@@ -96,7 +96,9 @@ npm --prefix studio/apps start
 `npm start` 会在首次运行时自动调用 Apple Silicon 环境准备脚本；
 `./scripts/start_studio_app.sh` 仍作为兼容入口，行为相同。
 
-首次运行依次选择 VoiceMem 记忆 API、准备记忆相关模型、选择 Studio Agent 对话 API，
+Windows x64 + NVIDIA 用户先安装 Node.js 22.12 或更新版本、Docker Desktop（WSL2 后端、Linux containers）和兼容的 NVIDIA 驱动，再在仓库根目录执行 `npm.cmd --prefix studio/apps start`。启动器会引导 API 配置、构建缺失的 Docker 镜像、启动后端并等待模型准备，然后打开 App；不需要手动创建 Ubuntu Python 环境。Windows 全流程仍需实机验收。
+
+Mac 首次运行依次选择 VoiceMem 记忆 API、准备记忆相关模型、选择 Studio Agent 对话 API，
 再启动本机 MLX 后端；最后一项可只连接已有 Studio 服务，但须先手动输入服务地址。
 不同服务商分别隐藏输入 Key。之后可在“设置 → 组件”中更换记忆/回复模型服务并重启后端；成功配置会安全保存。
 首次准备需要下载约 8–12 GB 内容，取决于是否选择本地回复模型；下载可续传，

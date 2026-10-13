@@ -154,6 +154,7 @@ function remoteEnvironment(env = process.env) {
   for (const name of MANAGED_ENVIRONMENT) delete next[name];
   for (const name of ['VOICEMEM_MEMORY_API_KEY', 'VOICEMEM_STUDIO_API_KEY',
     'DEEPSEEK_API_KEY', 'DASHSCOPE_API_KEY', 'OPENAI_API_KEY']) delete next[name];
+  delete next.VOICEMEM_DESKTOP_SERVER_URL;
   next.VOICEMEM_DESKTOP_CONFIGURE = '1';
   next.VOICEMEM_DESKTOP_REQUIRE_ADDRESS = '1';
   return next;
@@ -178,20 +179,44 @@ function startElectron(env, args) {
   child.on('exit', code => { process.exitCode = code ?? 1; });
 }
 
-async function main() {
-  if (!['darwin', 'win32'].includes(process.platform)) {
+async function main({ platform = process.platform, arch = process.arch, env: inheritedEnv = process.env,
+  ensure = ensureDependencies, start = startElectron, prepareDocker } = {}) {
+  if (!['darwin', 'win32'].includes(platform)) {
     throw new Error('桌面 App 和桌宠仅面向 Windows / macOS。Linux 请启动 Studio 后端，或从其他电脑连接。');
   }
   // npm runs the same check through prestart. Keep it here as well so direct
   // source launches repair a fresh checkout instead of failing at require('electron').
-  ensureDependencies();
+  ensure();
   const options = launchArguments();
   if (options.remote) {
-    startElectron(remoteEnvironment(), options.electronArgs);
+    start(remoteEnvironment(inheritedEnv), options.electronArgs);
     return;
   }
-  if (process.platform === 'darwin' && process.arch !== 'arm64') {
-    startElectron(remoteEnvironment(), options.electronArgs);
+  if (platform === 'win32') {
+    const { prepareWindowsDocker } = require('./windows-docker.cjs');
+    const control = new AbortController();
+    const cancel = () => control.abort(new Error('已取消 Windows 启动。'));
+    process.once('SIGINT', cancel);
+    process.once('SIGTERM', cancel);
+    try {
+      const url = await (prepareDocker || prepareWindowsDocker)(path.resolve(__dirname, '../..'), {
+        chooseProvider, readSecret, env: inheritedEnv, signal: control.signal,
+      });
+      const env = remoteEnvironment(inheritedEnv);
+      if (url) {
+        delete env.VOICEMEM_DESKTOP_CONFIGURE;
+        delete env.VOICEMEM_DESKTOP_REQUIRE_ADDRESS;
+        env.VOICEMEM_DESKTOP_SERVER_URL = url;
+      }
+      start(env, options.electronArgs);
+    } finally {
+      process.removeListener('SIGINT', cancel);
+      process.removeListener('SIGTERM', cancel);
+    }
+    return;
+  }
+  if (platform === 'darwin' && arch !== 'arm64') {
+    start(remoteEnvironment(inheritedEnv), options.electronArgs);
     return;
   }
   if (!process.stdin.isTTY) throw new Error('本机启动需要交互终端来选择 API；只连接已有服务请运行 npm run start:remote。');
@@ -200,7 +225,7 @@ async function main() {
     prepareMemory: ({ projectDir, provider, env: childEnv }) =>
       runtime.prepareManagedMemory(projectDir, provider, { platform: process.platform, env: childEnv }),
   });
-  startElectron(env, options.electronArgs);
+  start(env, options.electronArgs);
 }
 
 if (require.main === module) main().catch(error => {
@@ -209,4 +234,4 @@ if (require.main === module) main().catch(error => {
 });
 
 module.exports = { PROVIDERS, REMOTE, MANAGED_ENVIRONMENT, providerChoices, selectProvider, chooseProvider,
-  savedModelProviders, readSecret, launchEnvironment, launchArguments, remoteEnvironment };
+  savedModelProviders, readSecret, launchEnvironment, launchArguments, remoteEnvironment, main };

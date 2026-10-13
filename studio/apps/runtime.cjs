@@ -104,11 +104,11 @@ async function validateBackendProject(directory) {
   return root;
 }
 
-function command(file, args, { cwd, signal, timeoutMs = 60000, spawnImpl = spawn } = {}) {
+function command(file, args, { cwd, env = process.env, signal, timeoutMs = 60000, spawnImpl = spawn } = {}) {
   return new Promise((resolve, reject) => {
     const control = AbortSignal.any([...(signal ? [signal] : []), AbortSignal.timeout(timeoutMs)]);
     let output = '', errors = '';
-    const child = spawnImpl(file, args, { cwd, signal: control, shell: false, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
+    const child = spawnImpl(file, args, { cwd, env, signal: control, shell: false, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
     child.stdout.on('data', data => { output = (output + data.toString()).slice(-16000); });
     child.stderr.on('data', data => { errors = (errors + data.toString()).slice(-16000); });
     child.once('error', error => reject(error.code === 'ENOENT'

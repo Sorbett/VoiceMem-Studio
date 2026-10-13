@@ -56,7 +56,7 @@ docker compose logs -f studio
 
 看到启动成功日志后，本机浏览器可打开 `http://localhost:8787`。如果要从其他电脑连接，请先配置 HTTPS 和访问控制，或使用 SSH 端口转发；默认服务只绑定在服务器的 `127.0.0.1`，不会直接对公网开放。首次构建、模型下载和预热可能需要较长时间，具体要求和数据卷说明见[部署说明](deploy/README.md)。
 
-Windows 用户可在 WSL2/NVIDIA 环境中运行后端，再使用桌面 App；也可以直接连接一台已运行 Studio 的 Linux 服务器。Windows 本机路径尚需实机验证，相关要求见[桌面 App 说明](apps/README.md)；Linux/Docker 部署见[部署说明](deploy/README.md)。App 不会替你安装 WSL2、显卡驱动或 Python 解释器。
+Windows 用户先安装 Node.js 22.12 或更新版本、Docker Desktop（WSL2 后端、Linux containers）和兼容的 NVIDIA 驱动，再从 Windows PowerShell 执行 `npm.cmd --prefix studio/apps start`。入口会引导 API 配置、自动构建缺失的后端镜像、启动容器并等待模型准备，然后打开 App；无需手动准备 Ubuntu Python 或 Breeze。Windows 全流程尚需实机验收，详见[桌面 App 说明](apps/README.md)。已有服务器仍可使用 `start:remote`。
 
 ## 配置与常见问题
 

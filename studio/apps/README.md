@@ -9,10 +9,10 @@
 | 你的电脑 | 后端运行在哪里 | 推荐入口 |
 | --- | --- | --- |
 | Apple Silicon Mac | 本机 Python 3.12 + MLX | `npm --prefix studio/apps start` |
-| Windows x64 + NVIDIA | 已准备好的 WSL2/CUDA 环境 | `npm --prefix studio/apps start` |
+| Windows x64 + NVIDIA | Docker Desktop（WSL2 后端） | `npm --prefix studio/apps start` |
 | Intel Mac，或不在本机运行推理的 Mac/Windows | 已运行的本机或远程 Studio 服务 | `npm --prefix studio/apps run start:remote` |
 
-本机模式不会帮你安装 Python 解释器、WSL2 或显卡驱动。Apple Silicon Mac 需要原生 ARM64 Python 3.12；Windows 本机模式需要先在 WSL2 中准备 Python/CUDA 环境和对应依赖。Linux/NVIDIA 和 Docker 的部署要求见[后端部署说明](../deploy/README.md)。Windows 的 WSL2/CUDA 路径已有自动启动逻辑和模拟测试，但仍需在实际设备上验证；初次使用建议先确认后端能独立启动。
+Apple Silicon Mac 需要原生 ARM64 Python 3.12。Windows 需要先安装并打开 Docker Desktop，启用 WSL2 后端和 Linux containers，并安装兼容的 NVIDIA Windows 驱动；无需在 Ubuntu 中手动创建 Python 环境或另拉 Breeze 源码。Windows `npm start` 检查本机 Docker、引导缺失的 API 配置、构建缺失的镜像、启动容器并等待模型下载和预热，然后直接打开 App。已有镜像和配置会复用。Docker 配置和 Key 保存在项目 `.env`（明文、Git 忽略），现有配置和注释会保留；设置组件时由用户编辑 `.env` 并重新启动。Windows Docker 路径已有模拟测试，仍需实机验收。Linux/NVIDIA 的要求见[后端部署说明](../deploy/README.md)。
 
 ## 本机启动
 
@@ -22,7 +22,9 @@
 npm --prefix studio/apps start
 ```
 
-首次启动会按顺序引导你：
+Windows PowerShell 可使用 `npm.cmd --prefix studio/apps start`，避免 PowerShell 的 npm 脚本执行策略限制。首次 Windows 启动先检查 Docker，再选择缺失的记忆/对话 API 配置，随后构建镜像并准备所有模型。已在 `.env` 中配置的服务和 Key 不重复询问。后续无需手动启动 Ubuntu 或运行 Compose。首次构建和模型准备可能较久，进度显示在终端。Docker 容器在 App 退出后继续运行，可用 `docker compose stop` 停止；已有 Docker 容器不会改用 `.venv-cuda`。
+
+Apple Silicon Mac 首次启动会按顺序引导你：
 
 1. 选择 VoiceMem 记忆处理的 API（DeepSeek、Qwen 或 OpenAI），填写 Key。
 2. 等待本机环境、记忆、感知和转写模型准备完成。

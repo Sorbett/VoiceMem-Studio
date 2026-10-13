@@ -29,7 +29,7 @@ Windows 的 Docker 路线需要已运行的 Docker Desktop、启用 WSL2 后端�
 远程连接页与对话风格选择页共用浅色卡片视觉和 680×430 紧凑窗口；菜单中统一使用“连接设置”，主对话页面继续复用 Web。
 源码启动提供两个入口：
 
-- `npm start`：Mac 使用 MLX；Windows 使用 WSL2/CUDA。本机后端使用各自的平台环境。
+- `npm start`：Mac 使用原生 MLX；Windows 检查 Docker Desktop、引导 API 配置、构建缺失的镜像并启动 WSL2/CUDA 容器，待后端就绪直接打开 App。Windows 无需手动安装 Ubuntu Python 或 Breeze。
 - `npm run start:remote`：只配置服务地址，不要求本机具备 CUDA、MLX、WSL 或 Docker。
 
 Windows 和 Mac 共用配置页面；平台差异由启动适配层处理。
@@ -37,29 +37,26 @@ Windows 和 Mac 共用配置页面；平台差异由启动适配层处理。
 本机模型路径必须属于实际运行后端的文件系统：Windows、WSL 和容器路径不是同一个命名空间，不能直接混用。
 远程模式的模型和 API Key 留在服务器，不能拿客户端目录代替服务器配置。
 
-首次 `npm start` 在终端分别选择 VoiceMem 记忆 API 与 Studio Agent 对话 API，分别读取需要的密钥。托管后端启动后，“设置 → 组件”
+Windows Docker 配置使用项目 `.env`（明文、Git 忽略），分别记录记忆和对话 provider/Key，保留已有字段和注释；已配置的角色不重复询问。容器继续由 Docker 管理，退出 App 不停止容器。组件设置只读，用户在 `.env` 中修改服务后重新运行入口。
+
+Mac 首次 `npm start` 在终端分别选择 VoiceMem 记忆 API 与 Studio Agent 对话 API，分别读取需要的密钥。托管后端启动后，“设置 → 组件”
 可分别修改记忆和回复的服务商、OpenAI-compatible 地址、模型名与 Key，并由 App 受控重启。
 成功配置使用系统安全存储加密，下次启动直接复用；远程连接仍只读，由服务器管理配置和重启。
 
 ## 源码 App 启动流程
 
 ```text
-npm start        → 首次选择 VoiceMem API / 输入 Key，或读取已加密配置
-                 → 检查本机环境并准备记忆、感知、转写模型（非独立 VoiceMem 服务）
-                 → 首次选择 Studio Agent 对话 API / 输入不同服务商的 Key
-                 ├─ Apple Silicon Mac：启动受控的原生 MLX 后端
-                 └─ Windows 本机：通过 wsl.exe 启动 WSL2/CUDA 后端
-                 → 检查并下载回复、TTS 模型 → 严格预热
-                 → 创建风格选择页 → 主界面 + 桌宠
-
-                 → Studio API 的最后一项：仅 UI，输入已有 Studio 地址后连接
+npm start
+  ├─ Apple Silicon Mac：记忆 API → 准备记忆模型 → 对话 API → MLX 后端预热
+  └─ Windows：检查 Docker → 配置缺失的记忆/对话 API → 构建缺失的镜像
+              → 启动 Compose CUDA 后端 → 跟踪模型下载/预热日志
+  → 后端就绪 → 风格选择页 → 主界面 + 桌宠
 
 npm run start:remote
-                 → 不检查或启动本机后端
-                 → 打开空地址配置页 → 必须手动输入地址并连接已有服务
+  → 不检查或启动本机后端 → 空地址配置页 → 输入地址并连接已有服务
 ```
 
-准备和等待期间只使用终端，不创建本地连接/状态窗口。启动失败时显示原生错误框并退出。
+准备和等待期间只使用终端，不创建本地连接/状态窗口。终端准备失败时显示具体错误并退出；Electron 启动后的失败使用原生错误框。
 受管后端首次下载和预热默认最多等待 30 分钟；连接已有服务仍使用较短的三分钟就绪等待。
 
 自动识别平台不等于自动安装系统组件。缺少 WSL、驱动、Docker 或 MLX 环境时应准确提示，
@@ -72,8 +69,8 @@ Mac App 的启动适配传入 `STUDIO_DESKTOP_PET=0`，桌宠由 App 管理；Li
 
 - 已实现：共享 App + 桌宠、配置文案、Windows/macOS 打包配置、连接现有服务、Linux/WSL 禁止自动拉起桌宠。
 - 已实现代码并做模拟测试：`npm start` 的记忆/回复独立 provider 与密钥步骤、UI-only 必填地址、组件内模型服务配置、安全持久化与失败回退、VoiceMem 模型准备、Mac MLX 受控进程和 Windows `wsl.exe` CUDA 受控进程；App 退出时结束自己启动的进程。
-- 已实现代码并做模拟测试：Windows Docker CLI 本机 named-pipe 检查和 Compose 启动；只启动已有镜像和配置。
-  不自动启动 Docker Desktop 本身，不构建、拉取或重建容器。
+- 已实现代码并做模拟测试：Windows Docker CLI 本机 named-pipe 检查、首次配置、镜像缺失时构建、Compose 启动和容器失败检测。
+  图形连接页只启动已有服务。源码 `npm start` 可构建缺失的 Studio 镜像并更新配置有变化的容器，显示日志并最多等待 30 分钟；不自动安装或启动 Docker Desktop，不删除卷。
 - 尚未实现：安装包内置 Python/模型环境；本地 ASR、TTS、感知和声纹模型继续由后端 profile 管理。
 - 尚未实机验收：Windows 安装包、WSL/CUDA 联调、Mac 打包签名和麦克风权限。
   Linux 的虚拟桌面测试只验证共享客户端代码，不等于支持 Linux 桌面发布，也不能代替 Windows/macOS 验收。
