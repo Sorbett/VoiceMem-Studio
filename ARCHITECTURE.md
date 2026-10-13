@@ -124,7 +124,7 @@ moving model inference onto the event loop. GPU and Torch schedulers remain
 process-scoped. Speculative generation captures its memory instance and space
 before scheduling; cancellation also reaps pending route work.
 
-The App's first local launch chooses the VoiceMem memory API, prepares the
+The native Mac App's first local launch chooses the VoiceMem memory API, prepares the
 memory-stage models, then chooses the Studio Agent reply API. It passes separate
 `--memory-llm` and `--llm` values into one Studio backend. The direct Python CLI
 retains its simpler compatibility behavior: an interactive launch without
@@ -259,7 +259,10 @@ can clear the gate.
 `studio/apps/` owns the Windows/macOS Electron desktop client and pet. Linux is
 a backend deployment target, not a desktop release target. Windows runs capture,
 playback and the pet natively, while local CUDA inference belongs in WSL2 or its
-Docker backend. macOS uses native MLX or a remote service. Both clients share
+Docker backend.
+
+Windows source `npm start` uses the Docker route: it validates the local named-pipe context and Linux engine, fills missing memory/reply credentials in the ignored project `.env`, builds the Studio image only when absent, starts Compose, and waits up to 30 minutes with terminal logs before handing the discovered loopback URL to Electron. Existing settings and comments are preserved; Docker credentials are plaintext deployment configuration, distinct from native safeStorage. Docker containers and named volumes remain independently owned and are not stopped when the App quits. The existing WSL Python adapter remains available internally but is no longer the Windows source default.
+Explicit `start:remote` bypasses Docker and ignores any inherited automatic server URL. macOS uses native MLX or a remote service. Both clients share
 the same Web UI and observer contracts. The backend root serves the shared
 frontend from `studio/apps/ui/`, with assets under `/ui/`. Its first page reuses the original mode-selection homepage, with labeled
 image cards linking to the technical or digital-human visual style. A centered

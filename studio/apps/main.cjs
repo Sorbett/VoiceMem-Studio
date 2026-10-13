@@ -380,6 +380,8 @@ else {
         managedConfiguration = managed;
       }
       current = managed ? { ...runtime.DEFAULTS }
+        : process.env.VOICEMEM_DESKTOP_SERVER_URL
+          ? { ...runtime.DEFAULTS, serverUrl: runtime.serverUrl(process.env.VOICEMEM_DESKTOP_SERVER_URL) }
         : process.env.VOICEMEM_DESKTOP_REQUIRE_ADDRESS === '1'
           ? { ...runtime.DEFAULTS, serverUrl: '' }
           : await runtime.loadSettings(configurationFile);
