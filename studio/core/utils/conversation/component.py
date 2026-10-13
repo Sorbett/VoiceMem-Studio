@@ -739,14 +739,17 @@ class Conversation:
             pending.self_harness_profile = self_harness_profile
 
         async def run_reply(send_json=self.sock.send_json, send_pcm=lambda pcm: self.send_audio(pcm, timeline)):
-            await self.agent.voicemem_llm_tts(
-                pending, send_json, send_pcm, self.owner, timeline,
-                said=reply_state, context_session=self.context_session,
-                context_space=context_space, memory_vm=memory_vm,
-                self_harness_profile=self_harness_profile,
-                on_self_harness_update=(
-                    self_harness.apply if self_harness is not None else None),
-                speech_provider=getattr(self, 'speech_provider', None))
+            try:
+                await self.agent.voicemem_llm_tts(
+                    pending, send_json, send_pcm, self.owner, timeline,
+                    said=reply_state, context_session=self.context_session,
+                    context_space=context_space, memory_vm=memory_vm,
+                    self_harness_profile=self_harness_profile,
+                    on_self_harness_update=(
+                        self_harness.apply if self_harness is not None else None),
+                    speech_provider=getattr(self, 'speech_provider', None))
+            finally:
+                self.agent.hot_path_exit(handoff_hot)
         ack = self.cached_ack(pending)
         decision = self.turn_taking.decide_handoff(main_audio_ready=False, reply_mode=pending.reply_mode, cached_ack_available=bool(ack), spoken=pending.spoken)
 
@@ -777,7 +780,11 @@ class Conversation:
                     await asyncio.gather(*child_tasks, return_exceptions=True)
                 self.save_reply_context(pending, timeline, memory_vm, context_space)
                 self.turn_taking.finish_reply()
+        # Reserve admission before scheduling; capture can resume before the
+        # child enters the reply pipeline's own hot-path scope.
+        handoff_hot = self.agent.hot_path_enter()
         task = asyncio.create_task(coordinate_reply())
+        task.add_done_callback(lambda _: self.agent.hot_path_exit(handoff_hot))
         self.turn['task'] = task
         task.add_done_callback(self.reply_done)
 

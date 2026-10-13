@@ -91,38 +91,10 @@ class Routing:
         started = time.monotonic()
         memory_vm = memory_vm or self.vm
         memory_required = gate.needs_memory(pending.route) or bool(query)
-        if self._THINKING_ROUTER_ON:
-            try:
-                decision = await thinking_router().classify_async(
-                    pending.text, history=history)
-            except Exception as exc:
-                print(f"[thinking] 深思判断不可用（{type(exc).__name__}），保留 VoiceMem 记忆资格", flush=True)
-                decision = ThinkingDecision(FAST, 'unavailable')
-        else:
-            decision = ThinkingDecision(FAST, 'router-disabled')
-        if depth_preference == "deep":
-            decision = ThinkingDecision(SLOW, 'self-harness:deep')
-        elif depth_preference == "quick":
-            decision = ThinkingDecision(FAST, 'self-harness:quick')
-        decision = ThinkingDecision(
-            SLOW if decision.level == SLOW else (MEDIUM if memory_required else FAST), decision.raw)
-        classified = time.monotonic()
         memory_ms = 0.0
-        pending.reply_mode = decision.reply_mode
-        if pending.stranger:
-            # Speaker privacy outranks routing: never expose the owner's retrieved data.
-            from voicemem.stream import empty_result
-            pending.result = empty_result()
-            pending.memory_context = ""
-            pending.replay = ""
-            pending.route = gate.SHALLOW
-        elif decision.reply_mode == DIRECT:
-            from voicemem.stream import empty_result
-            pending.result = empty_result()
-            pending.memory_context = ""
-            pending.replay = ""
-            pending.route = gate.SHALLOW
-        else:
+
+        async def retrieve():
+            nonlocal memory_ms
             memory_started = time.monotonic()
             try:
                 await self._ensure_pending_memory(pending, memory_vm, query)
@@ -136,7 +108,47 @@ class Routing:
                 pending.replay = ""
                 print(f"[route] memory retrieval failed: {type(exc).__name__}: {exc}",
                       flush=True)
-            memory_ms = (time.monotonic() - memory_started) * 1000
+            finally:
+                memory_ms = (time.monotonic() - memory_started) * 1000
+
+        # Memory already required by Gate does not depend on reasoning depth.
+        # Both tasks belong to this turn; cancellation must reap the retrieval.
+        memory_task = (asyncio.create_task(retrieve())
+                       if memory_required and not pending.stranger else None)
+        try:
+            if depth_preference == "deep":
+                decision = ThinkingDecision(SLOW, 'self-harness:deep')
+            elif depth_preference == "quick":
+                decision = ThinkingDecision(FAST, 'self-harness:quick')
+            elif self._THINKING_ROUTER_ON:
+                try:
+                    decision = await thinking_router().classify_async(
+                        pending.text, history=history)
+                except Exception as exc:
+                    print(f"[thinking] 深思判断不可用（{type(exc).__name__}），保留 VoiceMem 记忆资格", flush=True)
+                    decision = ThinkingDecision(FAST, 'unavailable')
+            else:
+                decision = ThinkingDecision(FAST, 'router-disabled')
+            decision = ThinkingDecision(
+                SLOW if decision.level == SLOW else (MEDIUM if memory_required else FAST), decision.raw)
+            classified = time.monotonic()
+            pending.reply_mode = decision.reply_mode
+            if pending.stranger or decision.reply_mode == DIRECT:
+                # Speaker privacy outranks routing, including reasoning upgrades.
+                from voicemem.stream import empty_result
+                pending.result = empty_result()
+                pending.memory_context = ""
+                pending.replay = ""
+                pending.route = gate.SHALLOW
+            elif memory_task is not None:
+                await memory_task
+            else:
+                await retrieve()
+        finally:
+            if memory_task is not None:
+                if not memory_task.done():
+                    memory_task.cancel()
+                await asyncio.gather(memory_task, return_exceptions=True)
         print(f"[route] {decision.display_name} → {decision.reply_mode}"
               f" / reasoning={decision.reasoning_effort} "
               f"(model={(classified - started) * 1000:.0f}ms"

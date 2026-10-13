@@ -80,12 +80,16 @@ class Memory:
         owner["miss"] = 0 if sid == owner["id"] else owner.get("miss", 0) + 1
 
     def hot_path_enter(self) -> dict:
-        """Mark audible reply work active and return a token for balanced release."""
+        """Mark input or reply work active and return a token for balanced release."""
         token = {"open": True}
         self._HOT["n"] += 1
         self._IDLE.clear()
         try:
-            asyncio.current_task().add_done_callback(lambda _: self.hot_path_exit(token))
+            task = asyncio.current_task()
+            if task is not None:
+                callback = lambda _: self.hot_path_exit(token)
+                token["owner"] = (task, callback)
+                task.add_done_callback(callback)
         except Exception:
             pass
         return token
@@ -94,12 +98,16 @@ class Memory:
         if not token.get("open"):
             return
         token["open"] = False
+        # Capture tasks live across many turns; do not retain completed leases.
+        owner = token.pop("owner", None)
+        if owner is not None:
+            owner[0].remove_done_callback(owner[1])
         self._HOT["n"] = max(0, self._HOT["n"] - 1)
         if self._HOT["n"] == 0:
             self._IDLE.set()
 
     async def wait_idle(self, what: str = "") -> None:
-        """Wait for the reply hot path to clear, with a bounded starvation fallback."""
+        """Wait for input/reply work to clear, with a bounded starvation fallback."""
         if self._IDLE.is_set():
             return
         t0 = time.monotonic()

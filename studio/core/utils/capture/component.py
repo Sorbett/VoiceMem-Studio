@@ -32,6 +32,16 @@ class Capture:
             textless_confirm_s=textless_confirm_s,
             turn_end_guard=pause_gate.allow_end)
         background_tasks = set()
+        input_hot = None
+
+        def input_activity(active):
+            nonlocal input_hot
+            if active and input_hot is None:
+                input_hot = self.hot_path_enter()
+            elif not active and input_hot is not None:
+                self.hot_path_exit(input_hot)
+                input_hot = None
+
         try:
             async with aclosing(self._capture_turns(
                     sock, stream, pause_gate, background_tasks,
@@ -47,10 +57,12 @@ class Capture:
                     on_backchannel_curve_update=on_backchannel_curve_update,
                     on_conversation_start=on_conversation_start,
                     on_speech_start=on_speech_start,
+                    on_input_activity=input_activity,
                     turn_taking=turn_taking, language_state=language_state)) as turns:
                 async for pending in turns:
                     yield pending
         finally:
+            input_activity(False)
             for task in background_tasks:
                 task.cancel()
             await asyncio.gather(*background_tasks, return_exceptions=True)
@@ -68,7 +80,7 @@ class Capture:
                          on_backchannel_curve_update=None,
                          on_conversation_start=None,
                          on_speech_start=None, textless_confirm_s=None,
-                         turn_taking=None, language_state=None):
+                         turn_taking=None, language_state=None, on_input_activity=None):
         """Yield confirmed turns while forwarding audio, playback, and cancellation events."""
         from voicemem.lang import detect_language
         from uuid import uuid4
@@ -135,6 +147,10 @@ class Capture:
         candidate_age = 0.0
         discard_candidate_turn = False
         while True:
+            # Keep the input lease through the yield and reply handoff. Rejected
+            # turns release it here too; disconnect cleanup belongs to anticipate.
+            if turn_finished and on_input_activity:
+                on_input_activity(False)
             msg = await sock.receive()
             if msg.get("type") == "websocket.disconnect":
                 return
@@ -170,6 +186,8 @@ class Capture:
                         await on_backchannel_curve_update(data.get("values"))
                     continue
                 if data.get("type") == "user_text" and data.get("text", "").strip():
+                    if on_input_activity:
+                        on_input_activity(True)
                     turn_taking.begin_user_turn()
                     stream.emotion = owner.get('emotion')
                     turn = await stream.feed_text(data["text"])
@@ -181,6 +199,8 @@ class Capture:
                                   reply_mode=MEMORY if gate.needs_memory(turn.route) else DIRECT,
                                   input_turn_id=uuid4().hex)
                     input_turn_id = uuid4().hex
+                    if on_input_activity:
+                        on_input_activity(False)
                 continue
             if msg.get("bytes") is None:
                 continue
@@ -204,6 +224,8 @@ class Capture:
                 await on_frame(raw)
             stream.emotion = owner.get('emotion')
             st = await stream.feed(raw)
+            if on_input_activity:
+                on_input_activity(st.spoke or bool(st.turn) or st.state == "<speak>")
             if (emotion_task is None and st.spoke and st.state == "<silence>"
                     and st.silence >= 0.08):
                 snapshot = st

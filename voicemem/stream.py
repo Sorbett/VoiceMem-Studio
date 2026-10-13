@@ -520,6 +520,9 @@ class VoiceStream:
 
     # Routing is re-evaluated as text grows. The final confirmed turn determines memory eligibility.
     def _gate_locked(self, text) -> str:
+        # The built-in gate locks its encoder internally; lexical rules need no GPU.
+        if self.gate is None or self.gate is _gate_mod.route:
+            return self._gate(text)
         with _EMBED_LOCK:
             return self._gate(text)
 

@@ -448,6 +448,76 @@ class MemoryRoutingIntegrationTests(unittest.IsolatedAsyncioTestCase):
         await self.agent.route_pending_thinking(pending)
         self.assertEqual(pending.reply_mode, 'memory')
         self.assertEqual(pending.memory_context, 'existing-context')
+        self.router.classify_async.assert_not_awaited()
+
+    async def test_required_retrieval_overlaps_depth_inference(self):
+        searching, release_search = threading.Event(), threading.Event()
+        depth_started, release_depth = asyncio.Event(), asyncio.Event()
+
+        def search(*_args, **_kwargs):
+            searching.set()
+            if not release_search.wait(2):
+                raise TimeoutError('synthetic search was not released')
+            return self.fresh
+
+        async def depth(*_args, **_kwargs):
+            depth_started.set()
+            await release_depth.wait()
+            return ThinkingDecision(SLOW, 'deep')
+
+        self.agent.vm.search.side_effect = search
+        self.router.classify_async.side_effect = depth
+        pending = self.pending()
+        task = asyncio.create_task(self.agent.route_pending_thinking(pending))
+        try:
+            await asyncio.wait_for(depth_started.wait(), 1)
+            self.assertTrue(await asyncio.to_thread(searching.wait, 1))
+            self.assertFalse(task.done())
+            release_search.set()
+            release_depth.set()
+            await asyncio.wait_for(task, 1)
+            self.assertEqual(pending.reply_mode, 'memory_cot')
+            self.assertIs(pending.result, self.fresh)
+            self.agent.vm.search.assert_called_once()
+        finally:
+            release_search.set()
+            release_depth.set()
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    async def test_cancelled_parallel_retrieval_cannot_update_pending(self):
+        searching, release_search, finished = (threading.Event() for _ in range(3))
+
+        def search(*_args, **_kwargs):
+            searching.set()
+            release_search.wait(2)
+            finished.set()
+            return self.fresh
+
+        async def depth(*_args, **_kwargs):
+            await asyncio.Event().wait()
+
+        self.agent.vm.search.side_effect = search
+        self.router.classify_async.side_effect = depth
+        pending = self.pending()
+        original = pending.result
+        task = asyncio.create_task(self.agent.route_pending_thinking(pending))
+        try:
+            self.assertTrue(await asyncio.to_thread(searching.wait, 1))
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await asyncio.wait_for(task, 1)
+            release_search.set()
+            self.assertTrue(await asyncio.to_thread(finished.wait, 1))
+            await asyncio.sleep(0)
+            self.assertIs(pending.result, original)
+            self.assertEqual(pending.memory_context, '')
+            self.assertFalse(any(t.get_coro().__name__ == 'retrieve'
+                                 for t in asyncio.all_tasks() if not t.done()))
+        finally:
+            release_search.set()
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
 
     async def test_classifier_failure_preserves_memory_and_privacy(self):
         self.router.classify_async.side_effect = RuntimeError('synthetic classifier failure')

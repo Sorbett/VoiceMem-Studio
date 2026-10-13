@@ -39,6 +39,7 @@ def anticipate_namespace():
               BARGE_DEBUG=False, SPEAKER_GATE=False, SPEAKER_DEBUG=False,
               STRANGER_MIN_TURNS=1, ACTIVE_SPACE="test", _eot=lambda: None,
               space_language=lambda _: "zh", _replaying_now=lambda: False,
+              hot_path_enter=lambda: {}, hot_path_exit=lambda _: None,
               _replay_id=lambda *a: "", save_turn_audio=lambda *a: "")
     execute([n for n in tree.body if getattr(n, "name", "") in names], ns)
     return ns

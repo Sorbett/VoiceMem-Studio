@@ -1003,8 +1003,11 @@ VoiceMem's existing Gate for memory eligibility, and Qwen3-0.6B for reasoning de
 The model receives current text plus up to four context messages sharing the
 existing 320-character history budget. It answers only whether deep reasoning
 is needed and does not receive memory-prefetch hints. Studio-specific topic,
-date and greeting regex shortcuts are not used. Each decision uses one off-loop
-classification request, not a second model judge or a keyword override.
+date and greeting regex shortcuts are not used. Automatic depth selection uses
+one off-loop classification request, not a second model judge or a keyword
+override. An explicit quick/deep Self Harness preference selects that depth
+directly without running a classifier whose result would be overwritten. Gate
+memory eligibility remains independent of this preference.
 The editable depth policy treats recall, ordinary explanation, simple formula
 application and requests for an already-derived result as ordinary reasoning.
 Explicit current deep-thinking requests and genuinely complex derivation,
@@ -1029,6 +1032,13 @@ Invalid model output uses ordinary reasoning; model exceptions preserve Gate
 memory eligibility. The legacy class name and
 hint argument remain for caller compatibility, but that hint no longer
 participates in depth classification.
+When Gate or a contextual follow-up already requires retrieval, missing memory
+is fetched concurrently with automatic depth selection. Confirmed prefetched
+memory is reused. An upgrade from shallow to deep reasoning still performs the
+newly required retrieval after classification. Both tasks belong to the turn;
+cancellation drains the retrieval task and a late native result cannot mutate
+the cancelled turn. Routing logs report each operation's duration and total
+elapsed time; parallel durations need not add up to the total.
 Provider-neutral request options carry the required reasoning across async reply
 iteration: `direct` and `memory` use non-thinking generation, while `memory_cot`
 uses high effort. Reasoning content remains private and is never spoken.
@@ -1285,6 +1295,9 @@ DeepSeek-only deployments require only DeepSeek credentials.
 Torch-backed embedding and related MPS operations use the process-level lock in
 `utils/torch_lock.py`. Lock scope covers device inference, not unrelated search
 coordination or waits on work that may need the same lock.
+The built-in Turn Gate takes no outer accelerator lock: lexical decisions run
+immediately, while its shared encoder locks semantic inference internally.
+Injected gate callables retain the existing outer lock contract.
 Shared embedding lookup and construction also acquire this lock before checking
 the cache, preventing concurrent cold loads from initializing MPS alongside ASR
 or another encoder. Equivalent omitted, positional and keyword tokenizer defaults
@@ -1297,9 +1310,18 @@ before each step and while acquiring the lock.
 
 ### Hot-path priority
 
-Studio tracks whether reply or speech output is on the user-visible hot path.
+Studio tracks whether user input, routing or reply generation is on the
+user-visible hot path. Capture reserves an input token when speech is detected
+(before turn confirmation), or before a text input enters memory lookup. The
+token remains active through confirmation and the consumer's reply handoff;
+rejected input, inactive capture and disconnect release it. Reply scheduling
+reserves a token before its child task can start, then releases it after the
+generation pipeline or on cancellation, including cancellation before the
+child's first execution. This bridges the input and generation scopes.
 Background perception and ingest may wait for an idle window, subject to a
 bounded fallback so memory work cannot starve indefinitely.
+The existing eight-second admission bound remains; already running native work
+is not preempted, and capture/ASR/route semantics and model quality are unchanged.
 
 Acoustic-emotion tasks belong to the conversation or realtime session and capture
 their output ID, Memory Space and VoiceMem instance. Ownership is checked before
@@ -1529,7 +1551,9 @@ experiments belong in focused evaluation artifacts, not this overview.
 ## Small-model emotion processing
 
 Audio emotion uses SenseVoiceSmall on CPU. Memory detectors and Studio reuse one
-process-level transcriber; initialization and inference follow the Torch lock.
+process-level transcriber. A dedicated creation lock protects the singleton and
+the CPU recognizer's instance lock serializes its requests without holding the
+accelerator lock used by streaming ASR. GPU transcribers retain `TORCH_LOCK`.
 The classifier returns localized acoustic labels. It does not load a multimodal
 language model or generate causal explanations from audio. The separate existing
 emotion2vec background classifier remains available in Studio.

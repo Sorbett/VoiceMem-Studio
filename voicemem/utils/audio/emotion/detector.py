@@ -1,14 +1,15 @@
 """Small acoustic emotion classifier shared by memory and Studio."""
 from pathlib import Path
+import threading
 
 _TRANSCRIBER = None
+_TRANSCRIBER_LOCK = threading.Lock()
 
 
 def shared_transcriber():
-    """Load one CPU recognizer; initialization and inference use the Torch lock."""
+    """Load one CPU recognizer without occupying the accelerator inference lock."""
     global _TRANSCRIBER
-    from voicemem.utils.torch_lock import TORCH_LOCK
-    with TORCH_LOCK:
+    with _TRANSCRIBER_LOCK:
         if _TRANSCRIBER is None:
             from voicemem.utils.audio.asr import Transcriber
             from voicemem.utils.common.paths import models_dir

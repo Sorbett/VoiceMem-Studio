@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import re
 import copy
+import threading
 
 import numpy as np
 
@@ -286,10 +287,14 @@ class FunASRStreamingASR:
 
 
 class Transcriber:
-    """SenseVoiceSmall 出最终文本（中英），比流式 ASR 更准，锁定一轮时用这个。"""
+    """Decode full utterances with SenseVoiceSmall and serialize model access."""
 
     def __init__(self, device: str, model: str | None = None) -> None:
-        from funasr import AutoModel        # 懒 import：只有用非流式精转写才需要 funasr
+        from voicemem.utils.torch_lock import TORCH_LOCK
+        # CPU recognition shares no accelerator state with streaming ASR.
+        self._inference_lock = (threading.RLock() if str(device).split(':')[0] == 'cpu'
+                                else TORCH_LOCK)
+        from funasr import AutoModel
         from voicemem.utils.common.paths import hf_model
         _name = model or hf_model("emotion", "FunAudioLLM/SenseVoiceSmall", "asr")
         self.model = AutoModel(model=_name, hub="hf",
@@ -297,8 +302,7 @@ class Transcriber:
                                trust_remote_code=False)
 
     def _generate(self, audio) -> str:
-        from voicemem.utils.torch_lock import TORCH_LOCK
-        with TORCH_LOCK:
+        with self._inference_lock:
             return self._generate_locked(audio)
 
     def _generate_locked(self, audio) -> str:
