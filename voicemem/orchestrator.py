@@ -968,6 +968,10 @@ class Orchestrator:
             ).start()
 
         def _notify_complete(result: dict) -> None:
+            root = getattr(self, "_memory_root", None)
+            if root is not None:
+                from voicemem.utils.common.memory_changes import for_space
+                for_space(root).publish(result.get("memory_ids") or ())
             if on_complete is None:
                 return
             try:

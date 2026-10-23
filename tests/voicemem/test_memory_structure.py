@@ -90,6 +90,24 @@ class RepositoryOwnershipTests(unittest.TestCase):
     def fact(self, text):
         return ExtractedAdditiveMemory('extractor-id', text, 'user')
 
+    def test_injected_backend_changes_notify_after_slot_metadata_and_deletion(self):
+        from voicemem.utils.common.memory_changes import for_space
+        repo = self.repository()
+        snapshots = []
+        feed = for_space(self.config.db_path.parent)
+        unsubscribe = feed.subscribe(lambda revision: snapshots.append(
+            repo.cognitive_store.memory_ids_for_slots_v2('fixture-user', ['work'])))
+        self.addCleanup(unsubscribe)
+        ids = repo.append_extracted([self.fact('work fact')], user_id='fixture-user')
+        self.assertIn(ids[0], snapshots[-1])
+        revision = feed.state()[0]
+        self.assertTrue(repo.update_memory(ids[0], 'knowledge fact', user_id='fixture-user'))
+        self.assertGreater(feed.state()[0], revision)
+        revision = feed.state()[0]
+        self.assertTrue(repo.delete_memory(ids[0]))
+        self.assertGreater(feed.state()[0], revision)
+        self.assertNotIn(ids[0], self.vectors.rows)
+
     def test_repository_types_keep_their_original_implementation_modules(self):
         self.assertEqual(LeftBrainMemoryRepository.__module__,
                          'voicemem.leftbrain.memory_repository')

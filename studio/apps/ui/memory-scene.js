@@ -19,6 +19,52 @@
   const cardBody = document.createElement('div'); cardBody.className = 'memory-node-card__body';
   const cardFoot = document.createElement('div'); cardFoot.className = 'memory-node-card__foot';
   card.append(cardHead, cardTitle, cardBody, cardFoot); document.body.append(card);
+  const tr = text => window.VMSettings?.t(text) || text;
+  const allButton = document.createElement('button');
+  allButton.className = 'memory-all-button'; allButton.type = 'button';
+  allButton.textContent = tr('全部记忆'); stage.append(allButton);
+  const allDialog = document.createElement('dialog'); allDialog.className = 'memory-all-dialog';
+  const allHead = document.createElement('div'); allHead.className = 'memory-all-head';
+  const allTitle = document.createElement('h2'); allTitle.id = 'memory-all-title'; allTitle.textContent = tr('全部记忆');
+  allDialog.setAttribute('aria-labelledby', allTitle.id);
+  const allClose = document.createElement('button'); allClose.textContent = tr('关闭'); allClose.type = 'button';
+  const allBody = document.createElement('div'); allBody.className = 'memory-all-body';
+  allHead.append(allTitle, allClose); allDialog.append(allHead, allBody); document.body.append(allDialog);
+  let allRequest = 0;
+  allClose.addEventListener('click', () => allDialog.close());
+  allButton.addEventListener('click', () => { allBody.textContent = tr('读取中…'); allDialog.showModal(); void loadAll(); });
+  async function loadAll() {
+    const generation = spaceGeneration, request = ++allRequest;
+    try {
+      const response = await fetch('/api/memories?all=true', {cache:'no-store'});
+      if (!response.ok) throw new Error(String(response.status));
+      const data = await response.json();
+      if (!allDialog.open || generation !== spaceGeneration || request !== allRequest ||
+          (activeSpace && data.space && data.space !== activeSpace)) return;
+      if (snapshot && data.epoch === snapshot.epoch && data.revision < snapshot.revision) return;
+      allBody.replaceChildren();
+      for (const [key, title] of [['left','事实'], ['right','画像']]) {
+        const heading = document.createElement('h3'); heading.textContent = `${tr(title)} · ${(data[key] || []).length}`;
+        allBody.append(heading);
+        for (const item of data[key] || []) {
+          const row = document.createElement('article');
+          row.setAttribute('data-no-i18n', '');
+          const text = document.createElement('p'); text.textContent = item.text || item.raw || '';
+          row.append(text);
+          const details = [item.desc && item.desc !== item.text ? item.desc : '',
+            ...(item.notes || []).map(note => [note.emotion, note.text, note.cause].filter(Boolean).join(' · ')),
+            item.date || ''].filter(Boolean);
+          if (details.length) {
+            const detail = document.createElement('small'); detail.textContent = details.join('\n'); row.append(detail);
+          }
+          allBody.append(row);
+        }
+      }
+    } catch (error) {
+      if (allDialog.open && generation === spaceGeneration && request === allRequest)
+        allBody.textContent = tr('读取失败，请关闭后重试。');
+    }
+  }
   const isActive = () => digital ? document.body.classList.contains('memory-on') && memoryIn.classList.contains('show') : !document.body.classList.contains('chat-background-only');
   const nodeScale = 1;
   const reduced = matchMedia('(prefers-reduced-motion: reduce)').matches;
@@ -45,11 +91,16 @@
   let crossLinks = [];
   const glowSprites = {};
   let glowScale = -1, previousTime = null;
-  let signature = '', snapshot = null, spaceGeneration = 0, watchTimer = 0, watchGeneration = 0;
+  let signature = '', snapshot = null, spaceGeneration = 0, activeSpace = '';
+  let labelTimer = 0, refreshRequest = 0, pageActive = true;
+  let observer = null, reconnectTimer = 0, changeTimer = 0, wantedRevision = -1, activeEpoch = '';
   const signatureOf = data => JSON.stringify({
-    left: (data.left || []).map(item => [item.text, item.slot]),
-    right: (data.right || []).map(item => [item.text, item.cluster, (item.notes || []).map(note => note.text)]),
+    left: (data.left || []).map(({hit, ...item}) => item),
+    right: (data.right || []).map(({label_pending, ...item}) => item),
   });
+  function updateAllCount() {
+    allButton.textContent = tr('全部记忆') + (snapshot ? ` · ${(snapshot.total?.left ?? snapshot.left?.length ?? 0) + (snapshot.total?.right ?? snapshot.right?.length ?? 0)}` : '');
+  }
   const slotNames = ['work','health','relationships','finance','knowledge','goals','daily_life','emotion','preference','personality'];
   const domainNames = {
     work:['工作','Work'], health:['健康','Health'], relationships:['关系','Relationships'],
@@ -164,15 +215,26 @@
   }
 
   async function refresh(generation = spaceGeneration) {
+    const request = ++refreshRequest;
     const response = await fetch('/api/memories', {cache: 'no-store'});
     if (!response.ok) throw new Error(`记忆快照读取失败 (${response.status})`);
     const data = await response.json();
-    if (generation !== spaceGeneration) return false;
+    if (generation !== spaceGeneration || request !== refreshRequest) return false;
+    if (activeSpace && data.space && data.space !== activeSpace) return false;
+    if (activeEpoch && data.epoch && data.epoch !== activeEpoch) { scheduleRefresh(100); return false; }
+    if (snapshot && data.epoch === snapshot.epoch && data.revision < snapshot.revision) return false;
+    activeSpace = data.space || activeSpace;
+    clearTimeout(labelTimer);
+    if ((data.right || []).some(item => item.label_pending)) watchLabels(generation);
+    if (data.revision < wantedRevision) scheduleRefresh(100);
+    const before = snapshot;
+    snapshot = data;
+    updateAllCount();
+    window.dispatchEvent(new CustomEvent('memory-snapshot', {detail:data}));
+    if (allDialog.open) void loadAll();
     const next = signatureOf(data);
     if (next === signature) return false;
-    const before = snapshot;
     signature = next; buildGraph(data);
-    snapshot = data;
     if (before) {
       const knownLeft = new Set((before.left || []).map(item => item.text));
       const knownRight = new Map((before.right || []).map(item => [item.text, (item.notes || []).length]));
@@ -187,19 +249,55 @@
     }
     return true;
   }
-  function watchMemories() {
-    clearTimeout(watchTimer);
+  function watchLabels(generation) {
+    clearTimeout(labelTimer);
+    if (document.hidden || !pageActive) return;
+    labelTimer = setTimeout(() => {
+      if (generation !== spaceGeneration || document.hidden || !pageActive) return;
+      void refresh(generation).catch(error => {
+        console.warn('[memory] label refresh failed:', error);
+        if (generation === spaceGeneration && !document.hidden && pageActive) watchLabels(generation);
+      });
+    }, 1000);
+  }
+  function scheduleRefresh(delay = 0) {
+    if (changeTimer || document.hidden || !pageActive) return;
     const generation = spaceGeneration;
-    const watch = ++watchGeneration;
-    let remaining = 20;
-    const check = async () => {
-      if (generation !== spaceGeneration || watch !== watchGeneration) return;
-      try { if (await refresh(generation)) return; }
-      catch (error) { console.warn('[memory] refresh failed:', error); }
-      if (watch !== watchGeneration) return;
-      if (--remaining > 0) watchTimer = setTimeout(check, 2000);
+    changeTimer = setTimeout(() => {
+      changeTimer = 0;
+      void refresh(generation).catch(error => {
+        console.warn('[memory] refresh failed:', error);
+        if (generation === spaceGeneration) scheduleRefresh(1000);
+      });
+    }, delay);
+  }
+  function stopObserver() {
+    clearTimeout(reconnectTimer); clearTimeout(changeTimer); changeTimer = 0;
+    const old = observer; observer = null;
+    if (old) old.close();
+  }
+  function observeChanges() {
+    if (observer || document.hidden || !pageActive || typeof WebSocket === 'undefined') return;
+    const generation = spaceGeneration;
+    const socket = observer = new WebSocket(`${location.protocol === 'https:' ? 'wss:' : 'ws:'}//${location.host}/ws/memories`);
+    socket.onmessage = event => {
+      if (observer !== socket || generation !== spaceGeneration) return;
+      let message;
+      try { message = JSON.parse(event.data); } catch { return; }
+      if (message.type !== 'memory_changed' || (activeSpace && message.space !== activeSpace)) return;
+      if (message.epoch && message.epoch !== activeEpoch) {
+        activeEpoch = message.epoch; wantedRevision = -1;
+      }
+      wantedRevision = Math.max(wantedRevision, message.revision);
+      scheduleRefresh();
     };
-    watchTimer = setTimeout(check, 2000);
+    socket.onclose = () => {
+      if (observer !== socket) return;
+      observer = null;
+      if (generation === spaceGeneration && !document.hidden && pageActive)
+        reconnectTimer = setTimeout(observeChanges, 1000);
+    };
+    socket.onerror = () => socket.close();
   }
   function hideCard() {
     card.classList.remove('on'); card.setAttribute('aria-hidden', 'true'); cardNode = null;
@@ -518,16 +616,16 @@
   backgroundCanvas.style.opacity = '.85';
   canvas.style.opacity = '1';
   window.addEventListener('pointermove',e=>{
-    pointer=e.target.closest('button,input,a,.col-side,.col-retrieval,.rail,.stage .scene') ? null : {x:e.clientX,y:e.clientY};
+    pointer=e.target.closest('button,input,a,dialog,.col-side,.col-retrieval,.rail,.stage .scene') ? null : {x:e.clientX,y:e.clientY};
     requestDraw();
   },{passive:true});
   window.addEventListener('pointerdown',e=>{
-    pointer=e.target.closest('button,input,a,.col-side,.col-retrieval,.rail,.stage .scene') ? null : {x:e.clientX,y:e.clientY};
+    pointer=e.target.closest('button,input,a,dialog,.col-side,.col-retrieval,.rail,.stage .scene') ? null : {x:e.clientX,y:e.clientY};
     requestDraw();
   },{passive:true});
   document.addEventListener('pointerleave',()=>{pointer=null;requestDraw();});
   window.addEventListener('click',e=>{
-    if(e.target.closest('button,input,a,.col-side,.col-retrieval,.rail,.stage .scene') || !isActive()) {pinned=-1;hideCard();return;}
+    if(e.target.closest('button,input,a,dialog,.col-side,.col-retrieval,.rail,.stage .scene') || !isActive()) {pinned=-1;hideCard();return;}
     pointer={x:e.clientX,y:e.clientY};
     selected=pickNode();
     if(selected<0){pinned=-1;hideCard();return;}
@@ -545,21 +643,31 @@
   new MutationObserver(redrawForView).observe(document.body,{attributes:true,attributeFilter:['class']});
   document.addEventListener('visibilitychange',()=>{
     cancelAnimationFrame(frameId);frameId=0;previousTime=null;requestDraw();
-    if (!document.hidden) void refresh().catch(error => console.warn('[memory] refresh failed:', error));
+    if (document.hidden) { clearTimeout(labelTimer); stopObserver(); }
+    if (!document.hidden) { observeChanges(); scheduleRefresh(); }
   });
-  window.addEventListener('pagehide',()=>{cancelAnimationFrame(frameId);frameId=0;});
-  window.addEventListener('pageshow',()=>{previousTime=null;resize();requestDraw();
-    void refresh().catch(error => console.warn('[memory] refresh failed:', error));});
-  document.addEventListener('display-settings-change',()=>{cardNode=null;layoutNodes();requestDraw();});
+  window.addEventListener('pagehide',()=>{
+    cancelAnimationFrame(frameId);frameId=0;pageActive=false;refreshRequest+=1;
+    stopObserver();clearTimeout(labelTimer);allDialog.close();
+  });
+  window.addEventListener('pageshow',()=>{pageActive=true;previousTime=null;resize();requestDraw();
+    observeChanges();scheduleRefresh();});
+  document.addEventListener('display-settings-change',()=>{
+    cardNode=null;layoutNodes();requestDraw();updateAllCount();
+    allTitle.textContent=tr('全部记忆');allClose.textContent=tr('关闭');
+    if(allDialog.open)void loadAll();
+  });
   image.onload=redrawForView;
   image.src='background.webp';
-  window.addEventListener('memory-space-change', () => {
-    spaceGeneration += 1; watchGeneration += 1; clearTimeout(watchTimer); signature = ''; snapshot = null;
-    void refresh().catch(error => console.warn('[memory] refresh failed:', error));
+  window.addEventListener('memory-space-change', event => {
+    spaceGeneration += 1; stopObserver(); clearTimeout(labelTimer); allDialog.close(); allRequest += 1;
+    activeSpace = event.detail?.space || ''; wantedRevision = -1; activeEpoch = '';
+    signature = ''; snapshot = null; updateAllCount(); buildGraph({});
+    observeChanges();scheduleRefresh();
   });
   window.VMMemoryScene = Object.freeze({
     onStudioEvent(message) {
-      if (message.type === 'answer_done' || message.type === 'playback_done') watchMemories();
+      if (message.type === 'memory_store_status' && (!message.space || message.space === activeSpace)) scheduleRefresh();
       if (message.type !== 'memory_hits') return;
       const hits = [...(message.left_brain || []).map(hit => hit.text),
         ...(message.right_brain_hits || []).map(hit => hit.content)];
@@ -575,5 +683,6 @@
       minGap: Number.isFinite(layoutMinGap) ? layoutMinGap : null}),
   });
   resize();requestDraw();
+  observeChanges();
   void refresh().catch(error => console.warn('[memory] refresh failed:', error));
 })();

@@ -4,6 +4,7 @@ import os
 import re
 from pathlib import Path
 
+import anyio
 from fastapi import FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -189,7 +190,8 @@ def hits_payload(result, has_audio=None, cluster_of=None):
     }
 
 def build_app(mode, session, classify, snapshot=None, audio_of=None, spaces=None,
-              set_lang=None, title=None, components=None, pet_port=8787):
+              set_lang=None, title=None, components=None, pet_port=8787,
+              memory_changes=None, full_snapshot=None):
     """Build the browser API and WebSocket routes using injected session callbacks."""
     app = FastAPI()
     desktop_instance = os.environ.get('VOICEMEM_DESKTOP_INSTANCE', '')
@@ -224,6 +226,61 @@ def build_app(mode, session, classify, snapshot=None, audio_of=None, spaces=None
         finally:
             pet_hub.discard(sock)
 
+    @app.websocket("/ws/memories")
+    async def ws_memories(sock: WebSocket):
+        """Observe one captured Space without opening a conversation or microphone."""
+        await sock.accept()
+        if memory_changes is None:
+            await sock.close(code=1000)
+            return
+        space, feed = await asyncio.to_thread(memory_changes)
+        loop = asyncio.get_running_loop()
+        queue = asyncio.Queue(maxsize=1)
+        closed, latest = False, -1
+
+        def enqueue(revision):
+            nonlocal latest
+            if closed or revision <= latest:
+                return
+            latest = revision
+            if queue.full():
+                queue.get_nowait()
+            queue.put_nowait(revision)
+
+        def changed(revision):
+            try:
+                loop.call_soon_threadsafe(enqueue, revision)
+            except RuntimeError:
+                pass
+
+        unsubscribe = feed.subscribe(changed)
+        enqueue(feed.state()[0])
+
+        async def publish():
+            while True:
+                revision = await queue.get()
+                await sock.send_json({"type": "memory_changed", "space": space,
+                                      "epoch": feed.epoch, "revision": revision})
+
+        async def receive():
+            while (await sock.receive())["type"] != "websocket.disconnect":
+                pass
+
+        tasks = [asyncio.create_task(publish()), asyncio.create_task(receive())]
+        try:
+            done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+            for task in done:
+                task.result()
+        except WebSocketDisconnect:
+            pass
+        finally:
+            closed = True
+            unsubscribe()
+            for task in tasks:
+                task.cancel()
+            with anyio.CancelScope(shield=True):
+                await asyncio.gather(*tasks, return_exceptions=True)
+
     @app.on_event("startup")
     def _start_pet():
         pet.ensure_running(f"ws://127.0.0.1:{pet_port}/ws-pet")
@@ -253,7 +310,8 @@ def build_app(mode, session, classify, snapshot=None, audio_of=None, spaces=None
 
     @app.get("/api/memories")
     async def api_memories(request: Request) -> dict:
-        return await asyncio.to_thread(snapshot) if snapshot else {"left": [], "right": []}
+        read = full_snapshot if request.query_params.get("all") == "true" and full_snapshot else snapshot
+        return await asyncio.to_thread(read) if read else {"left": [], "right": []}
 
     @app.get("/api/components")
     async def api_components(request: Request) -> dict:

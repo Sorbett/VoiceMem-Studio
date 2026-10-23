@@ -206,6 +206,8 @@ class Mem0BackendStore:
     def __init__(self, embedder: TextEmbedder, *, memory_root: Path) -> None:
         self._embedder = embedder  # the real embedder used for add()/search() -- see _Mem0EmbedderAdapter below
         self._path = Path(memory_root)  # for parity with LocalMemoryStore._path (used by dev scripts)
+        from voicemem.utils.common.memory_changes import for_space
+        self._changes = for_space(memory_root)
 
         from voicemem.utils.common import space as _space
         # 换了 embedding 又指向同一个 space 时，在这儿就说清楚，别等 qdrant 抛
@@ -286,6 +288,7 @@ class Mem0BackendStore:
             entries = result.get("results") if isinstance(result, dict) else result
             if entries:
                 ids.append(str(entries[0]["id"]))
+                self._changes.publish([ids[-1]])
         return ids
 
     def add_text(self, user_id: str, text: str, *, attributed_to: str = "user",
@@ -308,6 +311,7 @@ class Mem0BackendStore:
             meta["created_at"] = observed_at
         try:
             self._mem0.update(memory_id, text=t, metadata=meta or None)
+            self._changes.publish([memory_id])
             return True
         except Exception:
             return False
@@ -315,6 +319,7 @@ class Mem0BackendStore:
     def delete_memory(self, memory_id: str) -> bool:
         try:
             self._mem0.delete(memory_id)
+            self._changes.publish([memory_id])
             return True
         except Exception:
             return False
@@ -329,6 +334,7 @@ class Mem0BackendStore:
         yesterday = (date.today() - timedelta(days=1)).isoformat()
         try:
             self._mem0.update(memory_id, expiration_date=yesterday)
+            self._changes.publish([memory_id])
             return True
         except Exception:
             return False
@@ -338,6 +344,7 @@ class Mem0BackendStore:
         就是清空，见其文档字符串）。"""
         try:
             self._mem0.update(memory_id, expiration_date=None)
+            self._changes.publish([memory_id])
             return True
         except Exception:
             return False
@@ -361,6 +368,7 @@ class Mem0BackendStore:
             # attributed_to="assistant"），调用方要能把它们挑出来——比如 web demo
             # 的脑图只该显示"关于用户的记忆"，把助手的回复也长成节点就不对了。
             out.append({"id": str(e["id"]), "text": str(e.get("memory", "") or ""),
+                        "updated_at": str(e.get("updated_at") or e.get("created_at") or ""),
                         "date": str(md.get("time_start") or e.get("created_at") or "")[:10],
                         "role": str(md.get("role") or e.get("role") or "user")})
         return out

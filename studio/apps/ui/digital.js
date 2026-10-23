@@ -14,41 +14,38 @@ let current = conversations[0], replyMessage = null;
 let conversationSwitch = 0;
 const state = {get messages(){return current.messages;},busy:false,listening:false,memory:false};
 let toastTimer, typeTimer, markTimer;
-let memoryPoll = 0;
-let knownMemories = new Set();
-let memoryBaselineLoaded = false;
-const memoryKey = (kind, item) => `${kind}:${item.id || item.raw || ''}:${item.text || ''}:${kind==='right'?(item.notes||[]).length:''}`;
-const memorySnapshotReady = fetch('/api/memories', {cache:'no-store'})
-  .then(response => response.ok ? response.json() : Promise.reject(new Error('memory snapshot unavailable')))
-  .then(data => {knownMemories = new Set([
-    ...(data.left || []).map(item => memoryKey('left', item)),
-    ...(data.right || []).map(item => memoryKey('right', item)),
-  ]);memoryBaselineLoaded=true;}).catch(() => {});
+let knownMemories = new Map(), storedThisTurn = new Map(), memoryBaselineLoaded = false;
+let trackingStored = false;
+const memoryKey = (kind, item) => `${kind}:${item.id || item.raw || item.text}`;
+const memoryVersion = (kind, item) => JSON.stringify(kind === 'right'
+  ? [item.raw || item.text, item.notes || []] : [item.text, item.slot, item.entities || []]);
 function memoryList(id, values, empty){
   const host=$(id); host.replaceChildren();
   for(const value of values.slice(0,6)) host.append(el('li',null,value));
   if(!values.length) host.append(el('li',null,empty));
 }
-async function watchStoredMemories(){
-  const generation=++memoryPoll;
-  await memorySnapshotReady;
+function watchStoredMemories(){
+  trackingStored = true; storedThisTurn.clear();
   memoryList('storedMemories',[],'正在等待入库…');
-  for(let attempt=0;attempt<15 && generation===memoryPoll;attempt++){
-    if(attempt) await new Promise(resolve=>setTimeout(resolve,2000));
-    if(generation!==memoryPoll) break;
-    try{
-      const response=await fetch('/api/memories',{cache:'no-store'});
-      if(!response.ok) break;
-      const data=await response.json();
-      const entries=[...(data.left||[]).map(item=>['left',item]),...(data.right||[]).map(item=>['right',item])];
-      if(!memoryBaselineLoaded){entries.forEach(([kind,item])=>knownMemories.add(memoryKey(kind,item)));memoryBaselineLoaded=true;continue;}
-      const fresh=entries.filter(([kind,item])=>!knownMemories.has(memoryKey(kind,item)))
-        .map(([kind,item])=>`${kind==='left'?'事实':'感受'} · ${item.text || item.raw || ''}`);
-      if(fresh.length){memoryList('storedMemories',fresh,'本轮没有新记忆');entries.forEach(([kind,item])=>knownMemories.add(memoryKey(kind,item)));return;}
-    }catch{break;}
-  }
-  if(generation===memoryPoll)memoryList('storedMemories',[],'本轮暂无新入库记忆');
 }
+window.addEventListener('memory-snapshot', event => {
+  const data = event.detail;
+  const entries = [...(data.left || []).map(item => ['left',item]), ...(data.right || []).map(item => ['right',item])];
+  for (const [kind,item] of entries) {
+    const key = memoryKey(kind,item), version = memoryVersion(kind,item);
+    if (trackingStored && memoryBaselineLoaded && knownMemories.get(key) !== version)
+      storedThisTurn.set(key, `${kind === 'left' ? '事实' : '画像'} · ${item.text || item.raw || ''}`);
+    else if (storedThisTurn.has(key))
+      storedThisTurn.set(key, `${kind === 'left' ? '事实' : '画像'} · ${item.text || item.raw || ''}`);
+    knownMemories.set(key, version);
+  }
+  memoryBaselineLoaded = true;
+  if (storedThisTurn.size) memoryList('storedMemories', [...storedThisTurn.values()], '本轮暂无新入库记忆');
+});
+window.addEventListener('memory-space-change', () => {
+  knownMemories.clear(); storedThisTurn.clear(); memoryBaselineLoaded = false; trackingStored = false;
+  memoryList('storedMemories', [], '本轮暂无新入库记忆');
+});
 const reduced = VMUI.reduced;
 const backgroundVideo = $('bgVideo');
 const backgroundMotion = matchMedia('(prefers-reduced-motion: reduce)');
@@ -162,6 +159,9 @@ function speak(text){
 
 function handleStudio(message) {
   window.VMMemoryScene?.onStudioEvent(message);
+  if (message.type === 'memory_store_status' && !storedThisTurn.size) {
+    memoryList('storedMemories', [], message.status === 'error' ? '本轮入库未完成' : message.status === 'empty' ? '本轮暂无新入库记忆' : '正在更新记忆…');
+  }
   if (message.type === 'partial_transcript') {
     if (!VMStudio.acceptsPartial(current.messages, message)) return;
     $('said').textContent = message.text; $('said').classList.add('on');
@@ -387,6 +387,6 @@ addEventListener('keydown',e=>{if(e.key==='Escape'){setDrawer(false);setRail(inn
 document.addEventListener('visibilitychange',()=>{syncBackgroundPlayback();cancelAnimationFrame(raf);raf=0;lastT=0;if(!document.hidden && ink!==inkTarget)raf=requestAnimationFrame(tick);});
 addEventListener('pageshow',e=>{syncBackgroundPlayback();if(e.persisted){selectConversation(current);resizeInk();if(ink!==inkTarget&&!raf)raf=requestAnimationFrame(tick);}});
 document.addEventListener('settings-open',()=>voiceInput.pause());
-addEventListener('pagehide',()=>{memoryPoll++;backgroundVideo.pause();cancelAnimationFrame(raf);clearTimeout(typeTimer);clearTimeout(markTimer);clearTimeout(toastTimer);});
+addEventListener('pagehide',()=>{trackingStored=false;backgroundVideo.pause();cancelAnimationFrame(raf);clearTimeout(typeTimer);clearTimeout(markTimer);clearTimeout(toastTimer);});
 
 })();

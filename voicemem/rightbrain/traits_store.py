@@ -114,6 +114,9 @@ class TraitStore:
     def __init__(self, db_path, embed) -> None:
         self._db = str(db_path)
         self._embed = embed                 # fn(text) -> list[float]
+        from pathlib import Path
+        from voicemem.utils.common.memory_changes import for_space
+        self._changes = for_space(Path(db_path).parent)
         with self._conn() as c:
             c.execute("""CREATE TABLE IF NOT EXISTS rb_traits (
                 id             TEXT PRIMARY KEY,
@@ -173,6 +176,7 @@ class TraitStore:
                       (uuid.uuid4().hex, tid, user_id, str(ev.quote or ""),
                        str(ev.emotion or ""), str(ev.cause or ""),
                        str(ev.cause_id or ""), str(ev.at or now)))
+        self._changes.publish([tid])
         return tid
 
     def _vec(self, text: str):
@@ -203,8 +207,10 @@ class TraitStore:
     # ── 读 ────────────────────────────────────────────────────────────────────
 
     def all(self, user_id: str, *, per_slot: int = 8) -> list[Trait]:
-        """给脑图用：每个 slot 取证据最多的前几条 + 最近新增的几条。"""
+        """Return graph traits, prioritizing committed changes before older evidence."""
         out: list[Trait] = []
+        _, recent = self._changes.state()
+        rank = {mid: index for index, mid in enumerate(recent)}
         with self._conn() as c:
             for slot in SLOTS:
                 rows = c.execute(
@@ -216,8 +222,8 @@ class TraitStore:
                 by_new = sorted(rows, key=lambda r: r["updated_at"], reverse=True)
                 fresh = max(1, per_slot // 2)
                 picked, seen = [], set()
-                # 一半给最近新增的（刚说的那句要能立刻看见），一半给证据最多的
-                for r in by_new[:fresh] + by_ev:
+                changed = sorted((r for r in rows if r["id"] in rank), key=lambda r: rank[r["id"]])
+                for r in changed + by_new[:fresh] + by_ev:
                     if r["id"] in seen:
                         continue
                     seen.add(r["id"])

@@ -357,11 +357,31 @@ completion/reset cancels stale paints. User transcripts remain plain text, and
 copy/history retain source Markdown. Interrupted previews render the heard
 prefix without requiring closing formatting markers.
 The brain backdrop remains an illustration, while graph nodes are rebuilt from
-the current Space's `/api/memories` snapshot. Node placement uses the visible
+the current Space's `/api/memories` snapshot. Both visual styles share the
+server's asynchronously prepared portrait labels, including the existing
+owner-name policy. Right-brain items retain the stored claim in `raw` and expose
+`label_pending` alongside `text`. The server captures label text and readiness
+together and deduplicates concurrent preparation; a failed rewrite resolves to
+the stored claim for that process. The shared graph renderer refreshes pending
+labels until ready, including on initial load, so page-open order cannot leave
+one style displaying an earlier label. The display owner name projects the newest
+explicit persisted owner-name fact, with voice registration as a fallback; this
+does not alter voice identity binding or stored history. Revisions and registry
+modification time invalidate the name cache. No model call blocks the conversation
+or the WebSocket loop. Node placement uses the visible
 hemisphere bounds and keeps space between memory nodes and domain labels on
 each resize. Hovering or selecting a node shows
-a compact card beside it, following the Web brain's interaction pattern. The page checks for asynchronous
-ingest changes after a turn and redraws only when memory content changes. Its
+a compact card beside it, following the Web brain's interaction pattern.
+Both styles observe `/ws/memories`, a passive subscription to one captured Space.
+Committed changes trigger a fresh snapshot regardless of reply timing. Notifications
+coalesce, reconnects receive the current revision, and a process epoch distinguishes
+restarted revision counters. Hidden/departed pages unsubscribe; Space changes and
+request ordering reject stale results. Graph snapshots include their Space, epoch,
+revision and totals. Recently changed records take priority within graph limits;
+`/api/memories?all=true` supplies the shared full-list dialog using the store's
+enumeration limits, without starting extra portrait rewrites. The digital stored-memory
+panel consumes these same snapshots and ignores label-only changes. The graph
+redraws when displayed content changes, including evidence or deletions. Its
 background canvas is redrawn on resize or view changes rather than every frame.
 
 The technical page's liquid orb owns its WebGPU device and animation loop.
@@ -520,6 +540,17 @@ and summaries; it is an implementation, not a second independent memory engine.
 The extension selects its graph-store type before construction so base schema
 initialization and migration run once. Existing tables and query algorithms remain
 unchanged. See `voicemem/README.md` for the owner inventory and historical opt-in APIs.
+
+`utils/common/memory_changes.py` owns process-local revisions per resolved Space
+root. Native factual mutations and trait/evidence transactions publish after a
+successful commit; repository and slot-extension completion publish after metadata
+updates, including with injected vector stores. Ingest completion provides a final
+notification after auxiliary writes, including empty or failed background completion so partial
+success can be reread. Recent changed IDs are bounded advisory display state;
+neither revisions nor listeners are a persistent journal or a retrieval policy.
+Listeners run outside the revision lock on the writer thread and only schedule work.
+The transport uses a bounded queue and removes listeners and publisher tasks on
+disconnect. Reading snapshots and persistence remain outside the WebSocket loop.
 
 `leftbrain/mem0_backend_store.py` caches one Mem0 client per resolved local
 Qdrant directory. Before sharing it, the adapter serializes native Qdrant SDK

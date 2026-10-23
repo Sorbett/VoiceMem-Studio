@@ -106,6 +106,7 @@ class LeftBrainMemoryRepositoryV2(LeftBrainMemoryRepository):
         texts_to_tag = [(mid, t) for mid, t in texts_to_tag if t]
         if not texts_to_tag or self._cognitive_store is None:
             return
+        changed = []
         try:
             self._ensure_slot_embeddings()
             vecs = self._embedder.embed_texts([t for _, t in texts_to_tag])
@@ -117,9 +118,13 @@ class LeftBrainMemoryRepositoryV2(LeftBrainMemoryRepository):
                 ]
                 if slots_above:
                     self._cognitive_store.upsert_memory_tags(mid, user_id, slots_above)  # type: ignore[union-attr]
+                    changed.append(mid)
         except Exception as exc:
             import logging
             logging.getLogger(__name__).warning("auto-tag slot failed: %s", exc)
+        finally:
+            if changed:
+                self._changes.publish(changed)
 
     # Opt-in retrieval for direct repository callers.
 

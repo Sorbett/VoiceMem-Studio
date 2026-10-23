@@ -75,6 +75,8 @@ class LeftBrainMemoryRepository:
         # 实例自己的 memory_root 相互隔离"的语义；未显式传 db_path 时才退回全局默认目录。
         root = cfg.db_path.parent if cfg.db_path is not None else default_memory_root()
         root.mkdir(parents=True, exist_ok=True)
+        from voicemem.utils.common.memory_changes import for_space
+        self._changes = for_space(root)
         self._json_path = (
             Path(cfg.json_path).expanduser().resolve()
             if cfg.json_path is not None
@@ -191,6 +193,8 @@ class LeftBrainMemoryRepository:
                 except Exception as _cog_err:
                     import logging
                     logging.getLogger(__name__).warning("UPDATE 认知图重新写入失败: %s", _cog_err)
+        if updated:
+            self._changes.publish([memory_id])
         return updated
 
     def delete_memory(self, memory_id: str) -> bool:
@@ -201,6 +205,8 @@ class LeftBrainMemoryRepository:
             results = [obj for obj in store["results"]
                        if not (isinstance(obj, dict) and str(obj.get("id", "")) == memory_id)]
             self._write_json_store(results)
+        if deleted:
+            self._changes.publish([memory_id])
         return deleted
 
     def append_extracted(
@@ -282,6 +288,7 @@ class LeftBrainMemoryRepository:
                 import logging
                 logging.getLogger(__name__).warning("认知图写入失败: %s", _cog_err)
 
+        self._changes.publish(saved_ids)
         return saved_ids
 
     def search(

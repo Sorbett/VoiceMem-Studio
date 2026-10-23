@@ -50,21 +50,44 @@ class Visualization:
             print(f"[web] 读左脑事实失败：{e}", flush=True)
             return {}
 
-    def owner_name(self, space: str = "") -> str:
-        """Read the owner name from the selected space without guessing identity."""
+    def memory_changes(self):
+        """Return the selected Space and its shared process-local revision feed."""
+        from voicemem.utils.common.memory_changes import for_space
+        space = self.ACTIVE_SPACE
+        directory, _ = self.space_dir(space)
+        return space, for_space(directory)
+
+    def owner_name(self, space: str = "", *, memory_vm=None, entries=None, revision=None) -> str:
+        """Project the current stored owner name, falling back to voice registration."""
+        from voicemem.utils.common.memory_changes import for_space
+        from studio.core.utils.visualization.owner_identity import current_owner_name
+        from voicemem.utils.common import space as _sp
         space = space or self.ACTIVE_SPACE
-        if space in self._OWNER_NAME_CACHE:
-            return self._OWNER_NAME_CACHE[space]
+        d, _ = self.space_dir(space)
+        p = _sp.mm(d, "voiceprint_registry.json")
+        if revision is None:
+            revision = for_space(d).state()[0]
+        try:
+            stamp = p.stat().st_mtime_ns
+        except FileNotFoundError:
+            stamp = None
+        cache_key = (revision, stamp)
+        cached = self._OWNER_NAME_CACHE.get(space)
+        if isinstance(cached, tuple) and cached[0] == cache_key:
+            return cached[1]
         name = ""
         try:
-            import json
-            from voicemem.utils.common import space as _sp
-            d, _ = self.space_dir(space)
-            p = _sp.mm(d, "voiceprint_registry.json")
-            if p.is_file():
+            vm = memory_vm or self.vm
+            if entries is None:
+                entries = vm._o._get_repo()._vector_store.list_entries(user_id=vm._o._user_id)
+            name = current_owner_name(entries)
+        except Exception as e:
+            print(f"[rb] Owner name facts unavailable: {type(e).__name__}: {e}", flush=True)
+        try:
+            if not name and p.is_file():
                 data = json.loads(p.read_text(encoding="utf-8"))
                 cands = []
-                for key, v in (data or {}).items():
+                for v in (data or {}).values():
                     if not isinstance(v, dict) or v.get("role") != "user":
                         continue
                     n = (v.get("name") or "").strip()
@@ -78,7 +101,7 @@ class Visualization:
                     name = cands[0][1]
         except Exception as e:
             print(f"[rb] 主人姓名读取失败：{type(e).__name__}: {e}", flush=True)
-        self._OWNER_NAME_CACHE[space] = name
+        self._OWNER_NAME_CACHE[space] = (cache_key, name)
         return name
 
     def _rb_humanize_now(self, claims: list, name: str = "", lang: str = "zh") -> None:
@@ -103,60 +126,67 @@ class Visualization:
             if len(lines) != len(claims):
                 print(f"[rb] 改写行数不符（{len(lines)}≠{len(claims)}），这批跳过", flush=True)
                 return
-            for c, h in zip(claims, lines):
-                self._RB_HUMAN[(lang, name, c)] = h
+            with self._RB_HUMAN_LOCK:
+                for c, h in zip(claims, lines):
+                    self._RB_HUMAN[(lang, name, c)] = h
         except Exception as e:
             print(f"[rb] 判断改写失败：{type(e).__name__}: {e}", flush=True)
         finally:
-            self._RB_HUMAN_PENDING.difference_update((lang, name, c) for c in claims)
+            with self._RB_HUMAN_LOCK:
+                # Resolve failures once so readers share a stable fallback and stop polling.
+                for claim in claims:
+                    self._RB_HUMAN.setdefault((lang, name, claim), claim)
+                self._RB_HUMAN_PENDING.difference_update((lang, name, c) for c in claims)
+
+    def _rb_human_labels(self, claims: list, *, name=None, lang=None, prepare=True) -> dict[str, tuple[str, bool]]:
+        """Capture labels and readiness together, sharing pending work across readers."""
+        if not self.RB_HUMANIZE:
+            return {claim: (claim, False) for claim in claims}
+        name = self.owner_name() if name is None else name
+        lang = lang or self.SPACE_LANG
+        claims = list(dict.fromkeys(claims))
+        with self._RB_HUMAN_LOCK:
+            todo = [c for c in claims if prepare and c and (lang, name, c) not in self._RB_HUMAN
+                    and (lang, name, c) not in self._RB_HUMAN_PENDING]
+            self._RB_HUMAN_PENDING.update((lang, name, c) for c in todo)
+            labels = {
+                c: (self._RB_HUMAN.get((lang, name, c), c),
+                    (lang, name, c) in self._RB_HUMAN_PENDING)
+                for c in claims
+            }
+        if todo:
+            threading.Thread(target=self._rb_humanize_now, args=(todo, name, lang), daemon=True).start()
+        return labels
 
     def rb_human(self, claim: str) -> str:
         """Return the prepared display label for an internal memory claim."""
-        if not self.RB_HUMANIZE or not claim:
-            return claim
-        name, lang = self.owner_name(), self.SPACE_LANG
-        hit = self._RB_HUMAN.get((lang, name, claim))
-        if hit:
-            return hit
-        if (lang, name, claim) not in self._RB_HUMAN_PENDING:
-            self._RB_HUMAN_PENDING.add((lang, name, claim))
-            import threading
-            threading.Thread(target=self._rb_humanize_now,
-                             args=([claim], name, lang), daemon=True).start()
-        return claim
+        return self._rb_human_labels([claim])[claim][0]
 
     def rb_human_batch(self, claims: list) -> None:
         """Prepare display labels outside the response hot path."""
-        if not self.RB_HUMANIZE:
-            return
-        name, lang = self.owner_name(), self.SPACE_LANG
-        todo = [c for c in dict.fromkeys(claims)
-                if c and (lang, name, c) not in self._RB_HUMAN
-                and (lang, name, c) not in self._RB_HUMAN_PENDING]
-        if not todo:
-            return
-        self._RB_HUMAN_PENDING.update((lang, name, c) for c in todo)
-        import threading
-        threading.Thread(target=self._rb_humanize_now, args=(todo, name, lang), daemon=True).start()
+        self._rb_human_labels(claims)
 
-    def right_brain_tree(self, uid, facts):
+    def right_brain_tree(self, uid, facts, *, memory_vm=None, name=None, language=None, include_all=False):
         """Build affective-memory graph data from the active schema."""
         try:
-            store = self.vm._o._right._traits()
+            store = (memory_vm or self.vm)._o._right._traits()
         except Exception as e:
             print(f"[web] 判断表读取失败：{type(e).__name__}: {e}", flush=True)
             return []
 
-        traits = list(store.all(uid, per_slot=self.RB_ENTITIES_PER_SLOT))
-        self.rb_human_batch([t.claim for t in traits])
+        traits = list(store.all(uid, per_slot=10000 if include_all else self.RB_ENTITIES_PER_SLOT))
+        labels = self._rb_human_labels([t.claim for t in traits], name=name, lang=language,
+                                       prepare=not include_all)
         out = []
         for t in traits:
             out.append({
+                "id": t.id,
                 "cluster": t.cluster,
                 "slot": t.slot,
 
                 "raw": t.claim,
-                "text": self.rb_human(t.claim),
+                "text": labels[t.claim][0],
+                "label_pending": labels[t.claim][1],
                 "desc": "",
                 "notes": [{"text": e.quote, "emotion": e.emotion, "cause": e.cause}
                           for e in t.evidence],
@@ -225,40 +255,62 @@ class Visualization:
             if mid:
                 self._LAST_HIT_IDS.add(str(mid))
 
-    def memory_snapshot(self, limit: int = 48) -> dict:
-        """Read the current memory graph without running inference."""
+    def memory_snapshot(self, limit: int = 48, *, include_all: bool = False) -> dict:
+        """Read a captured Space; include_all bypasses graph caps and label preparation."""
         from voicemem.leftbrain.cognitive_graph.types import SlotV2
 
-        uid = self.vm._o._user_id
+        from voicemem.utils.common.memory_changes import for_space
+        space = self.ACTIVE_SPACE
+        vm = getattr(self, "_SPACES", {}).get(space) or self.vm
+        language = self.space_language(space) if hasattr(self, "space_language") else self.SPACE_LANG
+        directory, _ = self.space_dir(space)
+        feed = for_space(directory)
+        revision, recent = feed.state()
+        uid = vm._o._user_id
         left, right = [], []
+        total_left, total_right = 0, 0
+        entries = []
+        hit_ids = set(self._LAST_HIT_IDS)
         try:
-            repo = self.vm._o._get_repo()
+            repo = vm._o._get_repo()
             entries = repo._vector_store.list_entries(user_id=uid)
 
             cog = repo._cognitive_store
             slot_of = {}
-            for slot in SlotV2:
-                for mid in cog.memory_ids_for_slots(uid, [slot]):
-                    slot_of.setdefault(mid, slot.value)
+            if cog is not None:
+                try:
+                    for slot in SlotV2:
+                        for mid in cog.memory_ids_for_slots(uid, [slot]):
+                            slot_of.setdefault(mid, slot.value)
+                except Exception as e:
+                    print(f"[web] Memory slots unavailable: {type(e).__name__}: {e}", flush=True)
 
             entries = [e for e in entries if e.get("role") != "assistant"]
-
-            #
+            total_left = len(entries)
+            rank = {mid: index for index, mid in enumerate(recent)}
+            entries.sort(key=lambda e: str(e.get("updated_at") or e.get("date") or ""), reverse=True)
+            entries.sort(key=lambda e: (rank.get(str(e["id"]), len(rank)), str(e["id"]) not in hit_ids))
+            owner = self.owner_name(space, memory_vm=vm, entries=entries, revision=revision)
 
             per_slot, kept = {}, []
-            hit_first = ([e for e in entries if str(e["id"]) in self._LAST_HIT_IDS] +
-                         [e for e in entries if str(e["id"]) not in self._LAST_HIT_IDS])
-            for e in hit_first:
+            for e in entries:
                 sl = slot_of.get(e["id"], "daily_life")
-                hit = str(e["id"]) in self._LAST_HIT_IDS
+                hit = str(e["id"]) in hit_ids
                 per_slot[sl] = per_slot.get(sl, 0) + 1
-                if hit or per_slot[sl] <= self.LB_ENTRIES_PER_SLOT:
+                if include_all or str(e["id"]) in rank or hit or per_slot[sl] <= self.LB_ENTRIES_PER_SLOT:
                     kept.append(e)
             entries = kept
 
-            head = [e for e in entries if str(e["id"]) in self._LAST_HIT_IDS]
-            rest = [e for e in entries if str(e["id"]) not in self._LAST_HIT_IDS]
-            for e in (head + rest)[:max(limit, len(head))]:
+            if include_all:
+                visible = entries
+            else:
+                hits = [e for e in entries if str(e["id"]) in hit_ids]
+                rest = [e for e in entries if str(e["id"]) not in hit_ids]
+                remaining = max(0, limit - len(hits))
+                if rest and str(rest[0]["id"]) in rank:
+                    remaining = max(1, remaining)
+                visible = hits + rest[:remaining]
+            for e in visible:
 
                 d = str(e.get("date", ""))
 
@@ -273,12 +325,16 @@ class Visualization:
 
                 left.append({"id": str(e["id"]), "text": e["text"], "date": d if d[:4].isdigit() else "",
                              "slot": slot_of.get(e["id"], "daily_life"),
-                             "hit": str(e["id"]) in self._LAST_HIT_IDS,
+                             "hit": str(e["id"]) in hit_ids,
                              "entities": list(ents)[:6]})
         except Exception as e:
             print(f"[web] 左脑快照读取失败：{e}", flush=True)
         try:
-            right = self.right_brain_tree(uid, self.fact_index(uid))
+            owner = self.owner_name(space, memory_vm=vm, entries=entries, revision=revision)
+            right = self.right_brain_tree(uid, {}, memory_vm=vm, name=owner,
+                                          language=language, include_all=include_all)
+            total_right = vm._o._right._traits().counts(uid)[0]
         except Exception as e:
             print(f"[web] 右脑快照读取失败：{e}", flush=True)
-        return {"left": left, "right": right}
+        return {"left": left, "right": right, "space": space, "epoch": feed.epoch, "revision": revision,
+                "total": {"left": total_left, "right": total_right}}

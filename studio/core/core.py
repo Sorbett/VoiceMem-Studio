@@ -88,6 +88,8 @@ def build_app(agent):
         title=transport.make_title_generator(agent.REPLY, agent.CONFIG["llm"]),
         components=lambda: components_for(agent),
         pet_port=agent.ARGS.port,
+        memory_changes=agent.memory_changes,
+        full_snapshot=lambda: agent.memory_snapshot(include_all=True),
     )
 
 

@@ -130,6 +130,7 @@ def configure(self, args):
     self._BAD_NAME_CHARS = '什谁哪啥吗呢么?？'
     self._RB_HUMAN: dict = {}
     self._RB_HUMAN_PENDING: set = set()
+    self._RB_HUMAN_LOCK = threading.Lock()
     self.RB_HUMANIZE = True
     self._RB_HUMANIZE_PROMPT = RB_HUMANIZE_PROMPT
     self._RB_HUMANIZE_EXAMPLES = RB_HUMANIZE_EXAMPLES
