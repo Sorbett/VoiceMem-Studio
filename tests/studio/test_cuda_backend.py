@@ -139,6 +139,7 @@ class BackendConfigTests(unittest.TestCase):
 class CudaStreamTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.provider = BreezeCUDATTS(instruction='test')
+        self.provider._load = lambda: None
 
     async def asyncTearDown(self):
         await self.provider.aclose()

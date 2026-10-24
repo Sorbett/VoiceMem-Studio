@@ -610,12 +610,15 @@ class AudioPerceiver:
         detection = {"pairs": [], "music": None, "abnormal": [], "embedding": None}
         if audio_path is not None:
             _apath = Path(audio_path)
+            from voicemem.engine import background_checkpoint
 
             if self._enable_scene or self._enable_music or self._enable_abnormal_sound:
+                background_checkpoint()
                 (environment, environment_hint, scene_tag, scene_raw_labels,
                  tune_result, abnormal_hits, detection) = self._detect_scene(_apath)
 
             if self._enable_voiceprint:
+                background_checkpoint()
                 person_id, speaker, stable_voiceprint, vec = self._detect_speaker(
                     speaker, session_id, text, _apath,
                 )
@@ -627,6 +630,7 @@ class AudioPerceiver:
             # Acoustic emotion classification.
             # 只在调用方没显式传 emotion 时才自动检测填充。
             if self._enable_emotion and not emotion:
+                background_checkpoint()
                 try:
                     emotion = self._emotion_detector().detect(_apath)
                 except Exception as _e:

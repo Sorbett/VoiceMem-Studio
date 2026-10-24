@@ -100,8 +100,8 @@ def configure(self, args):
     self._HOT = {'n': 0}
     self._IDLE = asyncio.Event()
     self._IDLE.set()
-    self._IDLE_MAX_WAIT_S = 8.0
-    self._REMEMBER_LOCK = asyncio.Lock()
+    self._NATIVE_IDLE = threading.Event()
+    self._NATIVE_IDLE.set()
     self._REMEMBER_TASKS: set[asyncio.Task] = set()
     self._MEMORY_WRITES: set[str] = set()
     self.ECHO_WINDOW = 300

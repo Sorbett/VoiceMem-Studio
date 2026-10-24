@@ -30,13 +30,30 @@ module redirects to make the root appear smaller.
 | Affective search, ingestion and traits | `rightbrain/` |
 | Audio perception and speaker permissions | `utils/audio/` |
 | Shared request journal | `utils/common/prompt_trace.py` |
-| Accelerator scheduling and serialization | `utils/gpu_loop.py`, `utils/torch_lock.py` |
+| Inference scheduling, resource budgets and serialization | `engine/` |
 
 The root contains thirteen implementation modules: the twelve upstream module
 names plus `gate.py`. Studio persona, prompt configuration, local reply generation,
 Breeze implementation, tone controls and decoder caches live in `studio/` and are
 imported from there directly. The shared journal has one implementation under
 `utils/common/`, used directly by both packages.
+
+Shared inference infrastructure lives in `engine/`: `mlx.py` owns MLX execution
+and bounded output, `cuda.py` owns CUDA speech workers and bounded async delivery,
+`torch.py` owns per-device accelerator admission and CUDA graph initialization,
+`cpu.py` supplies CPU
+runtime budgets, `context.py` captures priority, and `background.py` owns background
+native task lifetime. `admission.py` owns speech-aware cross-backend admission;
+`metrics.py` separates model execution, lock and admission wait; `system.py`
+samples real paging rates off the event loop. Providers import `voicemem.engine` directly.
+This is shared Harness runtime infrastructure; model weights and provider-specific
+inference stay in their adapters, and Studio dialogue policy stays in `studio/harness/`.
+CUDA speech, ASR, routing and GPU perception share device admission. Separate GPUs
+execute independently outside graph initialization, while MPS and legacy adapters
+retain the original singleton lock. See [engine contracts](engine/README.md).
+The former utility entry points remain compatibility imports of these same
+objects; they never construct a second scheduler or lock. Engine imports remain
+lightweight and do not load optional inference runtimes.
 
 ## Existing layers
 

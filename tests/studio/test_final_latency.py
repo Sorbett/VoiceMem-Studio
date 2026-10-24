@@ -203,8 +203,10 @@ class WarmupTests(unittest.TestCase):
                 agent._LOCAL_LLM = None
                 agent.space_language = lambda _: 'zh'
                 agent._warm_final_asr = lambda _: events.append('final-asr')
-                agent._sensevoice = lambda: events.append('sensevoice')
-                agent._warm_emotion2vec = lambda: events.append('emotion')
+                agent._sensevoice = lambda: types.SimpleNamespace(
+                    run_with_emotion=lambda _: events.append('sensevoice'))
+                agent._warm_emotion2vec = lambda _: events.append('emotion')
+                agent._emotion_by_meaning = lambda _: events.append('semantic-emotion')
                 agent._print_backchannel_status = lambda: None
                 agent._mem_line = lambda: 'synthetic'
                 with patch('studio.core.voicemem.memory_warmups', return_value=[]), \

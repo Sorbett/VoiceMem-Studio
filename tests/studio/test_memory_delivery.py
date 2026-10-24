@@ -9,11 +9,11 @@ from studio.core.utils.memory.component import Memory
 
 
 class MemoryCompletionTests(unittest.IsolatedAsyncioTestCase):
-    async def test_native_completion_keeps_agent_pinned_after_background_task_finishes(self):
+    async def test_background_lane_remains_owned_until_durable_completion(self):
         callbacks, events = [], []
         agent = Memory()
         agent.BARGE_DEBUG = False
-        agent._REMEMBER_LOCK, agent._REMEMBER_TASKS = asyncio.Lock(), set()
+        agent._REMEMBER_TASKS = set()
         agent.wait_idle = AsyncMock()
         agent._finish_history_turn = Mock()
 
@@ -26,13 +26,19 @@ class MemoryCompletionTests(unittest.IsolatedAsyncioTestCase):
         pending = types.SimpleNamespace(text='synthetic fact', audio_path='', language='en')
         agent.queue_remember_turn(pending, 'synthetic reply', {}, 'turn', memory, events.append)
         task = next(iter(agent._REMEMBER_TASKS))
-        await asyncio.wait_for(task, 1)
-        await asyncio.sleep(0)
-        self.assertFalse(agent._REMEMBER_TASKS)
+        for _ in range(100):
+            if callbacks:
+                break
+            await asyncio.sleep(.001)
+        self.assertEqual(len(callbacks), 1)
+        self.assertFalse(task.done())
         self.assertTrue(agent._MEMORY_WRITES)
         self.assertEqual(events, [])
         result = {'persistent_memory_created': True, 'memory_ids': ['fixture-memory']}
         await asyncio.to_thread(callbacks[0], result)
+        await asyncio.wait_for(task, 1)
+        await asyncio.sleep(0)
+        self.assertFalse(agent._REMEMBER_TASKS)
         self.assertFalse(agent._MEMORY_WRITES)
         self.assertEqual(events, [result])
         agent._finish_history_turn.assert_called_once_with('turn', result)
@@ -49,6 +55,52 @@ class MemoryCompletionTests(unittest.IsolatedAsyncioTestCase):
         await asyncio.to_thread(agent.remember_turn, pending, '', {}, 'turn', memory, events.append)
         self.assertFalse(agent._MEMORY_WRITES)
         self.assertEqual(events, [{'error': True, 'persistent_memory_created': False}])
+
+    async def test_metadata_failure_waits_for_the_started_durable_write(self):
+        agent = Memory()
+        agent.BARGE_DEBUG = False
+        agent.wait_idle = AsyncMock()
+        agent._finish_history_turn = Mock()
+        agent._remember_tune = Mock(side_effect=RuntimeError('synthetic metadata failure'))
+        entered = asyncio.Event()
+        callbacks = []
+        loop = asyncio.get_running_loop()
+        def ingest(_text, **kwargs):
+            callbacks.append(kwargs['on_complete'])
+            loop.call_soon_threadsafe(entered.set)
+            return {'recognized_tune': True}
+        memory = types.SimpleNamespace(ingest=ingest)
+        pending = types.SimpleNamespace(text='synthetic fixture', audio_path='synthetic.wav', language='en')
+        task = asyncio.create_task(agent._remember_background(pending, '', {}, '', memory))
+        await asyncio.wait_for(entered.wait(), 1)
+        await asyncio.sleep(.01)
+        self.assertFalse(task.done())
+        callbacks[0]({'persistent_memory_created': True})
+        with self.assertRaisesRegex(RuntimeError, 'synthetic metadata failure'):
+            await asyncio.wait_for(task, 1)
+        self.assertFalse(agent._MEMORY_WRITES)
+
+    async def test_history_callback_failure_still_releases_native_lane(self):
+        agent = Memory()
+        agent.BARGE_DEBUG = False
+        agent.wait_idle = AsyncMock()
+        agent._finish_history_turn = Mock(side_effect=RuntimeError('synthetic history failure'))
+        callbacks = []
+        def ingest(_text, **kwargs):
+            callbacks.append(kwargs['on_complete'])
+            return {'speaker_id': ''}
+        memory = types.SimpleNamespace(ingest=ingest)
+        pending = types.SimpleNamespace(text='synthetic fixture', audio_path='', language='en')
+        task = asyncio.create_task(agent._remember_background(pending, '', {}, '', memory))
+        for _ in range(100):
+            if callbacks:
+                break
+            await asyncio.sleep(.001)
+        self.assertEqual(len(callbacks), 1)
+        with self.assertRaisesRegex(RuntimeError, 'synthetic history failure'):
+            callbacks[0]({'persistent_memory_created': True})
+        await asyncio.wait_for(task, 1)
+        self.assertFalse(agent._MEMORY_WRITES)
 
 
 class MemoryDeliveryTests(unittest.IsolatedAsyncioTestCase):

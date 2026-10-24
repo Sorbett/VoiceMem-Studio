@@ -80,7 +80,7 @@ def build_app(agent):
             "speech": {"provider": active_agent.REPLY["tts"]["provider"]},
         }
 
-    return transport.build_app(
+    app = transport.build_app(
         agent.MODE, session, lambda *a, **k: agent.vm.classify(*a, **k),
         agent.memory_snapshot, agent.audio_of,
         spaces=(agent.list_spaces, agent.create_space, agent.use_space, lambda: agent.ACTIVE_SPACE),
@@ -91,6 +91,11 @@ def build_app(agent):
         memory_changes=agent.memory_changes,
         full_snapshot=lambda: agent.memory_snapshot(include_all=True),
     )
+    app.router.add_event_handler('shutdown', agent.drain_memory)
+    from voicemem.engine import observer
+    app.router.add_event_handler('startup', observer.start)
+    app.router.add_event_handler('shutdown', observer.stop)
+    return app
 
 
 def _exit_on_sigterm(signum, frame):

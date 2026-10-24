@@ -16,7 +16,6 @@ def priority_owner():
     owner._HOT = {'n': 0}
     owner._IDLE = asyncio.Event()
     owner._IDLE.set()
-    owner._IDLE_MAX_WAIT_S = .5
     owner.BARGE_DEBUG = False
     return owner
 
@@ -117,14 +116,16 @@ class CapturePriorityTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.gather(task, return_exceptions=True)
             await turns.aclose()
 
-    async def test_background_starvation_limit_remains_bounded(self):
-        self.owner._IDLE_MAX_WAIT_S = .01
+    async def test_background_prefers_idle_within_deferral_budget(self):
         token = self.owner.hot_path_enter()
         try:
-            await asyncio.wait_for(self.owner.wait_idle(), .5)
+            idle = asyncio.create_task(self.owner.wait_idle())
+            await asyncio.sleep(.02)
+            self.assertFalse(idle.done())
             self.assertFalse(self.owner._IDLE.is_set())
         finally:
             self.owner.hot_path_exit(token)
+        await asyncio.wait_for(idle, .5)
 
 
 class ReplyHandoffPriorityTests(ConversationFixture, unittest.IsolatedAsyncioTestCase):

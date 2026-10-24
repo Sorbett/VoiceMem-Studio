@@ -3,7 +3,10 @@ from __future__ import annotations
 
 import asyncio
 import os
+import time
+from contextlib import aclosing
 from pathlib import Path
+from uuid import uuid4
 
 import numpy as np
 
@@ -151,8 +154,52 @@ class BreezeMLXTTS:
                     if self._reference_cache is not None:
                         self._reference_cache.close()
 
+    def _profiled_segments(self, text, instruction, submitted, request_id):
+        from voicemem.engine import speech_scope
+        with speech_scope():
+            started = time.perf_counter()
+            work_s = max_step_s = audio_s = 0.0
+            first_s = None
+            count = 0
+            status = 'cancelled'
+            segments = self._segments(text, instruction)
+            try:
+                while True:
+                    step_started = time.perf_counter()
+                    try:
+                        pcm = next(segments)
+                    except StopIteration:
+                        status = 'complete'
+                        break
+                    finally:
+                        step_s = time.perf_counter() - step_started
+                        work_s += step_s
+                        max_step_s = max(max_step_s, step_s)
+                    produced = time.perf_counter()
+                    if first_s is None:
+                        first_s = produced - started
+                    count += 1
+                    audio_s += len(pcm) / (SAMPLE_RATE * 2)
+                    from voicemem.engine import observe_speech
+                    observe_speech(len(pcm) / (SAMPLE_RATE * 2), step_s, first=count == 1)
+                    yield pcm, produced
+            except Exception:
+                status = 'error'
+                raise
+            finally:
+                try:
+                    close = getattr(segments, 'close', None)
+                    if close is not None:
+                        close()
+                finally:
+                    print(f'[tts-gpu] id={request_id} queue_ms={(started-submitted)*1000:.0f}'
+                          f' first_pcm_ms={(first_s or 0)*1000:.0f}'
+                          f' compute_ms={work_s*1000:.0f} max_step_ms={max_step_s*1000:.0f}'
+                          f' audio_ms={audio_s*1000:.0f} chunks={count}'
+                          f' status={status}', flush=True)
+
     async def _raw(self, text, instruction=None):
-        from voicemem.utils.gpu_loop import gpu_loop
+        from voicemem.engine import Service, gpu_loop, speech_scope
         if not text.strip():
             return
         async with self._lock:
@@ -164,26 +211,43 @@ class BreezeMLXTTS:
                 "cfg_scale": self.cfg_scale, "seed": self.seed,
                 "max_tokens": self.max_tokens,
             })
-            loop = asyncio.get_running_loop()
-
-            job = gpu_loop().iter(lambda: self._segments(text, instruction), weight=4,
-                                  solo_first=True)
+            submitted = time.perf_counter()
+            request_id = uuid4().hex[:8]
+            delivered = 0
+            audio_s = max_delivery_s = max_gap_s = 0.0
+            previous = None
+            status = 'cancelled'
             try:
-                while True:
-                    item = await loop.run_in_executor(None, job.out.get)
-                    if item is None:
-                        return
-                    kind, chunk = item
-                    if kind == "err":
-                        raise chunk
-                    yield chunk
+                with speech_scope():
+                    async with aclosing(gpu_loop().aiter(
+                        lambda: self._profiled_segments(text, instruction, submitted, request_id),
+                        weight=4, solo_first=True, max_pending=2,
+                        service=Service.AUDIO, label="tts")) as chunks:
+                        async for pcm, produced in chunks:
+                            now = time.perf_counter()
+                            max_delivery_s = max(max_delivery_s, now - produced)
+                            if previous is not None:
+                                max_gap_s = max(max_gap_s, now - previous)
+                            previous = now
+                            delivered += 1
+                            audio_s += len(pcm) / (SAMPLE_RATE * 2)
+                            yield pcm
+                status = 'complete'
+            except Exception:
+                status = 'error'
+                raise
             finally:
-                job.cancel()
+                elapsed = time.perf_counter() - submitted
+                print(f'[tts-delivery] id={request_id} chunks={delivered:.0f}'
+                      f' audio_ms={audio_s*1000:.0f} elapsed_ms={elapsed*1000:.0f}'
+                      f' max_gap_ms={max_gap_s*1000:.0f}'
+                      f' max_handoff_ms={max_delivery_s*1000:.0f}'
+                      f' rtf={elapsed/audio_s if audio_s else 0:.3f}'
+                      f' status={status}', flush=True)
 
     async def stream(self, text, instruction=None):
         # Already sample-aligned PCM16; explicitly close the inner generator on
         # early exit so cancellation releases the per-model serialization lock.
-        from contextlib import aclosing
         async with aclosing(self._raw(text, instruction)) as chunks:
             async for chunk in chunks:
                 yield chunk

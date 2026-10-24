@@ -12,6 +12,7 @@ import queue
 import re
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import numpy as np
@@ -215,11 +216,13 @@ ASR_FINISH_TIMEOUT_S = 1.0
 SPEC_MIN_INTERVAL_S = float(os.environ.get("VOICEMEM_SPEC_MIN_INTERVAL", "0.8"))
 SPEC_MIN_GROWTH = int(os.environ.get("VOICEMEM_SPEC_MIN_GROWTH", "6"))
 # Gate inference and query encoding share the process-level Torch lock.
-from voicemem.utils.torch_lock import TORCH_LOCK as _EMBED_LOCK  # Process-wide Torch serialization.
+from voicemem.engine import TORCH_LOCK as _EMBED_LOCK  # Process-wide Torch serialization.
 # One shared recognizer may serve multiple sessions; never decode it concurrently.
 # Separate from the default executor so ingestion cannot queue ahead of final ASR.
 from voicemem.utils.audio.final_asr_executor import FinalASRExecutor
 _FINAL_ASR_EXECUTOR = FinalASRExecutor()
+# EOT remains serial and cannot queue behind background work in the default pool.
+_EOT_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="voicemem-eot")
 
 
 class _AsrWorker:
@@ -440,6 +443,7 @@ class VoiceStream:
         self._eot_score = 0.0  # Latest EOT score.
         self._raw_text = ""  # Streaming transcript before final decoding.
         self._eot_hot = 0.0  # Duration of sustained high EOT scores.
+        self._eot_epoch = 0
         self._final_asr = _UNSET  # Lazy final-ASR provider.
         self._route = _gate_mod.DEEP  # Current route.
         self._last_memory = None  # Latest completed speculative result.
@@ -489,6 +493,7 @@ class VoiceStream:
         if self._closed:
             return
         self._closed = True
+        self._eot_epoch += 1
         tasks = {task for task in (self._spec, self._gate_pre, *self._snapshot_tasks)
                  if task is not None}
         for task in tasks:
@@ -786,6 +791,7 @@ class VoiceStream:
         return turn
 
     def _reset_turn(self):
+        self._eot_epoch += 1
         if getattr(self, "_asr_w", None) is not None:
             self._asr_w.reset()
         elif self._asr is not None:
@@ -904,7 +910,11 @@ class VoiceStream:
             if self._eot_wait >= 0.04:  # Limit EOT probe frequency.
                 self._eot_wait = 0.0
                 try:
-                    _p = self.eot.score(np.concatenate(self._pcm))
+                    detector, epoch = self.eot, self._eot_epoch
+                    _p = await asyncio.get_running_loop().run_in_executor(
+                        _EOT_EXECUTOR, detector.score, np.concatenate(self._pcm))
+                    if self._closed or epoch != self._eot_epoch or detector is not self.eot:
+                        return StreamState("<silence>", self._text, None, None, self.vm)
                     # Sustained high scores reject isolated mid-utterance spikes.
                     self._eot_hot = (self._eot_hot + 0.04) if _p >= EOT_HOT_LEVEL else 0.0
                     # Accept sustained acoustic completion or a text ending with sufficient acoustic support.
@@ -920,6 +930,8 @@ class VoiceStream:
                         print(f"[eot] 静音 {self._silence*1000:3.0f}ms  分数 {_p:.2f}"
                               f"  {'→ 结束' if semantic_done else ''}", flush=True)
                 except Exception as e:
+                    if self._closed or epoch != self._eot_epoch or detector is not self.eot:
+                        return StreamState("<silence>", self._text, None, None, self.vm)
                     print(f"[eot] 判定失败（{type(e).__name__}: {e}）→ 退回掐表",
                           flush=True)
                     self.eot = None

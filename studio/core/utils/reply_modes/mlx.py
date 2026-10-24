@@ -2,8 +2,12 @@
 from __future__ import annotations
 
 import copy
+import asyncio
+import time
+from contextlib import aclosing
 
 from .component import QwenThinkingRouter
+from studio.harness.reply_modes.policy import SYSTEM, EXAMPLES
 
 
 class MLXThinkingRouter(QwenThinkingRouter):
@@ -36,7 +40,7 @@ class MLXThinkingRouter(QwenThinkingRouter):
         return self._tokenizer, self._model
 
     def _predict(self, system: str, examples, prompt: str) -> str:
-        from voicemem.utils.gpu_loop import gpu_loop
+        from voicemem.engine import gpu_loop
 
         self._ensure_model_source()
         return gpu_loop().call(lambda: self._predict_on_gpu(system, examples, prompt))
@@ -45,7 +49,60 @@ class MLXThinkingRouter(QwenThinkingRouter):
         from .short_text import mlx_short_text
         return mlx_short_text(self, system, prompt, max_tokens, cancelled, deadline)
 
+    async def _classify_async(self, text, memory_prefetch_hint, history):
+        from voicemem.engine import gpu_loop
+
+        prompt = self._context_prompt(text, history, memory_prefetch_hint)
+        cached = self._cache.get((text, prompt))
+        if cached is not None:
+            return cached
+        if self._download_default:
+            await asyncio.to_thread(self._ensure_model_source)
+        output = ''
+        submitted = time.perf_counter()
+        async with aclosing(gpu_loop().aiter(
+                lambda: self._timed_prediction(SYSTEM, EXAMPLES, prompt, submitted),
+                label="reply_router")) as steps:
+            async for value in steps:
+                if value is not None:
+                    output = value
+        return self._remember_output(text, prompt, output)
+
+    def _timed_prediction(self, system, examples, prompt, submitted):
+        started = time.perf_counter()
+        work_s = 0.0
+        status = 'cancelled'
+        steps = self._prediction_steps(system, examples, prompt)
+        try:
+            while True:
+                step_started = time.perf_counter()
+                try:
+                    value = next(steps)
+                except StopIteration:
+                    status = 'complete'
+                    break
+                finally:
+                    work_s += time.perf_counter() - step_started
+                yield value
+        except Exception:
+            status = 'error'
+            raise
+        finally:
+            close = getattr(steps, 'close', None)
+            if close is not None:
+                close()
+            print(f'[route-gpu] queue_ms={(started-submitted)*1000:.0f}'
+                  f' compute_ms={work_s*1000:.0f}'
+                  f' status={status}', flush=True)
+
     def _predict_on_gpu(self, system: str, examples, prompt: str) -> str:
+        output = ''
+        for value in self._prediction_steps(system, examples, prompt):
+            if value is not None:
+                output = value
+        return output
+
+    def _prediction_steps(self, system: str, examples, prompt: str):
         import mlx.core as mx
         from mlx_lm.models.cache import make_prompt_cache
 
@@ -76,6 +133,7 @@ class MLXThinkingRouter(QwenThinkingRouter):
                 mx.eval([layer.state for layer in cache])
             self._prefix_tokens, self._prefix_cache = prefix, cache
             self._prefix_key = key
+            yield None
 
         tokens = tokenize(prompt, True)
         count = len(self._prefix_tokens)
@@ -92,6 +150,7 @@ class MLXThinkingRouter(QwenThinkingRouter):
             model(pending[:512][None], cache=cache)
             mx.eval([layer.state for layer in cache])
             pending = pending[512:]
+            yield None
         generated = []
         for _ in range(4):
             logits = model(pending[None], cache=cache)
@@ -100,4 +159,5 @@ class MLXThinkingRouter(QwenThinkingRouter):
                 break
             generated.append(token)
             pending = mx.array([token])
-        return tokenizer.decode(generated).strip()
+            yield None
+        yield tokenizer.decode(generated).strip()

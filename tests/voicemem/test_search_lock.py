@@ -15,7 +15,7 @@ from voicemem.stream import VoiceStream
 from voicemem.orchestrator import Orchestrator
 from voicemem.leftbrain.cognitive_graph.query_slot_classifier import QueryClassification
 from voicemem.leftbrain.local_embedder import _LockedEncoder
-from voicemem.utils.torch_lock import TORCH_LOCK
+from voicemem.engine import TORCH_LOCK
 
 
 class SearchLockTests(unittest.IsolatedAsyncioTestCase):

@@ -2,8 +2,6 @@
 import asyncio
 import time
 from contextlib import aclosing
-from pathlib import Path
-from tempfile import TemporaryDirectory
 
 
 class Startup:
@@ -16,19 +14,32 @@ class Startup:
         model.transcribe(np.zeros(16000, dtype=np.float32))
 
 
-    def _warm_emotion2vec(self):
-        """Load emotion2vec without classifying synthetic silence."""
-        from funasr import AutoModel
-        from studio.paths import MODELS
-        if "m" not in self._E2V:
-            self._E2V["m"] = AutoModel(model=str(MODELS / "emotion2vec"),
-                                         hub="hf", disable_update=True)
+    def _warm_emotion2vec(self, audio_path):
+        """Run emotion2vec inference and reject its empty-result fallback."""
+        import numpy as np
+        from studio.core.utils.perception.component import emotion_inference
+        result = emotion_inference(self._E2V, audio_path)
+        labels = result[0].get('labels', []) if result else []
+        scores = np.asarray(result[0].get('scores', []) if result else [], dtype=float)
+        if (not len(labels) or scores.ndim != 1 or len(scores) != len(labels)
+                or not np.isfinite(scores).all()):
+            raise RuntimeError('emotion2vec 未输出分类结果')
+
+    def _warm_eot(self, pcm):
+        """Exercise EOT features and inference before capture can request a score."""
+        import math
+
+        model = self._eot()
+        if model is None:
+            raise RuntimeError('EOT 未初始化')
+        score = model.score(pcm)
+        if not math.isfinite(score) or not 0 <= score <= 1:
+            raise RuntimeError('EOT 输出无效分数')
 
     def warmup(self):
         """Report every failed warmup and refuse to serve a degraded pipeline."""
-        import numpy as np
-        import soundfile as sf
         from studio.core.voicemem import memory_warmups
+        from studio.core.utils.startup.audio import warmup_audio
         from studio.core.utils.reply_modes.initialize import thinking_router
         failures = []
 
@@ -45,9 +56,12 @@ class Startup:
             tts = self.vm.utils.get('tts')
             text = ('你好，我在这里。' if self.space_language(self.ACTIVE_SPACE) == 'zh'
                     else 'Hello, I am here.')
+            produced_audio = False
             async with aclosing(tts.stream(text)) as chunks:
-                async for _ in chunks:
-                    pass
+                async for chunk in chunks:
+                    produced_audio |= bool(getattr(chunk, 'pcm', chunk))
+            if not produced_audio:
+                raise RuntimeError('TTS 未输出音频')
             if self.ARGS.backchannel:
                 from studio.core.utils.turn_taking.initialize import BackchannelVoice
                 voice = BackchannelVoice(tts, lang=self.space_language(self.ACTIVE_SPACE))
@@ -61,21 +75,16 @@ class Startup:
                     break
 
         if self.MODE == 'llm_tts':
-            if self.ARGS.backend == 'mlx':
-                import mlx.core as mx
-                from voicemem.utils.gpu_loop import gpu_loop
-                gpu_loop().call(lambda: mx.set_cache_limit(536870912))
             step('三级回复路由', lambda: thinking_router().warmup())
-        for name, action in memory_warmups(self.vm):
-            step(name, action)
-        step('最终 ASR', lambda: self._warm_final_asr(self.vm))
-        if self.ARGS.eot:
-            step('EOT', self._eot)
-        step('SenseVoice', self._sensevoice)
-        with TemporaryDirectory(prefix='studio-warmup-') as temporary:
-            silence = Path(temporary) / 'silence.wav'
-            sf.write(silence, np.zeros(16000, dtype=np.float32), 16000)
-            step('emotion2vec', self._warm_emotion2vec)
+        with warmup_audio() as (pcm, audio_path):
+            for name, action in memory_warmups(self.vm, audio_path=audio_path):
+                step(name, action)
+            step('最终 ASR', lambda: self._warm_final_asr(self.vm))
+            if self.ARGS.eot:
+                step('EOT', lambda: self._warm_eot(pcm))
+            step('SenseVoice', lambda: self._sensevoice().run_with_emotion(str(audio_path)))
+            step('emotion2vec', lambda: self._warm_emotion2vec(audio_path))
+        step('语义情绪', lambda: self._emotion_by_meaning('这是一条启动检查消息。'))
         if self._LOCAL_LLM is not None:
             step('本地回复前缀和首字', lambda: asyncio.run(warm_reply()))
         if self.MODE == 'llm_tts':

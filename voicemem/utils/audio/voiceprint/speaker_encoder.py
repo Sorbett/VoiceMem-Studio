@@ -77,7 +77,8 @@ class SpeakerEncoder:
     def embed(self, audio_path: Path) -> np.ndarray | None:
         """返回 192 维 L2 归一化声纹向量，失败时返回 None。"""
         try:
-            with self._lock:
+            from voicemem.engine import inference_call
+            with inference_call("speaker", "onnx_worker", lock=self._lock):
                 self._ensure_started()
                 self._proc.stdin.write(f"{audio_path}\n")
                 self._proc.stdin.flush()

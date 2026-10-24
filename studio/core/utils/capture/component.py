@@ -103,7 +103,6 @@ class Capture:
         bc_rms_fast = 0.0
         bc_rms_slow = 0.0
         bc_gap = 0.0
-        emotion_task = None
 
         #
 
@@ -226,13 +225,6 @@ class Capture:
             st = await stream.feed(raw)
             if on_input_activity:
                 on_input_activity(st.spoke or bool(st.turn) or st.state == "<speak>")
-            if (emotion_task is None and st.spoke and st.state == "<silence>"
-                    and st.silence >= 0.08):
-                snapshot = st
-                emotion_task = asyncio.create_task(
-                    asyncio.to_thread(lambda: snapshot.emotion))
-                background_tasks.add(emotion_task)
-                emotion_task.add_done_callback(background_tasks.discard)
             turn_finished = bool(st.turn)
             utterance.observe(active=st.spoke or bool(st.turn) or st.state == "<speak>",
                               busy=busy_at_capture, reference=reference_at_capture)
@@ -546,14 +538,6 @@ class Capture:
                     print(f"[speaker] owner={owner['id'] or '-'} last={owner['last'] or '-'}"
                           f" miss={owner.get('miss', 0)} stranger={stranger}", flush=True)
                 turn_taking.commit_user_turn()
-                current_emotion = owner.get("emotion", "")
-                if emotion_task is not None:
-                    try:
-                        current_emotion = (await emotion_task) or current_emotion
-                    except Exception as exc:
-                        if self.BARGE_DEBUG:
-                            print(f"[emotion] 提前分析失败：{type(exc).__name__}: {exc}", flush=True)
-                emotion_task = None
                 yield Pending(st.turn.text,
                               "" if stranger else st.turn.memory_context,
                               st.turn.result, spoken=True,
@@ -561,7 +545,7 @@ class Capture:
                                   self.save_turn_audio, getattr(st, "_pcm", None)),
                               stranger=stranger,
                               replay="" if stranger else self._replay_id(st.turn.text, st.turn.result),
-                              emotion=current_emotion,
+                              emotion=owner.get("emotion", ""),
                               route=st.turn.route,
                               reply_mode=(MEMORY if gate.needs_memory(st.turn.route)
                                           else DIRECT),

@@ -201,12 +201,17 @@ class LlmTimingTests(unittest.TestCase):
     def test_instrumentation_keeps_cache_text_and_generation_options(self):
         from studio.core.utils.llm import local as local_llm
         llm = local_llm.LocalLLM.__new__(local_llm.LocalLLM)
+        llm._cache_lock = threading.Lock()
         llm._cache, llm._cached_prefix = "cache", [1, 2]
         llm._base, llm._base_ids = None, []
-        llm.load = lambda: (object(), types.SimpleNamespace(encode=lambda _: [1, 2, 3, 4]))
+        cache_state = types.SimpleNamespace(state=None)
+        def model(tokens, *, cache):
+            self.assertEqual(tokens.tolist(), [[3]])
+            self.assertEqual(cache, [cache_state])
+        llm.load = lambda: (model, types.SimpleNamespace(encode=lambda _: [1, 2, 3, 4]))
         llm._render = lambda _: "prompt"
         llm._msgs = lambda *a: []
-        llm._fork = lambda c: "forked-" + c
+        llm._fork = lambda c: [cache_state]
         options = []
         def generate(model, tok, prompt, **kw):
             options.append((prompt, kw))
@@ -217,6 +222,8 @@ class LlmTimingTests(unittest.TestCase):
                 yield types.SimpleNamespace(text=text)
         fake_core = types.ModuleType("mlx.core")
         fake_core.clear_cache = lambda: None
+        import numpy as np
+        fake_core.array, fake_core.eval = np.array, lambda _: None
         fake_mlx = types.ModuleType("mlx")
         fake_mlx.core = fake_core
         fake_lm = types.ModuleType("mlx_lm")
@@ -226,9 +233,9 @@ class LlmTimingTests(unittest.TestCase):
             for debug in [True, False]:
                 output = io.StringIO()
                 with patch.object(local_llm, "DEBUG", debug), contextlib.redirect_stdout(output):
-                    self.assertEqual(list(llm._gen_iter("hi", "", [])), ["", "你", "好"])
-                self.assertEqual(options[-1][0], [3, 4])
-                self.assertEqual(options[-1][1]["prompt_cache"], "forked-cache")
+                    self.assertEqual(list(llm._gen_iter("hi", "", [])), ["", "", "你", "好"])
+                self.assertEqual(options[-1][0], [4])
+                self.assertEqual(options[-1][1]["prompt_cache"], [cache_state])
                 self.assertEqual(options[-1][1]["max_tokens"], 512)
                 self.assertEqual("[llm-detail]" in output.getvalue(), debug)
                 if debug:
@@ -236,23 +243,21 @@ class LlmTimingTests(unittest.TestCase):
 
     def test_delivery_unwraps_timestamp_and_cancels_job(self):
         from studio.core.utils.llm import local as local_llm
+        from tests.helpers.gpu import cpu_gpu_loop
         llm = local_llm.LocalLLM.__new__(local_llm.LocalLLM)
+        closed = []
         def tokens(*a):
-            yield ""
-            yield "你好"
+            try:
+                yield ""
+                yield "你好"
+            finally:
+                closed.append(True)
         llm._gen_iter = tokens
-        job = types.SimpleNamespace(out=queue.Queue(), cancelled=False)
-        job.cancel = lambda: setattr(job, "cancelled", True)
-        def submit(make):
-            for item in make():
-                job.out.put(("ok", item))
-            job.out.put(None)
-            return job
         async def run():
             return [text async for text in llm("hi")]
-        with patch.object(local_llm, "gpu_loop", lambda: types.SimpleNamespace(iter=submit)):
+        with cpu_gpu_loop() as gpu, patch.object(local_llm, "gpu_loop", lambda: gpu):
             self.assertEqual(asyncio.run(run()), ["你好"])
-        self.assertTrue(job.cancelled)
+        self.assertEqual(closed, [True])
 
 
 if __name__ == "__main__":

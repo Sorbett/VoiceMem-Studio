@@ -140,9 +140,13 @@ class QwenThinkingRouter:
             device = self.device_name or ("cuda" if torch.cuda.is_available() else "cpu")
             dtype = torch.bfloat16 if device.startswith("cuda") else torch.float32
             tokenizer = AutoTokenizer.from_pretrained(self.model_name)
-            model = AutoModelForCausalLM.from_pretrained(
-                self.model_name, torch_dtype=dtype, low_cpu_mem_usage=True)
-            model.to(device).eval()
+            from voicemem.engine import device_lock
+            lock = device_lock(device)
+            device = lock.device or device
+            with lock:
+                model = AutoModelForCausalLM.from_pretrained(
+                    self.model_name, torch_dtype=dtype, low_cpu_mem_usage=True)
+                model.to(device).eval()
             self._tokenizer, self._model, self._device = tokenizer, model, device
             print(f"[thinking] router ready: {self.model_name} on {device}", flush=True)
         return self._tokenizer, self._model, self._device
@@ -162,20 +166,21 @@ class QwenThinkingRouter:
             add_generation_prompt=True,
             enable_thinking=False,
         )
-        inputs = tokenizer(rendered, return_tensors="pt").to(device)
+        inputs = tokenizer(rendered, return_tensors="pt")
         import torch
 
-        from voicemem.utils.torch_lock import TORCH_LOCK
+        from voicemem.engine import device_lock, inference_call
 
-        with TORCH_LOCK, torch.inference_mode():
+        with inference_call("reply_router", "torch", lock=device_lock(device)), torch.inference_mode():
+            inputs = inputs.to(device)
             generated = model.generate(
                 **inputs,
                 max_new_tokens=4,
                 do_sample=False,
                 pad_token_id=tokenizer.eos_token_id,
             )
-        output = tokenizer.decode(
-            generated[0, inputs["input_ids"].shape[1]:], skip_special_tokens=True)
+            output = tokenizer.decode(
+                generated[0, inputs["input_ids"].shape[1]:], skip_special_tokens=True)
         return output.strip()
 
     def _context_prompt(self, text: str, history, prefetch_hint: bool) -> str:
@@ -208,22 +213,27 @@ class QwenThinkingRouter:
         if cached is not None:
             return cached
 
-        def remember(decision: ThinkingDecision) -> ThinkingDecision:
-            if len(self._cache) >= 256:
-                self._cache.pop(next(iter(self._cache)))
-            self._cache[key] = decision
-            return decision
-
         output = self._predict(
             SYSTEM,
             EXAMPLES,
             prompt,
         )
+        return self._remember_output(text, prompt, output)
+
+    def _remember_output(self, text: str, prompt: str, output: str) -> ThinkingDecision:
+        """Validate and cache a completed classification under its input context."""
         label = (output or '').strip().strip('。.!！')
         if label not in {'是', '否'}:
             print('[thinking] 深思判定输出无效，保持普通推理；不改变记忆资格', flush=True)
         decision = ThinkingDecision(SLOW if label == '是' else FAST, raw=label)
-        return remember(decision)
+        if len(self._cache) >= 256:
+            self._cache.pop(next(iter(self._cache)))
+        self._cache[(text, prompt)] = decision
+        return decision
+
+    async def _classify_async(self, text, memory_prefetch_hint, history):
+        """Run the synchronous provider off-loop; accelerators may override it."""
+        return await asyncio.to_thread(self.classify, text, memory_prefetch_hint, history)
 
     async def classify_async(self, text: str, memory_prefetch_hint: bool = False,
                              history=None) -> ThinkingDecision:
@@ -233,8 +243,7 @@ class QwenThinkingRouter:
         key = (loop, text, self._context_prompt(text, history, memory_prefetch_hint))
         job = self._classifications.get(key)
         if job is None:
-            task = asyncio.create_task(asyncio.to_thread(
-                self.classify, text, memory_prefetch_hint, history))
+            task = asyncio.create_task(self._classify_async(text, memory_prefetch_hint, history))
             job = {"task": task, "waiters": 0}
             self._classifications[key] = job
 
@@ -255,6 +264,7 @@ class QwenThinkingRouter:
                 if self._classifications.get(key) is job:
                     self._classifications.pop(key)
                 job["task"].cancel()
+                await asyncio.gather(job["task"], return_exceptions=True)
 
     async def generate_short_text_async(self, system: str, prompt: str, *,
                                         max_tokens: int = 40, timeout_s: float = 1.2) -> str:

@@ -115,7 +115,7 @@ _LAZY: dict[str, str] = {
 
 # Expose registered subpackages lazily alongside the component exports.
 _SUBPACKAGES: tuple[str, ...] = (
-    "leftbrain", "rightbrain", "utils",
+    "engine", "leftbrain", "rightbrain", "utils",
 )
 
 __all__ = sorted([*_LAZY, *_SUBPACKAGES])

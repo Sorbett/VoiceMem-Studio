@@ -117,11 +117,12 @@ class JournalTests(unittest.IsolatedAsyncioTestCase):
         tts.__dict__.update(_lock=asyncio.Lock(), model_name="test-model", instruction="默认情绪",
                             ref_audio="/test/reference.wav", ref_text="参考原文", cfg_scale=1,
                             seed=42, max_tokens=750)
-        out = queue.Queue()
-        out.put(None)
-        job = types.SimpleNamespace(out=out, cancel=lambda: None)
-        loop = types.SimpleNamespace(iter=lambda *a, **kw: job)
-        with patch("voicemem.utils.gpu_loop.gpu_loop", return_value=loop):
+        async def empty_stream(*args, **kwargs):
+            for chunk in ():
+                yield chunk
+
+        loop = types.SimpleNamespace(aiter=empty_stream)
+        with patch("voicemem.engine.gpu_loop", return_value=loop):
             with trace.prompt_scope(output_id="breeze"):
                 self.assertEqual([x async for x in tts.stream("第一段", "语速平稳")], [])
         request = self.rows()[0][0]["request"]

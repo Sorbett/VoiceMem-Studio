@@ -17,7 +17,7 @@ def _streaming_model(kind, device):
 def streaming(language="auto"):
     """Default to bilingual FunASR; retain the explicit English adapter."""
     from voicemem.utils.audio.asr import pick_device
-    from voicemem.utils.torch_lock import TORCH_LOCK
+    from voicemem.engine import device_lock
     kind = "funasr" if language in {"auto", "zh"} else "sherpa"
     configured = (os.environ.get('STUDIO_ASR_DEVICE')
                   or os.environ.get('VOICEMEM_ASR_DEVICE')
@@ -25,7 +25,9 @@ def streaming(language="auto"):
                       if os.environ.get('STUDIO_BACKEND') == 'cuda' else None)
                   or 'auto')
     device = (pick_device() if configured == 'auto' else configured) if kind == "funasr" else "cpu"
-    with TORCH_LOCK:
+    lock = device_lock(device)
+    device = lock.device or device
+    with lock:
         return _streaming_model(kind, device).new_stream()
 
 
@@ -37,6 +39,6 @@ def _final_model():
 
 def final():
     """Reuse stateless refinement weights without fixing one input language."""
-    from voicemem.utils.torch_lock import TORCH_LOCK
+    from voicemem.engine import TORCH_LOCK
     with TORCH_LOCK:
         return _final_model()

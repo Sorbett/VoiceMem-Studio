@@ -180,7 +180,7 @@ class LocalFillerTests(unittest.IsolatedAsyncioTestCase):
 class TorchShortTextTests(unittest.TestCase):
     def fixture(self, tokens):
         import torch
-        from voicemem.utils.torch_lock import TORCH_LOCK
+        from voicemem.engine import TORCH_LOCK
         calls = []
         token_ids = iter(tokens)
         cache = object()
@@ -223,7 +223,7 @@ class TorchShortTextTests(unittest.TestCase):
         router._model.assert_not_called()
 
     def test_lock_wait_obeys_deadline_without_forward(self):
-        from voicemem.utils.torch_lock import TORCH_LOCK
+        from voicemem.engine import TORCH_LOCK
         router, calls, _ = self.fixture([3, 4, 5])
         results = []
         with TORCH_LOCK:
@@ -290,7 +290,7 @@ class MLXShortTextTests(unittest.IsolatedAsyncioTestCase):
             workers.append(worker)
             worker.start()
             return job
-        with patch.dict(sys.modules, modules), patch('voicemem.utils.gpu_loop.gpu_loop',
+        with patch.dict(sys.modules, modules), patch('voicemem.engine.gpu_loop',
                 return_value=types.SimpleNamespace(iter=submit)):
             result = await router.generate_short_text_async('s','p')
             for worker in workers:
@@ -305,7 +305,7 @@ class MLXShortTextTests(unittest.IsolatedAsyncioTestCase):
         router._model = Mock(side_effect=AssertionError('queued work must not run'))
         cancelled = threading.Event()
         job = types.SimpleNamespace(out=queue.Queue(), cancel=cancelled.set)
-        with patch('voicemem.utils.gpu_loop.gpu_loop',
+        with patch('voicemem.engine.gpu_loop',
                    return_value=types.SimpleNamespace(iter=lambda *a,**k:job)):
             self.assertEqual(await router.generate_short_text_async('s','p',timeout_s=.04), '')
             self.assertTrue(await asyncio.to_thread(cancelled.wait, 1))

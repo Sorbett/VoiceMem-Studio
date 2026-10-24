@@ -1,0 +1,19 @@
+"""CPU inference budgets supplied to optional provider runtimes."""
+from __future__ import annotations
+
+
+def cpu_session_options(runtime, *, threads=2):
+    """Build bounded ONNX CPU execution without idle worker spinning.
+
+    The caller supplies the optional runtime, keeping engine import lightweight.
+    Model inputs, graph optimization and output contracts remain provider-owned.
+    """
+    if threads < 1:
+        raise ValueError("CPU inference threads must be positive")
+    options = runtime.SessionOptions()
+    options.inter_op_num_threads = 1
+    options.intra_op_num_threads = threads
+    options.execution_mode = runtime.ExecutionMode.ORT_SEQUENTIAL
+    options.add_session_config_entry("session.intra_op.allow_spinning", "0")
+    options.add_session_config_entry("session.inter_op.allow_spinning", "0")
+    return options

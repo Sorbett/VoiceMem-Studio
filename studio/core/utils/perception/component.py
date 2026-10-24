@@ -4,6 +4,27 @@ import re
 import time
 from studio.core.voicemem import shared_embed_model
 from studio.paths import MODELS
+from studio.core.utils.memory.background import background_lane
+
+
+def emotion_inference(cache, audio_path):
+    """Reuse emotion2vec on its configured device for warmup and runtime calls."""
+    from voicemem.engine import device_lock, inference_call
+    if "m" not in cache:
+        from funasr import AutoModel
+        import torch
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        lock = device_lock(device)
+        with lock:
+            if "m" not in cache:
+                cache["m"] = AutoModel(model=str(MODELS / 'emotion2vec'),
+                                       device=lock.device or device, hub="hf", disable_update=True)
+    config = getattr(cache["m"], "kwargs", {})
+    device = config.get("device", "cpu") if isinstance(config, dict) else "cpu"
+    lock = device_lock(device) if str(device).startswith("cuda") else None
+    with inference_call("emotion2vec", "torch", lock=lock, device=device):
+        return cache["m"].generate(str(audio_path), granularity="utterance", extract_embedding=False)
+
 
 class Perception:
     def _mentioned(self, name: str, text: str) -> bool:
@@ -38,11 +59,7 @@ class Perception:
         return lab if best >= 0.80 and gap >= 0.02 else ""
 
     def _acoustic_emotion(self, audio_path: str):
-        if "m" not in self._E2V:
-            from funasr import AutoModel
-            self._E2V["m"] = AutoModel(model=str(MODELS / 'emotion2vec'),
-                                  hub="hf", disable_update=True)
-        r = self._E2V["m"].generate(audio_path, granularity="utterance", extract_embedding=False)
+        r = emotion_inference(self._E2V, audio_path)
         if not r:
             return "", 0.0
         lab, score = max(zip(r[0]["labels"], r[0]["scores"]), key=lambda x: x[1])
@@ -61,15 +78,25 @@ class Perception:
         if not audio_path:
             return
 
+        def infer():
+            from voicemem.engine import background_scope
+            if not is_current():
+                return None
+            with background_scope(None):
+                return self._acoustic_emotion(audio_path)
+
         async def run():
             try:
                 if not is_current():
                     return
-                await self.wait_idle("声学情绪")
-                if not is_current():
-                    return
                 t0 = time.monotonic()
-                emo, score = await asyncio.to_thread(self._acoustic_emotion, audio_path)
+                result = await background_lane(self).run(
+                    lambda: self.wait_idle("声学情绪"),
+                    lambda: asyncio.to_thread(infer),
+                    is_current=is_current)
+                if result is None:
+                    return
+                emo, score = result
                 take = bool(emo) and score >= self.ACOUSTIC_MIN_SCORE and emo in self.ACOUSTIC_TRUST
                 if self.BARGE_DEBUG:
                     print(f"  [emotion] 声学(后台) {(time.monotonic()-t0)*1000:.0f}ms "

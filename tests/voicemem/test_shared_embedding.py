@@ -8,7 +8,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 from voicemem.leftbrain import local_embedder
-from voicemem.utils.torch_lock import TORCH_LOCK
+from voicemem.engine import TORCH_LOCK
 
 
 class SharedModelTests(unittest.TestCase):

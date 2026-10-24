@@ -48,13 +48,14 @@ def _messages(system, prompt):
 
 
 def torch_short_text(router, system, prompt, max_tokens, cancelled, deadline):
-    """Decode off-loop without holding TORCH_LOCK for the whole sentence."""
+    """Decode off-loop, releasing device admission between native steps."""
     import torch
-    from voicemem.utils.torch_lock import TORCH_LOCK
+    from voicemem.engine import device_lock
 
     if _expired(cancelled, deadline):
         return ""
     tokenizer, model, device = router._tokenizer, router._model, router._device
+    lock = device_lock(device)
     rendered = tokenizer.apply_chat_template(
         _messages(system, prompt), tokenize=False, add_generation_prompt=True,
         enable_thinking=False)
@@ -66,13 +67,13 @@ def torch_short_text(router, system, prompt, max_tokens, cancelled, deadline):
     pending = inputs['input_ids']
     cache = None
     generated = []
-    rng = torch.Generator(device=device).manual_seed(secrets.randbits(63))
+    rng = None
     eos = model.generation_config.eos_token_id
     eos = set(eos if isinstance(eos, (list, tuple)) else [eos])
     eos.add(tokenizer.eos_token_id)
     for _ in range(max_tokens):
         while not _expired(cancelled, deadline):
-            if TORCH_LOCK.acquire(timeout=0.01):
+            if lock.acquire(timeout=0.01):
                 break
         else:
             return ""
@@ -80,6 +81,8 @@ def torch_short_text(router, system, prompt, max_tokens, cancelled, deadline):
             if _expired(cancelled, deadline):
                 return ""
             with torch.inference_mode():
+                if rng is None:
+                    rng = torch.Generator(device=device).manual_seed(secrets.randbits(63))
                 result = model(input_ids=pending.to(device), past_key_values=cache,
                                use_cache=True)
                 cache = result.past_key_values
@@ -87,7 +90,7 @@ def torch_short_text(router, system, prompt, max_tokens, cancelled, deadline):
                 token = torch.multinomial(probabilities, 1, generator=rng).item()
                 pending = torch.tensor([[token]], device=device)
         finally:
-            TORCH_LOCK.release()
+            lock.release()
         if _expired(cancelled, deadline):
             return ""
         if token in eos:
@@ -105,7 +108,7 @@ def torch_short_text(router, system, prompt, max_tokens, cancelled, deadline):
 
 def mlx_short_text(router, system, prompt, max_tokens, cancelled, deadline):
     """Consume a cancellable, non-exclusive job on the process MLX thread."""
-    from voicemem.utils.gpu_loop import gpu_loop
+    from voicemem.engine import gpu_loop
 
     def tokens():
         import mlx.core as mx

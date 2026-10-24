@@ -12,6 +12,7 @@ import time
 
 from studio.core.utils.tts.cuda import BreezeCUDATTS
 from studio.paths import MODELS, VOICE
+from voicemem.engine import model_metrics, torch_snapshot
 
 
 async def benchmark(args):
@@ -29,7 +30,8 @@ async def benchmark(args):
             from voicemem.utils.audio.asr import FunASRStreamingASR
             import numpy as np
             asr = FunASRStreamingASR(
-                model=str(MODELS / 'asr/funasr-paraformer-zh-streaming'), device=args.device)
+                model=str(MODELS / 'asr/funasr-paraformer-zh-streaming'),
+                device=args.asr_device or args.device)
 
             def listen():
                 try:
@@ -41,6 +43,7 @@ async def benchmark(args):
 
             asr_thread = threading.Thread(target=listen, name='benchmark-asr')
             asr_thread.start()
+        model_metrics(reset=True)
         for index in range(args.repeats):
             texts = [args.text]
             if args.segmented:
@@ -59,7 +62,8 @@ async def benchmark(args):
                             yield pcm
 
             started = time.monotonic()
-            first = None
+            first = previous = None
+            max_gap = 0.
             size = count = 0
             deficit = 0.0
             async with aclosing(response()) as chunks:
@@ -67,6 +71,9 @@ async def benchmark(args):
                     now = time.monotonic()
                     if first is None:
                         first = now
+                    if previous is not None:
+                        max_gap = max(max_gap, now-previous)
+                    previous = now
                     deficit = max(deficit, now - first - size / 48000)
                     size += len(pcm)
                     count += 1
@@ -74,11 +81,14 @@ async def benchmark(args):
             if not size:
                 raise RuntimeError('No PCM generated')
             audio = size / 48000
-            row = dict(run=index + 1, depth=args.depth_mode, same_gpu_asr=args.with_asr,
+            row = dict(run=index + 1, depth=args.depth_mode, tts_device=tts.device,
+                       asr_device=asr.device if args.with_asr else None,
+                       same_gpu_asr=args.with_asr and asr.device == tts.device,
                        segments=len(texts),
                        audio_s=round(audio, 3), elapsed_s=round(elapsed, 3),
                        rtf=round(elapsed / audio, 3), first_ms=round((first - started) * 1000),
-                       delivery_deficit_ms=round(deficit * 1000), chunks=count)
+                       delivery_deficit_ms=round(deficit * 1000), max_gap_ms=round(max_gap*1000),
+                       chunks=count, model_metrics=model_metrics(reset=True), devices=torch_snapshot())
             results.append(row)
             print(json.dumps(row), flush=True)
         if failures:
@@ -97,6 +107,7 @@ if __name__ == '__main__':
     parser.add_argument('--device', default='cuda:0')
     parser.add_argument('--depth-mode', choices=('cached', 'compiled'), default='compiled')
     parser.add_argument('--with-asr', action='store_true')
+    parser.add_argument('--asr-device', help='Defaults to the TTS device; use cuda:N for a separate GPU')
     parser.add_argument('--segmented', action='store_true', help='Use Studio text segmentation')
     parser.add_argument('--assert-realtime', action='store_true')
     parser.add_argument('--repeats', type=int, default=2)

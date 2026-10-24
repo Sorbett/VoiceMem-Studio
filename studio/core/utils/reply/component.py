@@ -43,7 +43,8 @@ class Reply:
         cancelled = threading.Event()
 
         def build():
-            with self._REPLY_DISPLAY_LOCK:
+            from voicemem.engine import background_scope
+            with background_scope(None), self._REPLY_DISPLAY_LOCK:
                 if cancelled.is_set() or self.ACTIVE_SPACE != space or self.vm is not memory_vm:
                     return None
                 return self.fill_tags(
@@ -79,9 +80,13 @@ class Reply:
         display = asyncio.create_task(self._send_reply_display(
             pending, send, ready, timeline.output_id, context_space, memory_vm))
         from voicemem.utils.common.prompt_trace import prompt_scope
+        from voicemem.engine import SpeechFeedback, speech_scope
+        feedback = SpeechFeedback()
+        timeline.inference_feedback = feedback
         try:
             with prompt_scope(output_id=timeline.output_id, session=context_session,
-                              space=context_space, early=bool(getattr(pending, "early_ok", False))):
+                              space=context_space, early=bool(getattr(pending, "early_ok", False))), \
+                    speech_scope(feedback, producing=False):
                 return await self._voicemem_llm_tts(
                     pending, send, send_audio, owner, timeline, said=said,
                     context_session=context_session, context_space=context_space,

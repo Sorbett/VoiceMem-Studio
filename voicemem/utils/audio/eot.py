@@ -27,6 +27,8 @@
 from __future__ import annotations
 
 import os
+import hashlib
+import time
 
 import numpy as np
 
@@ -51,14 +53,14 @@ class EndOfTurn:
         from transformers import WhisperFeatureExtractor
 
         path = model_path or self._resolve()
-        so = ort.SessionOptions()
-        so.inter_op_num_threads = 1          # 跟官方推理代码一致
-        so.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+        from voicemem.engine import cpu_session_options
+        so = cpu_session_options(ort)
         self._sess = ort.InferenceSession(path, sess_options=so,
                                           providers=["CPUExecutionProvider"])
         # chunk_length=8 是这个模型的窗口；其余参数用 Whisper 默认（它就是 Whisper 编码器）
         self._fe = WhisperFeatureExtractor(chunk_length=WINDOW_S)
         self.threshold = threshold
+        self._score_cache = None
 
     @staticmethod
     def _resolve() -> str:
@@ -97,18 +99,32 @@ class EndOfTurn:
         return a[:end]
 
     def score(self, pcm, sample_rate: int = 16000) -> float:
-        """0~1，越大越像「说完了」。onnx 输出**已经是概率**，别再套 sigmoid。"""
+        """Return the native completion probability, reusing identical canonical input.
+
+        The one-entry cache retains only a digest and score, never audio. Changed
+        samples, sample rate or injected model components invalidate the entry.
+        """
+        from voicemem.engine import Service, inference_call
+        started = time.perf_counter()
         n = WINDOW_S * sample_rate
         a = self._frame(np.asarray(pcm, np.float32).reshape(-1), sample_rate)
-        # 不够 8 秒**在前面补零**（官方 truncate_audio_to_last_n_seconds 就是这样）：
-        # 补在后面等于告诉模型「话说完后还有一段静音」，那正是它要判的东西，
-        # 补错一边结论就反了。
-        a = a[-n:] if len(a) > n else np.pad(a, (n - len(a), 0))
-        feat = self._fe(a, sampling_rate=sample_rate, return_tensors="np",
-                        padding="max_length", max_length=n, truncation=True,
-                        do_normalize=True).input_features
-        out = self._sess.run(None, {"input_features": feat.astype(np.float32)})
-        return float(np.asarray(out[0]).reshape(-1)[0])
+        a = np.ascontiguousarray(a[-n:]) if len(a) > n else np.pad(a, (n-len(a), 0))
+        key = (sample_rate, id(self._fe), id(self._sess), hashlib.sha256(a.data).digest())
+        cached = getattr(self, "_score_cache", None)
+        if cached is not None and cached[0] == key:
+            from voicemem.engine.context import inference_scope
+            from voicemem.engine.metrics import record
+            with inference_scope(Service.AUDIO):
+                record("eot", "cache", time.perf_counter()-started)
+            return cached[1]
+        with inference_call("eot", "onnx", service=Service.AUDIO):
+            feat = self._fe(a, sampling_rate=sample_rate, return_tensors="np",
+                            padding="max_length", max_length=n, truncation=True,
+                            do_normalize=True).input_features
+            out = self._sess.run(None, {"input_features": feat.astype(np.float32)})
+            score = float(np.asarray(out[0]).reshape(-1)[0])
+        self._score_cache = key, score
+        return score
 
     def done(self, pcm, sample_rate: int = 16000) -> bool:
         return self.score(pcm, sample_rate) >= self.threshold

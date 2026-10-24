@@ -53,11 +53,12 @@ async def main():
         finally:
             await reply.aclose()
     tts = BreezeMLXTTS(model='test-only')  # constructor does not load MLX
-    q = queue.Queue(); q.put(None)
-    job = types.SimpleNamespace(out=q, cancel=lambda: None)
+    async def empty_stream(*args, **kwargs):
+        for chunk in ():
+            yield chunk
     instruction = tts_control.instruction('认真', ns['_SPEAK_BASE']['zh'])
-    with patch('voicemem.utils.gpu_loop.gpu_loop', return_value=types.SimpleNamespace(
-            iter=lambda *a,**kw: job)), patch('voicemem.utils.common.prompt_trace.record_request') as record:
+    with contextlib.redirect_stdout(sys.stderr), patch('voicemem.engine.gpu_loop', return_value=types.SimpleNamespace(
+            aiter=empty_stream)), patch('voicemem.utils.common.prompt_trace.record_request') as record:
         async for _ in tts.stream('测试正文', instruction):
             pass
         request = record.call_args.args[2]

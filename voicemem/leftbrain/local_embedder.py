@@ -24,6 +24,8 @@ query/passage 前缀、向量维度。换模型 = 换一个 key，前缀跟着�
 from __future__ import annotations
 
 import os
+import sys
+import threading
 from dataclasses import dataclass
 from functools import lru_cache
 
@@ -143,14 +145,15 @@ def resolve_path(model: LocalEmbedModel) -> str:
 
 
 class _LockedEncoder:
-    """SentenceTransformer 的壳：``encode`` 持进程级 torch 锁（见 utils/torch_lock）。
-    其他属性原样透传。"""
+    """Preserve the encoder interface while admitting and timing locked inference."""
     def __init__(self, m):
         self._m = m
+        self._lock = threading.RLock()
 
     def encode(self, *a, **k):
-        from voicemem.utils.torch_lock import TORCH_LOCK
-        with TORCH_LOCK:
+        from voicemem.engine import device_lock, inference_call
+        locks = (self._lock, lambda: device_lock(k.get("device") or getattr(self._m, "device", None)))
+        with inference_call("embedding", "torch", lock=locks):
             return self._m.encode(*a, **k)
 
     def __getattr__(self, name):
@@ -164,7 +167,7 @@ def shared_model(path: str, tokenizer_kwargs: tuple = ()):
     duplicate models or initialize MPS while another model is encoding. Pass
     both arguments positionally to canonicalize omitted and explicit defaults.
     """
-    from voicemem.utils.torch_lock import TORCH_LOCK
+    from voicemem.engine import TORCH_LOCK
     with TORCH_LOCK:
         return _cached_shared_model(path, tokenizer_kwargs)
 
@@ -179,14 +182,24 @@ def _cached_shared_model(path: str, tokenizer_kwargs: tuple):
         except Exception:
             pass
     from sentence_transformers import SentenceTransformer
+    from voicemem.engine import device_lock
+    torch = sys.modules.get("torch")
+    cuda = getattr(torch, "cuda", None)
+    device = f"cuda:{cuda.current_device()}" if cuda is not None and cuda.is_available() else None
+    with device_lock(device):
+        return _construct_shared_model(SentenceTransformer, path, tokenizer_kwargs)
+
+
+def _construct_shared_model(factory, path, tokenizer_kwargs):
+    """Construct under both cache serialization and resolved device admission."""
     if not tokenizer_kwargs:
-        return _LockedEncoder(SentenceTransformer(path))
+        return _LockedEncoder(factory(path))
     # Preserve left-padding for last-token pooling across library versions.
     kw = dict(tokenizer_kwargs)
     try:
-        return _LockedEncoder(SentenceTransformer(path, processor_kwargs=kw))
+        return _LockedEncoder(factory(path, processor_kwargs=kw))
     except TypeError:
-        return _LockedEncoder(SentenceTransformer(path, tokenizer_kwargs=kw))
+        return _LockedEncoder(factory(path, tokenizer_kwargs=kw))
 
 
 shared_model.cache_clear = _cached_shared_model.cache_clear

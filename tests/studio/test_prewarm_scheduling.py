@@ -18,6 +18,7 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 from tests.helpers.studio import studio_tree, studio_source, execute
 from voicemem.lang import detect_language
+from tests.helpers.gpu import cpu_gpu_loop
 
 
 def session_namespace():
@@ -148,16 +149,16 @@ class SchedulingTests(unittest.IsolatedAsyncioTestCase):
 class QueuedWarmTests(unittest.IsolatedAsyncioTestCase):
     async def test_invalidated_gpu_queue_entry_never_runs_model(self):
         from studio.core.utils.llm.local import LocalLLM
-        llm = LocalLLM.__new__(LocalLLM)
+        llm = LocalLLM(system="synthetic persona")
         calls = []
-        llm._prewarm = lambda *a: calls.append(a) or 42
+        llm._prewarm_steps = lambda *a: calls.append(a) or iter([42])
         queued, release, cancelled = threading.Event(), threading.Event(), threading.Event()
-        def call(fn):
+        def run_steps(fn, **kwargs):
             queued.set()
             if not release.wait(2):
                 raise TimeoutError("test queue was not released")
-            return fn()
-        with patch("studio.core.utils.llm.local.gpu_loop", return_value=types.SimpleNamespace(call=call)):
+            return None if kwargs["cancelled"].is_set() else list(fn())[-1]
+        with patch("studio.core.utils.llm.local.gpu_loop", return_value=types.SimpleNamespace(run_steps=run_steps)):
             task = asyncio.create_task(asyncio.to_thread(
                 llm.prewarm, [], "memory", cancelled=cancelled))
             try:
@@ -170,16 +171,171 @@ class QueuedWarmTests(unittest.IsolatedAsyncioTestCase):
 
     def test_startup_and_uncancelled_warming_preserve_arguments_and_result(self):
         from studio.core.utils.llm.local import LocalLLM
-        llm = LocalLLM.__new__(LocalLLM)
+        llm = LocalLLM(system="synthetic persona")
         calls = []
-        llm._prewarm = lambda *a: calls.append(a) or 42
-        with patch("studio.core.utils.llm.local.gpu_loop", return_value=types.SimpleNamespace(call=lambda f: f())):
+        llm._prewarm_steps = lambda *a: calls.append(a) or iter([42])
+        with cpu_gpu_loop() as gpu, patch("studio.core.utils.llm.local.gpu_loop", return_value=gpu):
             self.assertEqual(llm.prewarm(), 42)
             self.assertEqual(llm.prewarm(["history"], "memory", cancelled=threading.Event()), 42)
             cancelled = threading.Event()
             cancelled.set()
             self.assertEqual(llm.prewarm(cancelled=cancelled), 0)
-        self.assertEqual(calls, [(None, ""), (["history"], "memory")])
+        self.assertEqual(calls[0], (None, "", None))
+        self.assertEqual(calls[1][:2], (["history"], "memory"))
+
+    async def test_audio_runs_between_materialized_prefix_blocks(self):
+        from studio.core.utils.llm.local import LocalLLM
+        llm = LocalLLM(system="synthetic persona")
+        entered, release = threading.Event(), threading.Event()
+        calls = []
+        cache = [types.SimpleNamespace(state=[])]
+
+        def forward(tokens, *, cache):
+            calls.append(("prefix", tokens.shape[1], threading.get_ident()))
+            cache[0].state.extend(tokens[0].tolist())
+            if len(calls) == 1:
+                entered.set()
+                release.wait(2)
+
+        llm.load = lambda: (forward, None)
+        llm._prefix_ids = lambda *_: list(range(768))
+        llm._pick_base = lambda _: (cache, 0, "")
+        with cpu_gpu_loop() as gpu, patch("studio.core.utils.llm.local.gpu_loop", return_value=gpu):
+            warm = asyncio.create_task(asyncio.to_thread(llm.prewarm))
+            try:
+                self.assertTrue(await asyncio.to_thread(entered.wait, 1))
+                def audio():
+                    calls.append(("audio", 0, threading.get_ident()))
+                    yield b"pcm"
+                job = gpu.iter(audio, solo_first=True)
+            finally:
+                release.set()
+            self.assertEqual(await asyncio.wait_for(warm, 2), 768)
+            self.assertEqual(job.out.get(timeout=1), ("ok", b"pcm"))
+            self.assertIsNone(job.out.get(timeout=1))
+            self.assertTrue(all(row[2] == gpu._thread.ident for row in calls))
+        self.assertEqual([row[0] for row in calls], ["prefix", "audio", "prefix", "prefix"])
+        self.assertEqual(cache[0].state, list(range(768)))
+        self.assertIs(llm._base, cache)
+
+    async def test_cancellation_or_prompt_invalidation_never_publishes_partial_cache(self):
+        from studio.core.utils.llm.local import LocalLLM
+        for invalidate in ("cancel", "system", "drop"):
+            with self.subTest(invalidate=invalidate):
+                llm = LocalLLM(system="synthetic persona")
+                entered, release, cancelled = (threading.Event() for _ in range(3))
+                calls = []
+                def forward(tokens, *, cache):
+                    calls.append(tokens.shape[1])
+                    entered.set()
+                    release.wait(2)
+                llm.load = lambda: (forward, None)
+                llm._prefix_ids = lambda *_: list(range(768))
+                llm._pick_base = lambda _: ([types.SimpleNamespace(state=None)], 0, "")
+                with cpu_gpu_loop() as gpu, patch("studio.core.utils.llm.local.gpu_loop", return_value=gpu):
+                    task = asyncio.create_task(asyncio.to_thread(llm.prewarm, cancelled=cancelled))
+                    try:
+                        self.assertTrue(await asyncio.to_thread(entered.wait, 1))
+                        if invalidate == "cancel":
+                            cancelled.set()
+                        elif invalidate == "system":
+                            llm.set_system("replacement persona")
+                        else:
+                            llm.drop_cache()
+                    finally:
+                        release.set()
+                    self.assertEqual(await asyncio.wait_for(task, 2), 0)
+                self.assertEqual(calls, [256])
+                self.assertIsNone(llm._cache)
+                self.assertIsNone(llm._base)
+
+    async def test_failed_prefill_keeps_previous_cache_and_allows_retry(self):
+        from studio.core.utils.llm.local import LocalLLM
+        llm = LocalLLM(system="synthetic persona")
+        previous = llm._cache = [types.SimpleNamespace(state="complete")]
+        llm._cached_prefix = [1]
+        llm._prefix_ids = lambda *_: list(range(512))
+        llm._pick_base = lambda _: ([types.SimpleNamespace(state=None)], 0, "")
+        def fail(*args, **kwargs):
+            raise ValueError("synthetic prefill failure")
+        llm.load = lambda: (fail, None)
+        with cpu_gpu_loop() as gpu, patch("studio.core.utils.llm.local.gpu_loop", return_value=gpu):
+            with self.assertRaisesRegex(ValueError, "synthetic prefill failure"):
+                await asyncio.to_thread(llm.prewarm)
+            self.assertIs(llm._cache, previous)
+            llm.load = lambda: (lambda *args, **kwargs: None, None)
+            self.assertEqual(await asyncio.to_thread(llm.prewarm), 512)
+            self.assertEqual(llm._cached_prefix, list(range(512)))
+
+
+class GenerationPrefillTests(unittest.IsolatedAsyncioTestCase):
+    async def test_cache_hit_and_miss_preserve_tokens_options_and_visible_text(self):
+        from studio.core.utils.llm.local import LocalLLM
+        for hit in (False, True):
+            with self.subTest(hit=hit):
+                llm = LocalLLM(system="synthetic persona")
+                tokens = list(range(600))
+                calls, generated = [], []
+                cache_module = types.ModuleType("mlx_lm.models.cache")
+                cache_module.make_prompt_cache = lambda _: [types.SimpleNamespace(state=[])]
+                prefix = [types.SimpleNamespace(state=tokens[:2])]
+                if hit:
+                    llm._cache, llm._cached_prefix = prefix, tokens[:2]
+                llm._fork = lambda src: [types.SimpleNamespace(state=list(src[0].state))]
+                def model(batch, *, cache):
+                    calls.append((batch.shape[1], threading.get_ident()))
+                    cache[0].state.extend(batch[0].tolist())
+                llm.load = lambda: (model, types.SimpleNamespace(encode=lambda _: tokens))
+                llm._render, llm._msgs = lambda _: "prompt", lambda *args: []
+                language_model = types.ModuleType("mlx_lm")
+                def generate(model, tokenizer, remaining, **kwargs):
+                    self.assertEqual(remaining, [599])
+                    self.assertEqual(kwargs["max_tokens"], 512)
+                    import mlx.core as mx
+                    model(mx.array(remaining)[None], cache=kwargs["prompt_cache"])
+                    generated.append(list(kwargs["prompt_cache"][0].state))
+                    yield types.SimpleNamespace(text="visible reply")
+                language_model.stream_generate = generate
+                with cpu_gpu_loop() as gpu, \
+                        patch("studio.core.utils.llm.local.gpu_loop", return_value=gpu), \
+                        patch.dict(sys.modules, {"mlx_lm": language_model,
+                                                  "mlx_lm.models.cache": cache_module}):
+                    self.assertEqual([text async for text in llm("input")], ["visible reply"])
+                    self.assertTrue(all(owner == gpu._thread.ident for _, owner in calls))
+                self.assertEqual(generated, [tokens])
+                self.assertLessEqual(max(size for size, _ in calls), 256)
+                self.assertEqual(prefix[0].state, tokens[:2])
+
+    async def test_cancel_during_generation_prefill_skips_sampling_and_later_blocks(self):
+        from studio.core.utils.llm.local import LocalLLM
+        llm = LocalLLM(system="synthetic persona")
+        llm._cache, llm._cached_prefix = [types.SimpleNamespace(state=None)], [0]
+        llm._fork = lambda _: [types.SimpleNamespace(state=None)]
+        entered, release = threading.Event(), threading.Event()
+        calls = []
+        def model(batch, *, cache):
+            calls.append(batch.shape[1])
+            entered.set()
+            release.wait(2)
+        llm.load = lambda: (model, types.SimpleNamespace(encode=lambda _: list(range(768))))
+        llm._render, llm._msgs = lambda _: "prompt", lambda *args: []
+        language_model = types.ModuleType("mlx_lm")
+        language_model.stream_generate = unittest.mock.Mock(return_value=iter([]))
+        with cpu_gpu_loop() as gpu, \
+                patch("studio.core.utils.llm.local.gpu_loop", return_value=gpu), \
+                patch.dict(sys.modules, {"mlx_lm": language_model}):
+            stream = llm("input")
+            task = asyncio.create_task(anext(stream))
+            try:
+                self.assertTrue(await asyncio.to_thread(entered.wait, 1))
+                task.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await task
+            finally:
+                release.set()
+            self.assertEqual([v async for v in gpu.aiter(lambda: iter(["next"]))], ["next"])
+        self.assertEqual(calls, [256])
+        language_model.stream_generate.assert_not_called()
 
 
 if __name__ == "__main__":

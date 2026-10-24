@@ -3,8 +3,11 @@ import asyncio
 import re
 import time
 import uuid
+from .background import background_lane
 
 class Memory:
+    BACKGROUND_DEFER_S = 0.5
+
     def save_turn_audio(self, pcm16k) -> str:
         """Archive turn PCM and return its path, or an empty string on failure."""
         if pcm16k is None or not len(pcm16k):
@@ -41,9 +44,11 @@ class Memory:
             if write_id not in writes:
                 return
             writes.discard(write_id)
-            self._finish_history_turn(history_turn_id, result)
-            if on_complete is not None:
-                on_complete(result)
+            try:
+                self._finish_history_turn(history_turn_id, result)
+            finally:
+                if on_complete is not None:
+                    on_complete(result)
 
         try:
             target_vm = memory_vm or self.vm
@@ -84,6 +89,9 @@ class Memory:
         token = {"open": True}
         self._HOT["n"] += 1
         self._IDLE.clear()
+        native_idle = getattr(self, "_NATIVE_IDLE", None)
+        if native_idle is not None:
+            native_idle.clear()
         try:
             task = asyncio.current_task()
             if task is not None:
@@ -104,15 +112,18 @@ class Memory:
             owner[0].remove_done_callback(owner[1])
         self._HOT["n"] = max(0, self._HOT["n"] - 1)
         if self._HOT["n"] == 0:
+            native_idle = getattr(self, "_NATIVE_IDLE", None)
+            if native_idle is not None:
+                native_idle.set()
             self._IDLE.set()
 
     async def wait_idle(self, what: str = "") -> None:
-        """Wait for input/reply work to clear, with a bounded starvation fallback."""
+        """Prefer idle admission, with bounded deferral for confirmed memory."""
         if self._IDLE.is_set():
             return
         t0 = time.monotonic()
         try:
-            await asyncio.wait_for(self._IDLE.wait(), timeout=self._IDLE_MAX_WAIT_S)
+            await asyncio.wait_for(self._IDLE.wait(), self.BACKGROUND_DEFER_S)
         except asyncio.TimeoutError:
             pass
         if self.BARGE_DEBUG and what:
@@ -122,17 +133,39 @@ class Memory:
     async def _remember_background(self, pending, reply: str, owner: dict,
                                    history_turn_id: str, memory_vm, on_complete=None) -> None:
         queued_at = time.monotonic()
-        async with self._REMEMBER_LOCK:
+        async def persist():
             waited = time.monotonic() - queued_at
             if waited > 0.05 and self.BARGE_DEBUG:
                 print(f"[memory] 入库排队 {waited:.2f}s", flush=True)
-            await self.wait_idle("入库")
             started = time.monotonic()
-            await asyncio.to_thread(
-                self.remember_turn, pending, reply, owner, history_turn_id, memory_vm,
-                **({"on_complete": on_complete} if on_complete is not None else {}))
+            loop = asyncio.get_running_loop()
+            completed = loop.create_future()
+
+            def complete(result):
+                try:
+                    if on_complete is not None:
+                        on_complete(result)
+                finally:
+                    def resolve():
+                        if not completed.done():
+                            completed.set_result(None)
+                    try:
+                        loop.call_soon_threadsafe(resolve)
+                    except RuntimeError:
+                        pass
+
+            from voicemem.engine import background_scope
+            try:
+                with background_scope(None):
+                    await asyncio.to_thread(
+                        self.remember_turn, pending, reply, owner, history_turn_id, memory_vm,
+                        on_complete=complete)
+            finally:
+                # Metadata failures cannot release the lane ahead of native writes.
+                await completed
             if self.BARGE_DEBUG:
-                print(f"[memory] 入库主流程 {time.monotonic()-started:.2f}s", flush=True)
+                print(f"[memory] 入库完成 {time.monotonic()-started:.2f}s", flush=True)
+        await background_lane(self).run(lambda: self.wait_idle("入库"), persist)
 
     def queue_remember_turn(self, pending, reply: str, owner: dict,
                             history_turn_id: str = "", memory_vm=None, on_complete=None) -> None:
@@ -151,3 +184,19 @@ class Memory:
                 print(f"[web] 后台记忆任务失败：{type(e).__name__}: {e}", flush=True)
 
         task.add_done_callback(done)
+
+    async def drain_memory(self):
+        """Finish accepted writes on shutdown while the owning event loop lives.
+
+        This is graceful draining, not a persistent retry journal. Forced process
+        termination cannot guarantee completion of queued or in-flight writes.
+        """
+        idle = getattr(self, "_NATIVE_IDLE", None)
+        if idle is not None:
+            idle.set()
+        self._IDLE.set()
+        while self._REMEMBER_TASKS:
+            await asyncio.gather(*tuple(self._REMEMBER_TASKS), return_exceptions=True)
+        lane = background_lane(self)
+        if lane.tasks:
+            await asyncio.gather(*tuple(lane.tasks), return_exceptions=True)

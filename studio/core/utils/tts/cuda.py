@@ -1,15 +1,11 @@
 """Local CUDA Breeze streaming using the existing Breeze inference checkout."""
 from __future__ import annotations
 
-import asyncio
-from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import aclosing
 import hashlib
 import os
 from pathlib import Path
-import queue
 import sys
-import threading
 import time
 import uuid
 
@@ -63,10 +59,11 @@ class BreezeCUDATTS:
         if self.ref_audio:
             digest.update(Path(self.ref_audio).read_bytes())
         self.cache_voice_id = self.voice + ':' + digest.hexdigest()[:16]
-        self._worker = ThreadPoolExecutor(max_workers=1, thread_name_prefix='breeze-cuda')
+        from voicemem.engine import CudaWorker
+        self._engine = CudaWorker(device, sample_rate=self.sample_rate)
+        self.device = self._engine.device
         self._runtime = None
         self._closed = False
-        self._requests: dict[threading.Event, Future] = {}
 
     def _load(self):
         """Load models only on the synthesis worker; preserve streaming codec state."""
@@ -97,13 +94,12 @@ class BreezeCUDATTS:
             from models.warmup_profile import load_warmup_profile
             print('[tts] 正在预热 Breeze CUDA depth graph，首次编译需要等待…', flush=True)
             runtime.warmup_from_profile(load_warmup_profile(source / 'configs/fast.json'))
+        import torch
+        torch.cuda.synchronize(self.device)
         self._model, self._codec, self._runtime = model, codec, runtime
         print(f'[tts] Breeze CUDA ready: {self.device}, {self.depth_mode} depth, local streaming', flush=True)
 
     def _segments(self, text, instruction, cancelled):
-        if cancelled.is_set():
-            return
-        self._load()
         if cancelled.is_set():
             return
         import torch
@@ -142,7 +138,10 @@ class BreezeCUDATTS:
                 if pending and not cancelled.is_set():
                     yield b''.join(pending)
             finally:
-                chunks.close()
+                try:
+                    chunks.close()
+                finally:
+                    torch.cuda.synchronize(self.device)
 
     async def stream(self, text, instruction=None):
         """Yield PCM16 with bounded buffering and cancellation at acoustic frames."""
@@ -163,68 +162,21 @@ class BreezeCUDATTS:
             'cfg_scale': self.cfg_scale, 'seed': self.seed,
             'max_tokens': self.max_tokens,
         })
-        cancelled = threading.Event()
-        output = queue.Queue(maxsize=4)
-
-        def emit(value):
-            while not cancelled.is_set():
-                try:
-                    output.put(value, timeout=0.05)
-                    return
-                except queue.Full:
-                    continue
-
-        def work():
-            chunks = self._segments(text, instruction, cancelled)
-            try:
-                for pcm in chunks:
-                    if cancelled.is_set():
-                        break
-                    emit(('pcm', pcm))
-            except Exception as exc:
-                emit(('error', exc))
-            finally:
-                try:
-                    chunks.close()
-                except Exception as exc:
-                    emit(('error', exc))
-                finally:
-                    # Release a pending consumer even when it was cancelled while
-                    # its executor thread was waiting on the bounded queue.
-                    while True:
-                        try:
-                            output.put(('done', None), timeout=0.05)
-                            break
-                        except queue.Full:
-                            if cancelled.is_set():
-                                try:
-                                    output.get_nowait()
-                                except queue.Empty:
-                                    pass
-
-        future = self._worker.submit(work)
-        self._requests[cancelled] = future
         started = time.monotonic()
         byte_count = 0
         first_at = None
         completed = False
         try:
-            while True:
-                kind, value = await asyncio.to_thread(output.get)
-                if kind == 'done':
-                    completed = True
-                    return
-                if kind == 'error':
-                    raise value
-                if first_at is None:
-                    first_at = time.monotonic()
-                byte_count += len(value)
-                yield value
+            async with aclosing(self._engine.stream(
+                    lambda cancelled: self._segments(text, instruction, cancelled),
+                    initialize=self._load)) as chunks:
+                async for value in chunks:
+                    if first_at is None:
+                        first_at = time.monotonic()
+                    byte_count += len(value)
+                    yield value
+            completed = True
         finally:
-            cancelled.set()
-            # Pending work must still run its tiny cancellation path to wake any
-            # consumer thread. It will not enter model inference.
-            self._requests.pop(cancelled, None)
             if byte_count and completed:
                 elapsed = time.monotonic() - started
                 duration = byte_count / (self.sample_rate * 2)
@@ -234,6 +186,4 @@ class BreezeCUDATTS:
 
     async def aclose(self):
         self._closed = True
-        for cancelled in list(self._requests):
-            cancelled.set()
-        await asyncio.to_thread(self._worker.shutdown, wait=True)
+        await self._engine.aclose()

@@ -104,14 +104,20 @@ class Conversation:
         if timeline is None or data.get('output_id') != timeline.output_id:
             return
         timeline.update_checkpoint(data.get('rendered_samples', 0), data.get('sample_rate', self.agent.MIC_RATE), data.get('state', 'playing'))
+        feedback = getattr(timeline, 'inference_feedback', None)
+        if feedback is not None and 'buffered_samples' in data:
+            feedback.checkpoint(data['buffered_samples'], data.get('sample_rate', self.agent.MIC_RATE),
+                                data.get('state', 'playing'))
         if data.get('event') == 'started' and (not self.turn['play_started']):
             self.turn['play_started'] = True
             if self.turn['speech_end']:
                 elapsed = (time.monotonic() - self.turn['speech_end']) * 1000
                 print(f'[lat] 闭嘴→浏览器开始播放（含回报传输） {elapsed:.0f}ms', flush=True)
         if data.get('state') == 'stalled' and self.agent.BARGE_DEBUG:
-            from voicemem.utils.gpu_loop import gpu_loop as _gl
+            from voicemem.engine import gpu_loop as _gl, observer, resources, torch_snapshot
             print(f"[play] 缓冲见底：已播 {timeline.rendered_ms():.0f}ms，GPU 线程活跃任务 {getattr(_gl(), 'active_count', '?')}", flush=True)
+            print(f"[engine] mlx={_gl().snapshot()} torch={torch_snapshot()}", flush=True)
+            print(f"[engine] os={observer.snapshot()} admission={resources.snapshot()}", flush=True)
         if timeline.playback_done:
             self.turn['until'] = 0.0
 

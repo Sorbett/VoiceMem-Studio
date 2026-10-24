@@ -230,18 +230,19 @@ class FunASRStreamingASR:
         if model is None:
             local = self._cached_model()
             model = str(local) if local is not None else "paraformer-zh-streaming"
-        # 跑 MPS。试过挪到 CPU：一块 600ms 音频要 683ms，比实时还慢，说完要排空
-        # 几秒积压。MPS 上 55~167ms 一块。多线程撞 MPS 的问题靠 TORCH_LOCK 解决
-        # （见 _run）。VOICEMEM_ASR_DEVICE 可强制。
-        self.model = AutoModel(model=model,
-                               device=device or _os.environ.get("VOICEMEM_ASR_DEVICE") or pick_device(),
-                               disable_update=True,
-                               log_level="ERROR" if _quiet else "INFO")
+        from voicemem.engine import device_lock
+        selected = device or _os.environ.get("VOICEMEM_ASR_DEVICE") or pick_device()
+        lock = device_lock(selected)
+        self.device = lock.device or selected
+        with lock:
+            self.model = AutoModel(model=model, device=self.device, disable_update=True,
+                                   log_level="ERROR" if _quiet else "INFO")
         self.reset()
 
     def _run(self, samples, is_final: bool) -> str:
-        from voicemem.utils.torch_lock import TORCH_LOCK
-        with TORCH_LOCK:                       # 跟 embedding 等 torch 调用串行
+        from voicemem.engine import Service, device_lock, inference_call
+        with inference_call("streaming_asr", "torch", lock=device_lock(getattr(self, "device", None)),
+                            service=Service.AUDIO):
             res = self.model.generate(input=samples, cache=self._cache, is_final=is_final,
                                       chunk_size=self.CHUNK_SIZE, **self.LOOK_BACK)
         if res and res[0].get("text"):
@@ -290,19 +291,21 @@ class Transcriber:
     """Decode full utterances with SenseVoiceSmall and serialize model access."""
 
     def __init__(self, device: str, model: str | None = None) -> None:
-        from voicemem.utils.torch_lock import TORCH_LOCK
+        from voicemem.engine import device_lock
         # CPU recognition shares no accelerator state with streaming ASR.
         self._inference_lock = (threading.RLock() if str(device).split(':')[0] == 'cpu'
-                                else TORCH_LOCK)
+                                else device_lock(device))
         from funasr import AutoModel
         from voicemem.utils.common.paths import hf_model
         _name = model or hf_model("emotion", "FunAudioLLM/SenseVoiceSmall", "asr")
-        self.model = AutoModel(model=_name, hub="hf",
-                               device=device, disable_update=True,
-                               trust_remote_code=False)
+        with self._inference_lock:
+            self.model = AutoModel(model=_name, hub="hf",
+                                   device=getattr(self._inference_lock, "device", None) or device,
+                                   disable_update=True, trust_remote_code=False)
 
     def _generate(self, audio) -> str:
-        with self._inference_lock:
+        from voicemem.engine import inference_call
+        with inference_call("sensevoice", "torch", lock=self._inference_lock):
             return self._generate_locked(audio)
 
     def _generate_locked(self, audio) -> str:
@@ -359,7 +362,9 @@ class OfflineASR:
             return ""
         st = self.rec.create_stream()
         st.accept_waveform(SAMPLE_RATE, a)
-        self.rec.decode_stream(st)
+        from voicemem.engine import Service, inference_call
+        with inference_call("final_asr", "onnx", service=Service.AUDIO):
+            self.rec.decode_stream(st)
         result = st.result
         text = (result.text or "").strip()
         if text and self.allowed_languages is not None:

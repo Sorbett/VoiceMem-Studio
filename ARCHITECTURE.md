@@ -573,13 +573,23 @@ does not call these legacy entry points and remains unchanged.
 
 ### Inference and scheduling plane
 
+This is shared Harness runtime infrastructure, independent of dialogue policy,
+memory semantics and platform-specific model implementations. Studio composes
+it through `voicemem.engine`; the reusable SDK can use it without importing Studio.
 Owned by provider modules and shared schedulers:
 
 - `studio/core/utils/llm/local.py`: local MLX reply generation and prefix/KV caching;
 - `voicemem/tts.py`, `studio/core/utils/tts/component.py`, `cache.py`: speech providers and local
   synthesis support;
-- `utils/gpu_loop.py`: the single process-level MLX execution thread;
-- `utils/torch_lock.py`: serialization for shared Torch/MPS work;
+- `voicemem/engine/`: shared inference execution and resource scheduling;
+  `mlx.py` owns the single MLX thread, fair execution and bounded output,
+  `cuda.py` owns CUDA speech worker lifetimes and bounded async delivery,
+  `torch.py` owns native per-device priority admission, `cpu.py` supplies runtime thread
+  budgets, `context.py` captures inference priority, and `background.py` owns
+  background native task lifetime; `admission.py` owns speech-aware cross-backend
+  admission, `metrics.py` owns adapter timings, and `system.py` samples paging;
+- `voicemem/utils/engine.py`, `gpu_loop.py`, `torch_lock.py`, `background.py`:
+  compatibility imports exposing the same engine-owned objects;
 - the streaming ASR worker and dedicated final-ASR executor in `voicemem/stream.py`.
 
 Provider adapters translate configuration and provider events into shared
@@ -762,6 +772,13 @@ Streaming ASR runs in a dedicated serial worker so chunk inference does not
 block WebSocket input. At turn end, full-audio ASR refinement may run in a
 separate final-ASR executor. Epoch checks prevent obsolete worker results from
 overwriting a newer turn.
+Audio EOT scoring also runs off the WebSocket loop, on one dedicated serial
+executor independent of background ingestion and final ASR. Each stream awaits
+its score before applying the existing confirmation policy, retaining one pending
+probe per serial feed rather than spawning probes for every arriving frame.
+Reset, close and provider replacement invalidate pending results and failures;
+cancelled queued probes never enter the provider. An active native call may finish
+after cancellation without updating the stream.
 The recognizer remains serial. Confirmed decodes precede queued speculative
 snapshots, and a stream cancels its unstarted snapshots at finalization.
 Already-running native calls finish normally; different audio snapshots are
@@ -1057,8 +1074,15 @@ context, independent of the Gate; changing memory eligibility recomposes the
 final route without rerunning depth.
 Identical concurrent async requests also share their in-flight depth calculation
 within an event loop. Only text and bounded history form the key, not memory or
-turn objects. One cancelled waiter does not cancel another; the last cancelled
-waiter releases the task, and native inference already running may finish safely.
+turn objects. One cancelled waiter does not cancel another. The last cancelled
+waiter cancels and awaits the owned async task. MLX classification uses an async
+`GpuLoop` stream: queued obsolete requests never enter model inference, and active
+classification yields between prefix preparation, prefill batches and greedy
+decode steps. An in-flight native step may finish, but cancellation prevents later
+steps and prevents the result from entering the depth cache. Synchronous warmup
+and evaluation callers retain their existing classification contract.
+`[route-gpu]` separates GPU queue time from accumulated inference-step time;
+scheduler yields are excluded from the latter.
 Invalid model output uses ordinary reasoning; model exceptions preserve Gate
 memory eligibility. The legacy class name and
 hint argument remain for caller compatibility, but that hint no longer
@@ -1288,13 +1312,56 @@ do not become normal assistant replies.
 ### MLX
 
 Local MLX reply, reasoning-depth routing, and TTS work share one process-level
-`GpuLoop`. The loop owns the GPU execution thread and advances active generators in weighted turns.
+`GpuLoop` implemented in `voicemem/engine/mlx.py`. Production adapters import
+the shared `voicemem.engine` entry point; legacy utility imports expose the same
+classes, contexts and process singletons. Importing the engine does not import
+MLX, Torch or ONNX Runtime. The loop owns the GPU
+execution thread and advances one generator step at a time. Weights allocate
+measured execution time rather than a fixed number of tokens or audio chunks.
+Factories are deferred until their first scheduled step. Aging prevents a
+ready job from waiting indefinitely, and paused producers resume at the current
+virtual-time floor rather than accumulating catch-up credit. The engine applies
+the MLX allocator cache budget on its own thread before model execution.
+Initialization failures are delivered to queued callers instead of orphaning them.
+`engine/prefill.py` materializes local reply prompt updates in bounded token
+blocks, yielding to the same scheduler between blocks. Generation keeps the
+last prompt token for the existing sampler. Synchronous prefix warmup uses
+`GpuLoop.run_steps`; nested owner-thread callers execute inline. Cancellation
+and prompt/cache invalidation discard private partial state, and only a complete
+warmup publishes reusable caches under a short metadata lock. Model execution
+never holds that metadata lock. Progress yields remain private to the provider.
 Startup completes a short TTS utterance after other model warmups, exercising
 continuous codec generation and cleanup before accepting conversations.
+Startup also runs disposable synthetic inputs through ASR feed/flush, VAD,
+AST scene inference, speaker embedding, SenseVoice emotion, emotion2vec,
+enabled EOT scoring, semantic Gate banks, and Studio semantic-emotion prototypes.
+Loading weights alone is not readiness. Missing scene/speaker embeddings,
+invalid EOT scores, empty emotion2vec results, empty TTS streams, and inference
+exceptions fail startup before the server opens. Probe audio and model outputs
+never enter audio perception registration, dialogue history, or memory ingestion;
+temporary files are removed even on failure. Shared accelerators retain their
+existing schedulers and locks. This primes the configured local paths without
+issuing additional remote reply or memory-model requests.
 
 Some speech jobs receive temporary first-chunk priority; afterward they rejoin
 weighted scheduling. Cancellation closes the generator and removes it from the
-active set. Creating an independent MLX thread or stream bypasses this safety
+active set. Admission checks cancellation before calling a queued factory, and
+weighted jobs check it between each generator step. Cleanup errors remain visible
+to the job's consumer without stopping the worker or blocking later jobs.
+The async `GpuLoop.aiter()` bridge delivers output directly to its owning event
+loop; it never occupies the general thread pool waiting for GPU output. MLX
+classification, local reply text and Breeze PCM use this bridge. Async producers
+have finite output credits; Breeze permits two outstanding chunks, and local
+reply text permits sixteen tokens. A slow consumer pauses only that producer,
+leaving the MLX worker available for other jobs. Cancellation wakes paused jobs
+and closes their generators on the owning thread. Closing their async streams cancels
+their GPU jobs while preserving the existing single-thread codec cleanup order.
+Breeze diagnostics pair `[tts-gpu]` and `[tts-delivery]` using a request ID. They
+record queue time, first PCM, accumulated generation time, longest generation
+step, audio duration, delivery gaps and producer-to-consumer handoff delay without
+recording speech text or instructions. Delivery RTF and gaps include downstream
+consumer delays; they are distinct from GPU compute time and browser playback.
+Creating an independent MLX thread or stream bypasses this safety
 and scheduling model.
 Auxiliary Qwen work fillers run as non-exclusive token-stepped jobs on this
 same scheduler. Each has a private KV cache and leaves the classifier's static
@@ -1305,15 +1372,26 @@ prefix cache untouched.
 `studio/core/utils/tts/cuda.py` loads the configured Breeze streaming checkout
 and checkpoint locally. Its public `stream(text, instruction)` contract matches
 MLX: sample-aligned 24 kHz PCM16. No separate HTTP service or listening port is
-required. One shared provider serializes model loading, generation and codec
-cleanup on a dedicated worker. A bounded output queue limits buffered PCM;
-cancellation is observed between acoustic frames and queued work checks its
-cancellation flag before entering inference. Application shutdown closes the
-worker. Initial and subsequent acoustic batches preserve the MLX chunk settings.
+required. The provider supplies model loading and a host-PCM iterator to the
+engine-owned `CudaWorker`. That worker serializes mutable model and codec state
+on one owner thread and captures the caller's priority and output context.
+Each acoustic iterator step uses the same device admission as streaming ASR,
+Torch routing, embedding and GPU perception. Admission is released before
+bounded PCM delivery waits; an async notification bridge does not occupy the
+default executor waiting for output. Cancellation skips unstarted factories,
+checks between native steps and retains speech admission through owner-thread
+generator cleanup. Application shutdown drains that cleanup before closing the
+worker. Initial and subsequent acoustic batches retain their provider settings.
 CUDA depth decoding uses the existing compiled CUDA-graph path by default, with
 profile warmup completed before serving. The master `fast_all` override remains
 unset so it cannot disable that stage. Completed requests report delivery RTF;
-`evals/breeze_cuda_latency.py` measures warmed delivery and same-GPU ASR contention.
+Model loading and graph warmup acquire a process-wide CUDA initialization barrier
+before device admission, excluding other registered CUDA native calls on every
+device during graph capture. Upgrading a held device permit to this barrier is
+rejected. The adapter synchronizes completed initialization and codec cleanup;
+normal step admission ends at its existing host-PCM materialization boundary.
+`evals/breeze_cuda_latency.py` measures warmed delivery and configurable-device
+ASR contention, with model timings and cached per-device allocator metadata.
 
 ASR/router and TTS devices are explicit configuration. Shared GPU use still
 competes for resources; separate devices can be selected without changing the
@@ -1321,11 +1399,25 @@ conversation pipeline. CUDA startup validates the selected devices, code checkou
 and CUDA checkpoint including its bundled codec, and never acquires MLX weights.
 DeepSeek-only deployments require only DeepSeek credentials.
 
-### Torch/MPS
+### Torch device admission
 
 Torch-backed embedding and related MPS operations use the process-level lock in
-`utils/torch_lock.py`. Lock scope covers device inference, not unrelated search
+`voicemem/engine/torch.py`, also exposed through `utils/torch_lock.py`. The reentrant
+lock prioritizes streaming ASR over interactive queries and captured background
+work; aged waiters receive a turn to avoid starvation. Timed-out waiters leave
+no admission ticket behind. Native calls already running are not preempted.
+MLX and Torch retain separate execution lanes.
+`device_lock` gives each explicit CUDA device a process-owned priority lock;
+equivalent device aliases resolve to the same lock. Different CUDA devices can
+execute independently outside initialization. Streaming recognizers and the
+Torch router capture their resolved device before work crosses threads.
+MPS and unspecified legacy adapters retain `TORCH_LOCK`; CPU model-private
+serialization remains independent where already defined.
+Lock scope covers device inference, not unrelated search
 coordination or waits on work that may need the same lock.
+AST scene loading and inference serialize on the detector's own lock. CPU AST
+does not acquire the accelerator lock; explicit GPU AST retains it, including
+device transfers. Concurrent cold loads publish one complete model instance.
 The built-in Turn Gate takes no outer accelerator lock: lexical decisions run
 immediately, while its shared encoder locks semantic inference internally.
 Injected gate callables retain the existing outer lock contract.
@@ -1339,6 +1431,20 @@ between forward passes so a whole sentence does not monopolize ASR/router
 access. Each request owns its KV cache and checks cancellation and deadline
 before each step and while acquiring the lock.
 
+### CPU inference
+
+The engine supplies bounded ONNX session options without importing ONNX Runtime
+at module import. EOT uses two intra-op threads and one inter-op thread, sequential
+execution and no idle worker spinning. Its model, input preparation, score
+threshold, scoring cadence and dedicated executor remain unchanged. Independent
+CPU perception retains its model-specific serialization.
+EOT retains one digest/score pair for identical canonical eight-second input.
+Extra silence beyond the existing tail crop can reuse that result without
+feature extraction or ONNX execution. Changed canonical samples, sample rate or
+injected model components invalidate it. It retains no waveform, does not alter
+confirmation timing or thresholds. Reuse does not bypass stream-epoch checks;
+the existing consumer guards still own stale-result rejection.
+
 ### Hot-path priority
 
 Studio tracks whether user input, routing or reply generation is on the
@@ -1349,10 +1455,84 @@ rejected input, inactive capture and disconnect release it. Reply scheduling
 reserves a token before its child task can start, then releases it after the
 generation pipeline or on cancellation, including cancellation before the
 child's first execution. This bridges the input and generation scopes.
-Background perception and ingest may wait for an idle window, subject to a
-bounded fallback so memory work cannot starve indefinitely.
-The existing eight-second admission bound remains; already running native work
-is not preempted, and capture/ASR/route semantics and model quality are unchanged.
+Each Studio agent owns one background lane shared by memory ingestion and
+acoustic UI inference. The generic lane and cancellation ownership live in the
+engine; Studio binds them to one agent. Admission prefers an idle window with
+bounded deferral, so continuous foreground leases cannot starve confirmed memory.
+Pending confirmed turns remain queued in order; this bounds active jobs, not
+queued dialogue. The lane remains occupied until durable ingestion completes,
+including the native fact worker started by `async_facts=True`.
+Cancellation removes unstarted jobs. A cancelled caller detaches from started
+native work while the lane retains ownership until that work finishes, so the
+next job cannot overlap it. Existing session and output guards reject stale UI
+results. This lane is agent-owned; it does not impose a new process-wide account
+or session admission limit.
+
+`voicemem.engine.background` supplies an opt-in captured idle waiter without
+depending on Studio. Studio captures background inference priority after the
+initial bounded idle admission. Stage checkpoints retain the SDK's injected
+waiter contract; Studio no longer repeats a fixed idle timeout at every stage.
+`engine/admission.py` instead admits each background AST, SenseVoice, shared
+embedding, speaker-worker and emotion2vec native call using active speech inventory, measured
+stage cost and synthesis real-time factor. Admission happens before model locks.
+Streaming ASR and EOT retain immediate critical admission, and MLX and Torch
+execution lanes remain independent. A running native call is never preempted.
+CUDA synthesis reserves the same output-owned speech feedback as MLX synthesis.
+Known background CUDA work on another GPU does not wait for that output; unknown
+placement remains conservative. Stage-cost estimates and model metrics are keyed
+by resolved device. Fresh low-free-memory samples raise the same-device speech
+reserve; they do not evict weights, change allocator configuration or retry OOMs.
+
+Each reply timeline owns `SpeechFeedback`. Its context is captured by synthesis
+tasks and MLX jobs; Breeze MLX production activates a reservation retained
+across segments until reply completion, and until native generator cleanup if
+cancellation cleanup runs later. Cloud-only providers do not reserve local
+synthesis resources. Current-output browser checkpoints supply buffered
+samples; stale output IDs are rejected before updating feedback. Without browser
+feedback the engine estimates inventory from production and wall time. These
+estimates are scheduling data only and never modify rendered/heard accounting.
+Paused playback does not drain its inventory. Background display embeddings use
+the same admission as memory ingestion. When synthesis is slower than real time
+or inventory cannot cover a stage's measured cost plus reserve, background work
+waits. Deferral is bounded at six seconds per native stage to preserve persistence
+progress during continuous speech; such admissions are counted explicitly. The
+background scope also shares cumulative admission wait with its captured native
+workers. Aged tasks may proceed with a smaller inventory reserve covering the
+stage cost and the next observed synthesis step,
+once per new synthesis chunk; fresh paging/device pressure keeps the original
+reserve, and stalled or unsustainable production cannot use this path. The
+snapshot distinguishes these headroom-checked admissions from forced progress.
+Unstarted cancellation and durable completion still belong to the background
+lane. Cumulative wait credit is not a persistence deadline or permission to
+run successive background stages without intervening speech progress. The
+policy cannot guarantee uninterrupted playback when native production itself is
+slower than consumption, and does not evict weights or change model quality.
+
+`engine/metrics.py` separates native adapter wall time, model-lock wait, background
+admission wait, and initial MLX queue wait by static model/backend/service labels.
+Materialization remains inside the existing adapter boundary; these are not
+isolated kernel timings. Torch snapshots identify the active model/service.
+`engine/system.py` starts one optional Studio lifecycle-owned sampler thread. It
+samples OS counters once per second, reports swap/page-in/page-out deltas in MiB/s,
+compression/decompression rates, memory gauges, process CPU use and model
+aggregates every five seconds, and performs no subprocess work on the
+asyncio loop. Allocated swap is not treated as current paging activity. Fresh swap
+or decompression traffic raises the inventory reserve; stale samples expire after three seconds.
+MLX allocator gauges are sampled on the MLX execution thread only. CUDA allocator
+allocated/reserved/peak bytes and device-global free/total bytes are sampled by
+their native device-lock owner and cached for the observer. Observer snapshots
+do not call CUDA or initialize a context. Allocator memory and device-global
+free memory have distinct scopes. MPS tensor
+and process-wide Metal driver allocation are sampled by the native Torch-lock
+owner. The latter also includes other frameworks, including MLX, and must not be
+treated as Torch's unused cache or added again to the MLX allocation. Darwin
+sampling uses `host_statistics64` through `engine/darwin.py`; it never forks a
+process containing active model runtimes.
+Unsupported or failed sampling is visible and does not stop dialogue. Imports
+start no samplers or model runtimes. Readiness still does not guarantee physical
+memory residency. `evals/engine_contention.py` provides an offline ABBA native
+crossover probe with synthetic inputs, completed background jobs and no API,
+Memory Space, microphone or playback; it is not a perceived-latency benchmark.
 
 Acoustic-emotion tasks belong to the conversation or realtime session and capture
 their output ID, Memory Space and VoiceMem instance. Ownership is checked before
@@ -1480,6 +1660,13 @@ An agent tracks unfinished native writes separately from its asyncio task set.
 Returning from `ingest(async_facts=True)` does not complete a native write; its
 durable completion callback or a failed ingest releases that pending write. Browser completion messages contain status and IDs, never backend error
 details.
+The Studio background lane waits for this completion callback before admitting
+another ingest or acoustic UI job. The original Space, language, pending-write
+tracking and history completion callback remain attached even if its caller is
+cancelled or the active UI Space changes. Application shutdown releases idle
+waiters and drains accepted memory tasks and detached native work on the original
+event loop, before provider cleanup. This queue is process memory, not a durable
+retry journal; forced process termination can still interrupt pending writes.
 
 ## 13. State ownership
 
@@ -1488,8 +1675,10 @@ details.
 | Active model-role and provider configuration | Backend process | Process |
 | Managed desktop model-service configuration | Electron main process / encrypted app data | App installation |
 | Prompt templates and parsed prompt cache | Harness / prompt config | Process |
-| MLX scheduler | `GpuLoop` | Process |
-| Torch device serialization | `TORCH_LOCK` | Process |
+| Harness inference infrastructure and budgets | `voicemem/engine/` | Process |
+| MLX execution and bounded output | Engine-owned `GpuLoop` | Process |
+| CUDA speech model/codec worker lifetime | Engine-owned `CudaWorker` | Provider / native cleanup lifetime |
+| Torch device admission and CUDA capture barrier | Engine-owned device locks / `TORCH_LOCK` | Process |
 | `VoiceMem` capability cache | `VoiceMem` instance | Instance |
 | Factual and affective memory | Memory Space stores | Persistent |
 | Streaming ASR/VAD/EOT/gate state | `VoiceStream` | Input turn/session |
@@ -1504,6 +1693,7 @@ details.
 | Text/media alignment | `AudioTimeline` | Assistant output ID |
 | PCM queue and echo reference | Browser worklets | Assistant output ID/session |
 | Background ingest | Captured turn and `VoiceMem` | Until completion |
+| Background native admission | Studio agent background lane and idle events | Agent / native job lifetime |
 | Background acoustic emotion | Conversation or realtime session, captured output and Space | Until completion or cancellation |
 
 Turn-specific state is explicit. Process globals are reserved for configuration,
@@ -1552,7 +1742,7 @@ network-provider performance require the corresponding native environment.
 | Reply provider | `voicemem/reply.py` or `studio/core/utils/llm/local.py`, then config |
 | Three-way reply routing | `studio/core/utils/reply_modes/` and Web composition root |
 | TTS provider | `voicemem/tts.py` or provider module, then config |
-| GPU scheduling | `voicemem/utils/gpu_loop.py` |
+| Inference scheduling and resource budgets | `voicemem/engine/` |
 | Studio prompt parsing | `studio/prompt_config.py` and `studio/prompt/` schema |
 | Prompt tracing | `voicemem/utils/common/prompt_trace.py` |
 | Early generation | `ReplySink`, EOT callback, and cancellation path |
@@ -1588,6 +1778,14 @@ accelerator lock used by streaming ASR. GPU transcribers retain `TORCH_LOCK`.
 The classifier returns localized acoustic labels. It does not load a multimodal
 language model or generate causal explanations from audio. The separate existing
 emotion2vec background classifier remains available in Studio.
+
+Capture reuses the existing known emotion for retrieval and reply handoff. It
+does not start or await acoustic-emotion inference during input pauses or read
+`StreamState.emotion`, whose lazy perception can trigger additional model work.
+Full perception, speaker identity rules and persistent emotion processing remain
+in the existing memory-ingestion path. Background acoustic UI updates retain
+their output/session ownership and cancellation guards. The SDK's lazy
+perception properties keep their existing contracts.
 
 The optional fusion interface accepts a provider-neutral `TurnAttributor` via
 `attributor=`. `SmallEmotionAttributor` preserves the result schema with observed

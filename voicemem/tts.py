@@ -176,7 +176,7 @@ class QwenTTS(BaseTTS):
 
     async def _raw(self, text, instruction=None):
         import asyncio as _a
-        from voicemem.utils.gpu_loop import gpu_loop
+        from voicemem.engine import gpu_loop
         kw = {"text": text, "stream": True,
               "streaming_interval": self.interval, "temperature": self.temperature}
         if self.ref_audio:
@@ -250,7 +250,7 @@ class KokoroTTS(BaseTTS):
             yield (np.clip(o, -1, 1) * 32767).astype(np.int16).tobytes()
 
     async def _raw(self, text, instruction=None):
-        from voicemem.utils.gpu_loop import gpu_loop
+        from voicemem.engine import gpu_loop
         loop = asyncio.get_running_loop()
         job = gpu_loop().iter(lambda: self._segments(text), weight=4)
         try:

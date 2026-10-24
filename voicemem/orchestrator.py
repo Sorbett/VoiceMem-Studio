@@ -984,6 +984,8 @@ class Orchestrator:
             def _bg() -> None:
                 """Persist the captured turn, logging failures and reporting an error through the completion callback."""
                 try:
+                    from voicemem.engine import background_checkpoint
+                    background_checkpoint()
                     _notify_complete(self._finish_ingest(ctx))
                 except Exception as e:
                     import traceback

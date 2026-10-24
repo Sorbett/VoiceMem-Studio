@@ -1,11 +1,13 @@
 """Studio local implementation."""
 from __future__ import annotations
 
-import asyncio
 import os
+import threading
+from contextlib import aclosing
 from typing import AsyncIterator
 
-from voicemem.utils.gpu_loop import gpu_loop
+from voicemem.engine import gpu_loop
+from voicemem.engine.prefill import prefill_steps
 
 MODEL = 'mlx-community/Qwen3.5-4B-4bit'
 
@@ -29,13 +31,17 @@ class LocalLLM:
         self._base_ids: list[int] = []
         self._cache = None
         self._cached_prefix: list[int] = []
+        self._cache_epoch = object()
+        self._cache_lock = threading.Lock()
 
     def set_system(self, system: str) -> None:
         """Replace the system prompt and invalidate its cached prefix."""
-        if system and system != self.system:
-            self.system = system
-            self._base, self._base_ids = None, []
-            self._cache, self._cached_prefix = None, []
+        with self._cache_lock:
+            if system and system != self.system:
+                self._cache_epoch = object()
+                self.system = system
+                self._base, self._base_ids = None, []
+                self._cache, self._cached_prefix = None, []
 
     def load(self):
         """Load the local model on the shared GPU scheduler."""
@@ -84,49 +90,58 @@ class LocalLLM:
         return ids[:-1]
 
     def prewarm(self, history=None, memory_context: str = "", *, cancelled=None) -> int:
-        """Prepare reusable prefix state, skipping work when cancellation is signaled."""
+        """Warm a reusable prefix in cancellable, cooperatively scheduled blocks."""
+        return gpu_loop().run_steps(
+            lambda: self._prewarm_steps(history, memory_context, cancelled),
+            cancelled=cancelled, label="local_prewarm") or 0
 
-        def run():
-            if cancelled is not None and cancelled.is_set():
-                return 0
-            return self._prewarm(history, memory_context)
+    def _prewarm_steps(self, history, memory_context, cancelled=None):
+        epoch = self._cache_epoch
 
-        if cancelled is not None and cancelled.is_set():
-            return 0
-        return gpu_loop().call(run)
+        def stale():
+            return (self._cache_epoch is not epoch
+                    or (cancelled is not None and cancelled.is_set()))
 
-    def _prewarm(self, history, memory_context) -> int:
-        import mlx.core as mx
+        if stale():
+            return
         model, _ = self.load()
         ids = self._prefix_ids(memory_context, history)
         if not ids:
             return 0
         if ids == self._cached_prefix and self._cache is not None:
-            return len(ids)
+            yield len(ids)
+            return
         cache, done, kind = self._pick_base(ids)
-        if done < len(ids):
-            model(mx.array(ids[done:])[None], cache=cache)
-            mx.eval([c.state for c in cache])
-        self._cache, self._cached_prefix = cache, ids
-
-        if self._base is None:
-            self._base, self._base_ids = cache, list(ids)
-            kind = "人设底座 "
+        for _ in prefill_steps(model, ids[done:], cache, cancelled=stale):
+            yield 0
+        if stale():
+            return
+        with self._cache_lock:
+            if stale():
+                return
+            self._cache, self._cached_prefix = cache, ids
+            if self._base is None:
+                self._base, self._base_ids = cache, list(ids)
+                kind = "人设底座 "
         if DEBUG:
             print(f"[llm] 母本{kind}{len(ids) - done} token → 共 {len(ids)}", flush=True)
-        return len(ids)
+        yield len(ids)
 
     def _pick_base(self, ids):
         from mlx_lm.models.cache import make_prompt_cache
-        for cache, pre, kind in ((self._cache, self._cached_prefix, "续 "),
-                                 (self._base, self._base_ids, "接人设底座 ")):
+        with self._cache_lock:
+            candidates = ((self._cache, self._cached_prefix, "续 "),
+                          (self._base, self._base_ids, "接人设底座 "))
+        for cache, pre, kind in candidates:
             if cache is not None and len(pre) <= len(ids) and ids[:len(pre)] == pre:
                 return self._fork(cache), len(pre), f"{kind}{len(pre)}+"
         return make_prompt_cache(self.load()[0]), 0, "建 "
 
     def drop_cache(self) -> None:
         """Release prefix cache state before the next generation."""
-        self._cache, self._cached_prefix = self._base, list(self._base_ids)
+        with self._cache_lock:
+            self._cache_epoch = object()
+            self._cache, self._cached_prefix = self._base, list(self._base_ids)
 
     def _gen_iter(self, text, memory_context, history, submitted=0.0):
         import time as _t
@@ -138,8 +153,10 @@ class LocalLLM:
 
         cache = prefix = None
         _tf = _t.perf_counter()
-        for c, pre in ((self._cache, self._cached_prefix),
-                       (self._base, self._base_ids)):
+        with self._cache_lock:
+            candidates = ((self._cache, self._cached_prefix),
+                          (self._base, self._base_ids))
+        for c, pre in candidates:
             if c is not None and len(pre) < len(ids) and ids[:len(pre)] == pre:
                 cache, prefix = self._fork(c), pre
                 break
@@ -176,8 +193,15 @@ class LocalLLM:
         first_text = True
         empty_tokens = 0
         try:
-            for r in stream_generate(model, tok, tail, max_tokens=512,
-                                     prompt_cache=cache if hit else None,
+            if cache is None:
+                from mlx_lm.models.cache import make_prompt_cache
+                cache = make_prompt_cache(model)
+            processed = 0
+            for processed in prefill_steps(model, tail, cache, keep_last=True):
+                yield ""
+            prefilled_at = _t.perf_counter()
+            for r in stream_generate(model, tok, tail[processed:], max_tokens=512,
+                                     prompt_cache=cache,
                                      **({"prompt_progress_callback": prompt_progress} if DEBUG else {})):
                 now = _t.perf_counter()
                 if DEBUG and first_token:
@@ -186,7 +210,8 @@ class LocalLLM:
                           f"{(_g0 - _t1) * 1000 - _fork_ms:.0f} / fork {_fork_ms:.0f}）",
                           flush=True)
                     if "ready" in progress and "start" in progress:
-                        print(f"[llm-detail] 生成器准备 {(progress['start']-_g0)*1000:.0f}ms"
+                        print(f"[llm-detail] 分块prefill（含让路） {(prefilled_at-_g0)*1000:.0f}ms"
+                              f" · 生成器准备 {(progress['start']-prefilled_at)*1000:.0f}ms"
                               f" · 尾部prefill {(progress['prefill']-progress['start'])*1000:.0f}ms"
                               f" · 首token求值/流水准备 {(progress['ready']-progress['prefill'])*1000:.0f}ms"
                               f" · 解码返回 {(now-progress['ready'])*1000:.0f}ms"
@@ -213,7 +238,6 @@ class LocalLLM:
     async def __call__(self, text: str, memory_context: str = "",
                        history: list | None = None) -> AsyncIterator[str]:
         """Yield reply text while keeping reasoning private and honoring cancellation."""
-        loop = asyncio.get_running_loop()
         import time as _t
         _sub = _t.perf_counter()
 
@@ -225,25 +249,16 @@ class LocalLLM:
             finally:
                 gen.close()
 
-        job = gpu_loop().iter(stamped)
         first_received = True
         try:
-            while True:
-                item = await loop.run_in_executor(None, job.out.get)
-                if item is None:
-                    return
-                kind, val = item
-                if kind == "err":
-                    print(f"[llm] 本地生成失败：{type(val).__name__}: {val}", flush=True)
-                    return
-                val, produced_at = val
-                if val:
-                    if first_received and DEBUG:
-                        now = _t.perf_counter()
-                        print(f"[llm-delivery] 首文字回主循环 {(now-produced_at)*1000:.0f}ms"
-                              f" · 提交到收到 {(now-_sub)*1000:.0f}ms", flush=True)
-                    first_received = False
-                    yield val
-        finally:
-
-            job.cancel()
+            async with aclosing(gpu_loop().aiter(stamped, max_pending=16, label="local_llm")) as chunks:
+                async for val, produced_at in chunks:
+                    if val:
+                        if first_received and DEBUG:
+                            now = _t.perf_counter()
+                            print(f"[llm-delivery] 首文字回主循环 {(now-produced_at)*1000:.0f}ms"
+                                  f" · 提交到收到 {(now-_sub)*1000:.0f}ms", flush=True)
+                        first_received = False
+                        yield val
+        except Exception as exc:
+            print(f"[llm] 本地生成失败：{type(exc).__name__}: {exc}", flush=True)

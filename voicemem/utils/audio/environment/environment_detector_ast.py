@@ -10,6 +10,7 @@ know which audio model is configured.
 from __future__ import annotations
 
 import os
+import threading
 from pathlib import Path
 
 import numpy as np
@@ -39,8 +40,22 @@ class ASTEnvironmentDetector:
         self._processor = None
         self._model = None
         self._labels: list[str] = []
+        self._lock = threading.RLock()
+
+    def _model_lock(self):
+        import torch
+        from voicemem.engine import device_lock
+        device = self._device or ("cuda" if torch.cuda.is_available() else "cpu")
+        return self._lock if str(device).split(":", 1)[0] == "cpu" else device_lock(device)
 
     def _load(self) -> None:
+        if self._model is not None:
+            return
+        from voicemem.engine import inference_call
+        with inference_call("scene_ast_load", "torch", lock=(self._lock, self._model_lock)):
+            self._load_locked()
+
+    def _load_locked(self) -> None:
         if self._model is not None:
             return
         import torch
@@ -50,10 +65,13 @@ class ASTEnvironmentDetector:
             "VOICEMEM_ENVIRONMENT_MODEL", DEFAULT_MODEL
         )
         device = self._device or ("cuda" if torch.cuda.is_available() else "cpu")
-        self._processor = AutoProcessor.from_pretrained(source)
-        self._model = ASTForAudioClassification.from_pretrained(source).to(device).eval()
-        self._device = device
-        self._labels = [self._model.config.id2label[i] for i in range(self._model.config.num_labels)]
+        from voicemem.engine.devices import device_key
+        device = device_key(device)
+        processor = AutoProcessor.from_pretrained(source)
+        model = ASTForAudioClassification.from_pretrained(source).to(device).eval()
+        labels = [model.config.id2label[i] for i in range(model.config.num_labels)]
+        self._processor, self._device, self._labels = processor, device, labels
+        self._model = model
 
     @staticmethod
     def _load_audio(audio_path: Path) -> np.ndarray:
@@ -77,10 +95,10 @@ class ASTEnvironmentDetector:
                 return None
             import torch
 
-            inputs = self._processor(audio, sampling_rate=16000, return_tensors="pt")
-            inputs = {name: value.to(self._device) for name, value in inputs.items()}
-            from voicemem.utils.torch_lock import TORCH_LOCK
-            with TORCH_LOCK, torch.inference_mode():
+            from voicemem.engine import inference_call
+            with inference_call("scene_ast", "torch", lock=self._model_lock()), torch.inference_mode():
+                inputs = self._processor(audio, sampling_rate=16000, return_tensors="pt")
+                inputs = {name: value.to(self._device) for name, value in inputs.items()}
                 output = self._model(**inputs, output_hidden_states=True)
                 scores = torch.sigmoid(output.logits[0]).cpu().numpy()
                 embedding = output.hidden_states[-1][0].mean(dim=0).cpu().numpy()

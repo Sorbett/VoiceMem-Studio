@@ -70,3 +70,5 @@ Windows 用户先安装 Node.js 22.12 或更新版本、Docker Desktop（WSL2 �
 - **浏览器能用吗？** 浏览器是补充访问方式。独立启动的后端默认可通过 `http://localhost:8787` 访问同一套对话界面；App 管理的后端使用其实际监听端口。浏览器在远程地址使用麦克风时需要 HTTPS，或通过 SSH 转发后访问本机地址。
 
 更多平台细节见[桌面 App 说明](apps/README.md)和[后端部署说明](deploy/README.md)。
+
+Studio 的 Harness 使用共享的 [`voicemem/engine/`](../voicemem/engine/README.md) 作为推理基础设施：MLX 使用统一执行线程；CUDA 按设备协调语音合成、ASR、路由和后台模型，并统一处理输出背压、取消、音频缓冲反馈及资源观测。模型适配与对话策略由各自模块负责。平台性能需要对应硬件验证，Mac 上的延迟结果不能代表 NVIDIA 后端。
