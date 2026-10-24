@@ -582,12 +582,11 @@ Owned by provider modules and shared schedulers:
 - `voicemem/tts.py`, `studio/core/utils/tts/component.py`, `cache.py`: speech providers and local
   synthesis support;
 - `voicemem/engine/`: shared inference execution and resource scheduling;
-  `mlx.py` owns the single MLX thread, fair execution and bounded output,
-  `cuda.py` owns CUDA speech worker lifetimes and bounded async delivery,
-  `torch.py` owns native per-device priority admission, `cpu.py` supplies runtime thread
-  budgets, `context.py` captures inference priority, and `background.py` owns
-  background native task lifetime; `admission.py` owns speech-aware cross-backend
-  admission, `metrics.py` owns adapter timings, and `system.py` samples paging;
+  `backends/` owns the MLX execution thread and cooperative prefill, CUDA speech
+  workers, Torch per-device locks and CPU thread budgets; `scheduling/` owns
+  priority contexts, speech-aware cross-backend admission and background native
+  task lifetime; `telemetry/` owns adapter timings and OS/device observations.
+  Provider consumers use the public `voicemem.engine` facade;
 - `voicemem/utils/engine.py`, `gpu_loop.py`, `torch_lock.py`, `background.py`:
   compatibility imports exposing the same engine-owned objects;
 - the streaming ASR worker and dedicated final-ASR executor in `voicemem/stream.py`.
@@ -1077,12 +1076,14 @@ within an event loop. Only text and bounded history form the key, not memory or
 turn objects. One cancelled waiter does not cancel another. The last cancelled
 waiter cancels and awaits the owned async task. MLX classification uses an async
 `GpuLoop` stream: queued obsolete requests never enter model inference, and active
-classification yields between prefix preparation, prefill batches and greedy
+classification yields between bounded prefix preparation, request prefill batches and greedy
 decode steps. An in-flight native step may finish, but cancellation prevents later
 steps and prevents the result from entering the depth cache. Synchronous warmup
-and evaluation callers retain their existing classification contract.
+and evaluation callers use the same cooperative execution while retaining their
+classification contract. Only fully materialized prefix caches are published.
 `[route-gpu]` separates GPU queue time from accumulated inference-step time;
-scheduler yields are excluded from the latter.
+scheduler yields are excluded from the latter. It also reports the largest
+step and step count; `[route-input]` records token counts and prefix reuse without text.
 Invalid model output uses ordinary reasoning; model exceptions preserve Gate
 memory eligibility. The legacy class name and
 hint argument remain for caller compatibility, but that hint no longer
@@ -1312,7 +1313,7 @@ do not become normal assistant replies.
 ### MLX
 
 Local MLX reply, reasoning-depth routing, and TTS work share one process-level
-`GpuLoop` implemented in `voicemem/engine/mlx.py`. Production adapters import
+`GpuLoop` implemented in `voicemem/engine/backends/mlx/scheduler.py`. Production adapters import
 the shared `voicemem.engine` entry point; legacy utility imports expose the same
 classes, contexts and process singletons. Importing the engine does not import
 MLX, Torch or ONNX Runtime. The loop owns the GPU
@@ -1323,7 +1324,7 @@ ready job from waiting indefinitely, and paused producers resume at the current
 virtual-time floor rather than accumulating catch-up credit. The engine applies
 the MLX allocator cache budget on its own thread before model execution.
 Initialization failures are delivered to queued callers instead of orphaning them.
-`engine/prefill.py` materializes local reply prompt updates in bounded token
+`engine/backends/mlx/prefill.py` materializes local reply and router prompt updates in bounded token
 blocks, yielding to the same scheduler between blocks. Generation keeps the
 last prompt token for the existing sampler. Synchronous prefix warmup uses
 `GpuLoop.run_steps`; nested owner-thread callers execute inline. Cancellation
@@ -1402,7 +1403,7 @@ DeepSeek-only deployments require only DeepSeek credentials.
 ### Torch device admission
 
 Torch-backed embedding and related MPS operations use the process-level lock in
-`voicemem/engine/torch.py`, also exposed through `utils/torch_lock.py`. The reentrant
+`voicemem/engine/backends/torch.py`, also exposed through `utils/torch_lock.py`. The reentrant
 lock prioritizes streaming ASR over interactive queries and captured background
 work; aged waiters receive a turn to avoid starvation. Timed-out waiters leave
 no admission ticket behind. Native calls already running are not preempted.
@@ -1468,11 +1469,11 @@ next job cannot overlap it. Existing session and output guards reject stale UI
 results. This lane is agent-owned; it does not impose a new process-wide account
 or session admission limit.
 
-`voicemem.engine.background` supplies an opt-in captured idle waiter without
+`voicemem.engine.scheduling.background` supplies an opt-in captured idle waiter without
 depending on Studio. Studio captures background inference priority after the
 initial bounded idle admission. Stage checkpoints retain the SDK's injected
 waiter contract; Studio no longer repeats a fixed idle timeout at every stage.
-`engine/admission.py` instead admits each background AST, SenseVoice, shared
+`engine/scheduling/admission.py` instead admits each background AST, SenseVoice, shared
 embedding, speaker-worker and emotion2vec native call using active speech inventory, measured
 stage cost and synthesis real-time factor. Admission happens before model locks.
 Streaming ASR and EOT retain immediate critical admission, and MLX and Torch
@@ -1508,11 +1509,11 @@ run successive background stages without intervening speech progress. The
 policy cannot guarantee uninterrupted playback when native production itself is
 slower than consumption, and does not evict weights or change model quality.
 
-`engine/metrics.py` separates native adapter wall time, model-lock wait, background
+`engine/telemetry/metrics.py` separates native adapter wall time, model-lock wait, background
 admission wait, and initial MLX queue wait by static model/backend/service labels.
 Materialization remains inside the existing adapter boundary; these are not
 isolated kernel timings. Torch snapshots identify the active model/service.
-`engine/system.py` starts one optional Studio lifecycle-owned sampler thread. It
+`engine/telemetry/system.py` starts one optional Studio lifecycle-owned sampler thread. It
 samples OS counters once per second, reports swap/page-in/page-out deltas in MiB/s,
 compression/decompression rates, memory gauges, process CPU use and model
 aggregates every five seconds, and performs no subprocess work on the
@@ -1526,7 +1527,7 @@ free memory have distinct scopes. MPS tensor
 and process-wide Metal driver allocation are sampled by the native Torch-lock
 owner. The latter also includes other frameworks, including MLX, and must not be
 treated as Torch's unused cache or added again to the MLX allocation. Darwin
-sampling uses `host_statistics64` through `engine/darwin.py`; it never forks a
+sampling uses `host_statistics64` through `engine/telemetry/darwin.py`; it never forks a
 process containing active model runtimes.
 Unsupported or failed sampling is visible and does not stop dialogue. Imports
 start no samplers or model runtimes. Readiness still does not guarantee physical
@@ -1560,9 +1561,14 @@ an output ID. Late audio, subtitle, checkpoint, and cancellation events resolve
 against that ID.
 
 The local Breeze adapter emits an initial acoustic batch sized to satisfy the
-browser's existing admission buffer in one delivery. This avoids a redundant
-one-frame codec call and the subsequent wait for a second server chunk without
-raising the browser prebuffer or delaying audible playback.
+browser's admission buffer in one delivery. This avoids a redundant one-frame
+codec call. In chained mode, the shared browser worklet grants a small bounded
+start grace only when the initial buffer has no extra production headroom.
+Ready speculative output and completed short replies bypass this grace; realtime
+speech keeps its existing admission. Pause does not spend the grace, recovery
+does not repeat it, and interruption or a replacement output clears its state.
+This trades a bounded initial wait for protection against early delivery jitter;
+it does not accelerate synthesis or change rendered-sample accounting.
 
 Turn fillers use the browser's independent backchannel path so they do not
 become main-output timeline content. Once a backchannel starts, interruption,

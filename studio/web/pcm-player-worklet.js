@@ -13,6 +13,9 @@ class VoiceMemPCMPlayer extends AudioWorkletProcessor {
     this.baseTargetFrames = Math.round(sampleRate * 0.08);
     this.targetFrames = this.baseTargetFrames;
     this.maxTargetFrames = Math.round(sampleRate * 0.32);
+    this.startGraceFrames = 0;
+    this.startWaitFrames = 0;
+    this.hasStarted = false;
     this.stableFrames = 0;
     this.reportFrames = 0;
     this.levelFrames = 0;
@@ -44,6 +47,9 @@ class VoiceMemPCMPlayer extends AudioWorkletProcessor {
         const seconds = Math.max(0.04, Math.min(0.32, Number(message.prebuffer) || 0.08));
         this.baseTargetFrames = Math.round(sampleRate * seconds);
         this.targetFrames = Math.max(this.baseTargetFrames, this.targetFrames);
+        this.startGraceFrames = Math.round(sampleRate * Math.max(
+          0, Math.min(0.04, Number(message.startGrace) || 0),
+        ));
         if (message.comfortDb !== undefined) this._setComfort(message.comfortDb);
         return;
       }
@@ -131,6 +137,8 @@ class VoiceMemPCMPlayer extends AudioWorkletProcessor {
     this.offset = 0;
     this.bufferedFrames = 0;
     this.started = false;
+    this.hasStarted = false;
+    this.startWaitFrames = 0;
     this.draining = false;
     this.paused = false;
     this.stableFrames = 0;
@@ -183,7 +191,16 @@ class VoiceMemPCMPlayer extends AudioWorkletProcessor {
       if (!this.draining && this.bufferedFrames < this.targetFrames) {
         this._comfort(output, 0); return true;
       }
+      // Give a just-started producer a bounded head start. Already buffered
+      // outputs and final short clips need no additional playback delay.
+      if (!this.draining && !this.hasStarted &&
+          this.bufferedFrames < this.targetFrames + this.startGraceFrames &&
+          this.startWaitFrames < this.startGraceFrames) {
+        this.startWaitFrames += output.length;
+        this._comfort(output, 0); return true;
+      }
       this.started = true;
+      this.hasStarted = true;
       this._report("started");
     }
 

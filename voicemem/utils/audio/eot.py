@@ -112,8 +112,8 @@ class EndOfTurn:
         key = (sample_rate, id(self._fe), id(self._sess), hashlib.sha256(a.data).digest())
         cached = getattr(self, "_score_cache", None)
         if cached is not None and cached[0] == key:
-            from voicemem.engine.context import inference_scope
-            from voicemem.engine.metrics import record
+            from voicemem.engine.scheduling.context import inference_scope
+            from voicemem.engine.telemetry.metrics import record
             with inference_scope(Service.AUDIO):
                 record("eot", "cache", time.perf_counter()-started)
             return cached[1]

@@ -5,7 +5,7 @@ import unittest
 from unittest.mock import Mock
 
 from tests.helpers.gpu import cpu_gpu_loop
-from voicemem.engine.prefill import prefill_steps
+from voicemem.engine.backends.mlx.prefill import prefill_steps
 
 
 class PrefillTests(unittest.TestCase):

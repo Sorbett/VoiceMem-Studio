@@ -38,14 +38,11 @@ Breeze implementation, tone controls and decoder caches live in `studio/` and ar
 imported from there directly. The shared journal has one implementation under
 `utils/common/`, used directly by both packages.
 
-Shared inference infrastructure lives in `engine/`: `mlx.py` owns MLX execution
-and bounded output, `cuda.py` owns CUDA speech workers and bounded async delivery,
-`torch.py` owns per-device accelerator admission and CUDA graph initialization,
-`cpu.py` supplies CPU
-runtime budgets, `context.py` captures priority, and `background.py` owns background
-native task lifetime. `admission.py` owns speech-aware cross-backend admission;
-`metrics.py` separates model execution, lock and admission wait; `system.py`
-samples real paging rates off the event loop. Providers import `voicemem.engine` directly.
+Shared inference infrastructure lives in `engine/`: `backends/` owns native MLX,
+CUDA, Torch and CPU execution; `scheduling/` owns priorities, speech-aware resource
+admission and background task lifetime; `telemetry/` separates model execution,
+lock and admission wait and samples real paging rates off the event loop.
+Providers import the stable `voicemem.engine` facade directly.
 This is shared Harness runtime infrastructure; model weights and provider-specific
 inference stay in their adapters, and Studio dialogue policy stays in `studio/harness/`.
 CUDA speech, ASR, routing and GPU perception share device admission. Separate GPUs

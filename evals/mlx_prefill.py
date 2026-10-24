@@ -1,7 +1,7 @@
 """Offline native MLX prefill fairness and numerical-equivalence probe.
 
-Uses a seeded small Qwen3.5 architecture with both recurrent and attention
-caches, not pretrained weights. A is one native prefix call; B yields between
+Uses a seeded small Qwen3 or Qwen3.5 architecture, not pretrained weights.
+Qwen3.5 includes recurrent and attention caches. A is one prefix call; B yields between
 token blocks. The competing job is a materialized arithmetic probe, not speech.
 No API, Memory Space, audio, model download or persistent output is used.
 These timings do not measure production-model speed or perceived audio latency.
@@ -19,21 +19,29 @@ import time
 
 
 def main(args):
-    from voicemem.engine import gpu_loop
-    from voicemem.engine.prefill import prefill_steps
+    from voicemem.engine import gpu_loop, prefill_steps
 
     gpu = gpu_loop()
 
     def load():
         import mlx.core as mx
-        from mlx_lm.models.qwen3_5 import TextModel, TextModelArgs
         mx.random.seed(7)
-        model = TextModel(TextModelArgs(
-            hidden_size=256, intermediate_size=512, num_hidden_layers=4,
-            num_attention_heads=4, num_key_value_heads=2, head_dim=64,
-            vocab_size=128, linear_num_value_heads=4, linear_num_key_heads=4,
-            linear_key_head_dim=64, linear_value_head_dim=64,
-            full_attention_interval=2))
+        if args.architecture == 'qwen3':
+            from mlx_lm.models.qwen3 import Model, ModelArgs
+            model = Model(ModelArgs(
+                model_type='qwen3', hidden_size=256, intermediate_size=512,
+                num_hidden_layers=4, num_attention_heads=4, num_key_value_heads=2,
+                head_dim=64, vocab_size=128, rms_norm_eps=1e-6,
+                max_position_embeddings=8192, rope_theta=1000000,
+                tie_word_embeddings=True))
+        else:
+            from mlx_lm.models.qwen3_5 import TextModel, TextModelArgs
+            model = TextModel(TextModelArgs(
+                hidden_size=256, intermediate_size=512, num_hidden_layers=4,
+                num_attention_heads=4, num_key_value_heads=2, head_dim=64,
+                vocab_size=128, linear_num_value_heads=4, linear_num_key_heads=4,
+                linear_key_head_dim=64, linear_value_head_dim=64,
+                full_attention_interval=2))
         mx.eval(model.parameters())
         return model
 
@@ -42,7 +50,8 @@ def main(args):
 
     def native(stepped, entered, timings):
         import mlx.core as mx
-        cache = model.make_cache()
+        from mlx_lm.models.cache import make_prompt_cache
+        cache = make_prompt_cache(model)
         entered.set()
         if stepped:
             steps = prefill_steps(model, tokens, cache, step_size=args.step_size, keep_last=True)
@@ -121,13 +130,15 @@ def main(args):
                         for key in ("prefix_ms", "max_step_ms", "probe_wait_ms")}
                for policy in set(args.order)}
     print(json.dumps(dict(python=platform.python_version(), machine=platform.machine(),
-                          mlx=version("mlx"), mlx_lm=version("mlx-lm"), tokens=args.tokens,
+                          mlx=version("mlx"), mlx_lm=version("mlx-lm"),
+                          architecture=args.architecture, tokens=args.tokens,
                           step_size=args.step_size, equivalence=equivalence,
                           summary=summary, phases=rows), indent=2))
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--architecture", choices=['qwen3', 'qwen3.5'], default='qwen3.5')
     parser.add_argument("--tokens", type=int, default=2048)
     parser.add_argument("--step-size", type=int, default=256)
     parser.add_argument("--order", default="ABBAABBA")

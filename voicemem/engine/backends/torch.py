@@ -7,7 +7,7 @@ import threading
 import time
 import sys
 
-from .context import Service, _service
+from ..scheduling.context import Service, _service
 from .devices import device_key
 
 
@@ -132,7 +132,7 @@ class InferenceLock:
                     now = time.monotonic()
                     if self._owner is None and self._next(now) is waiter:
                         self._owner, self._depth = ident, 1
-                        from .metrics import _model
+                        from ..telemetry.metrics import _model
                         self._model, self._service = _model.get(), waiter.service.name.lower()
                         self._started = now
                         return True
@@ -164,7 +164,7 @@ class InferenceLock:
                                 "peak_allocated_bytes": cuda.max_memory_allocated(self.device),
                                 "free_bytes": free, "total_bytes": total,
                             }
-                            from .admission import resources
+                            from ..scheduling.admission import resources
                             resources.device_pressure(self.device, free < max(256*1024**2, .05*total))
                         elif torch is not None and torch.backends.mps.is_available():
                             self._memory = {

@@ -44,6 +44,106 @@ class MlxRouterSchedulingTests(unittest.IsolatedAsyncioTestCase):
     def router(self):
         return MLXThinkingRouter(model='/synthetic-router')
 
+    def long_input_runtime(self, before_forward, *, prefix_matches=True):
+        router = self.router()
+        caches, lengths = [], []
+
+        def forward(tokens, *, cache):
+            lengths.append(tokens.shape[1])
+            caches.append(cache)
+            before_forward()
+            cache[0].state[0] += tokens.shape[1]
+            token = 9 if tokens.shape[1] == 1 and tokens[0, 0] == 3 else 3
+            logits = np.full((1, 1, 10), -1000.0)
+            logits[0, -1, token] = 0
+            return logits
+
+        def tokenize(messages, *, add_generation_prompt, **kwargs):
+            tail = [5] * 600 if add_generation_prompt else [5 if not messages[-1]['content'] else 6]
+            prefix_token = 2 if add_generation_prompt and not prefix_matches else 1
+            return [prefix_token] * 400 + tail
+
+        tokenizer = types.SimpleNamespace(apply_chat_template=tokenize,
+                                         eos_token_ids={9}, decode=lambda _: '否')
+        router._load_mlx = lambda: (tokenizer, forward)
+        cache_module = types.ModuleType('mlx_lm.models.cache')
+        cache_module.make_prompt_cache = lambda _: [types.SimpleNamespace(state=np.array([0]))]
+        modules = {'mlx_lm': types.ModuleType('mlx_lm'),
+                   'mlx_lm.models': types.ModuleType('mlx_lm.models'),
+                   'mlx_lm.models.cache': cache_module}
+        return router, caches, lengths, modules
+
+    async def test_sync_router_yields_to_audio_during_prefix_and_bounds_request_prefill(self):
+        entered, release = threading.Event(), threading.Event()
+        order = []
+
+        def before_forward():
+            order.append('forward')
+            if len(order) == 1:
+                entered.set()
+                release.wait(2)
+
+        router, caches, lengths, modules = self.long_input_runtime(before_forward)
+
+        def audio():
+            order.append('audio')
+            yield b'pcm'
+
+        with cpu_gpu_loop() as gpu, patch.dict('sys.modules', modules), \
+                patch('voicemem.engine.gpu_loop', return_value=gpu):
+            task = asyncio.create_task(asyncio.to_thread(router.classify, 'synthetic input'))
+            try:
+                self.assertTrue(await asyncio.to_thread(entered.wait, 1))
+                speech = gpu.iter(audio, solo_first=True)
+            finally:
+                release.set()
+            self.assertEqual((await task).level, FAST)
+            self.assertEqual(speech.out.get(timeout=1), ('ok', b'pcm'))
+            self.assertIsNone(speech.out.get(timeout=1))
+        self.assertEqual(order[:3], ['forward', 'audio', 'forward'])
+        self.assertLessEqual(max(lengths), 128)
+        np.testing.assert_array_equal(router._prefix_cache[0].state, [400])
+        np.testing.assert_array_equal(caches[-1][0].state, [1001])
+
+    async def test_cancelled_prefix_stays_private_and_next_request_rebuilds_it(self):
+        entered, release = threading.Event(), threading.Event()
+
+        def before_forward():
+            if not entered.is_set():
+                entered.set()
+                release.wait(2)
+
+        router, caches, lengths, modules = self.long_input_runtime(before_forward)
+        with cpu_gpu_loop() as gpu, patch.dict('sys.modules', modules), \
+                patch('voicemem.engine.gpu_loop', return_value=gpu):
+            task = asyncio.create_task(router.classify_async('cancelled input'))
+            try:
+                self.assertTrue(await asyncio.to_thread(entered.wait, 1))
+                task.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await task
+            finally:
+                release.set()
+            await asyncio.to_thread(gpu.call, lambda: None)
+            self.assertEqual(lengths, [128])
+            self.assertIsNone(router._prefix_key)
+            self.assertIsNone(router._prefix_cache)
+            self.assertEqual(router._cache, {})
+            self.assertEqual((await router.classify_async('replacement input')).level, FAST)
+            np.testing.assert_array_equal(router._prefix_cache[0].state, [400])
+            self.assertIsNot(caches[0], router._prefix_cache)
+
+    async def test_token_prefix_mismatch_uses_bounded_private_fallback(self):
+        router, caches, lengths, modules = self.long_input_runtime(
+            lambda: None, prefix_matches=False)
+        with cpu_gpu_loop() as gpu, patch.dict('sys.modules', modules), \
+                patch('voicemem.engine.gpu_loop', return_value=gpu):
+            self.assertEqual((await router.classify_async('synthetic input')).level, FAST)
+        self.assertLessEqual(max(lengths), 128)
+        np.testing.assert_array_equal(router._prefix_cache[0].state, [400])
+        np.testing.assert_array_equal(caches[-1][0].state, [1001])
+        self.assertIsNot(caches[-1], router._prefix_cache)
+
     async def test_queued_last_waiter_cancellation_skips_model_and_cache(self):
         entered, release = threading.Event(), threading.Event()
         router = self.router()

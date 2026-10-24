@@ -17,6 +17,8 @@ class MLXThinkingRouter(QwenThinkingRouter):
     and examples enter the prefix cache; each request gets its own mutable copy.
     """
 
+    _PREFILL_STEP = 128
+
     def __init__(self, model: str | None = None) -> None:
         super().__init__(model=model)
         self._prefix_key = None
@@ -43,7 +45,10 @@ class MLXThinkingRouter(QwenThinkingRouter):
         from voicemem.engine import gpu_loop
 
         self._ensure_model_source()
-        return gpu_loop().call(lambda: self._predict_on_gpu(system, examples, prompt))
+        submitted = time.perf_counter()
+        return gpu_loop().run_steps(
+            lambda: self._timed_prediction(system, examples, prompt, submitted),
+            label="reply_router")
 
     def _short_text(self, system, prompt, max_tokens, cancelled, deadline):
         from .short_text import mlx_short_text
@@ -70,7 +75,8 @@ class MLXThinkingRouter(QwenThinkingRouter):
 
     def _timed_prediction(self, system, examples, prompt, submitted):
         started = time.perf_counter()
-        work_s = 0.0
+        work_s = max_step_s = 0.0
+        count = 0
         status = 'cancelled'
         steps = self._prediction_steps(system, examples, prompt)
         try:
@@ -82,7 +88,10 @@ class MLXThinkingRouter(QwenThinkingRouter):
                     status = 'complete'
                     break
                 finally:
-                    work_s += time.perf_counter() - step_started
+                    step_s = time.perf_counter() - step_started
+                    work_s += step_s
+                    max_step_s = max(max_step_s, step_s)
+                    count += 1
                 yield value
         except Exception:
             status = 'error'
@@ -93,6 +102,7 @@ class MLXThinkingRouter(QwenThinkingRouter):
                 close()
             print(f'[route-gpu] queue_ms={(started-submitted)*1000:.0f}'
                   f' compute_ms={work_s*1000:.0f}'
+                  f' max_step_ms={max_step_s*1000:.0f} steps={count}'
                   f' status={status}', flush=True)
 
     def _predict_on_gpu(self, system: str, examples, prompt: str) -> str:
@@ -105,6 +115,7 @@ class MLXThinkingRouter(QwenThinkingRouter):
     def _prediction_steps(self, system: str, examples, prompt: str):
         import mlx.core as mx
         from mlx_lm.models.cache import make_prompt_cache
+        from voicemem.engine import prefill_steps
 
         tokenizer, model = self._load_mlx()
         examples = tuple(examples)
@@ -128,29 +139,33 @@ class MLXThinkingRouter(QwenThinkingRouter):
                          min(len(left), len(right)))
             prefix = left[:count]
             cache = make_prompt_cache(model)
-            if prefix:
-                model(mx.array(prefix)[None], cache=cache)
-                mx.eval([layer.state for layer in cache])
+            for _ in prefill_steps(model, prefix, cache, step_size=self._PREFILL_STEP):
+                yield None
+            # Publish only a fully materialized prefix. Cancellation leaves
+            # private partial state on the scheduler's owning thread.
             self._prefix_tokens, self._prefix_cache = prefix, cache
             self._prefix_key = key
-            yield None
 
         tokens = tokenize(prompt, True)
         count = len(self._prefix_tokens)
-        if count < len(tokens) and tokens[:count] == self._prefix_tokens:
+        prefix_hit = count < len(tokens) and tokens[:count] == self._prefix_tokens
+        if prefix_hit:
             tokens = tokens[count:]
             cache = copy.deepcopy(self._prefix_cache)
         else:
             cache = make_prompt_cache(model)
+        print(f'[route-input] tokens={len(tokens)} prefix_tokens={count}'
+              f' prefix_hit={int(prefix_hit)} prefill_step_tokens={self._PREFILL_STEP}', flush=True)
         # A four-token greedy classifier does not need the text-generation
         # wrapper, which changes the process-wide wired-memory limit and clears
         # allocator caches also used by TTS. Keep inference on the owned stream.
-        pending = mx.array(tokens)
-        while len(pending) > 512:
-            model(pending[:512][None], cache=cache)
-            mx.eval([layer.state for layer in cache])
-            pending = pending[512:]
+        # Decode from the last bounded batch directly; short inputs need no
+        # separate prefill pass just to compute their first greedy token.
+        prefill_count = max(0, (len(tokens) - 1) // self._PREFILL_STEP * self._PREFILL_STEP)
+        for _ in prefill_steps(model, tokens[:prefill_count], cache,
+                               step_size=self._PREFILL_STEP):
             yield None
+        pending = mx.array(tokens[prefill_count:])
         generated = []
         for _ in range(4):
             logits = model(pending[None], cache=cache)

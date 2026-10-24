@@ -75,6 +75,16 @@ test('text waits for session readiness and uses the existing user_text contract'
   f.sockets[0].receive({type:'session_ready',mode:'llm_tts'}); await sent;
   assert.deepEqual(f.sockets[0].sent, [{type:'user_text',text:'hello'}]); f.client.cancel();
 });
+test('chained playback enables bounded start grace while realtime keeps immediate admission', async () => {
+  for (const mode of ['llm_tts', 'realtime']) {
+    const f = fixture(), pending = f.client.send('fixture'); await tick();
+    f.sockets[0].receive({type:'session_ready', mode}); await pending;
+    const config = f.nodes[0].messages.find(message => message.type === 'config');
+    assert.equal(config.prebuffer, mode === 'realtime' ? .08 : .16);
+    assert.equal(config.startGrace, mode === 'realtime' ? 0 : .04);
+    f.client.cancel();
+  }
+});
 test('settings pause the microphone without discarding the session', async () => {
   const f = fixture(); const starting = f.client.start(); await tick();
   f.sockets[0].receive({type:'session_ready'}); await tick();

@@ -5,7 +5,7 @@ import sys
 import threading
 import time
 
-from .admission import resources
+from ..scheduling.admission import resources
 from .metrics import model_metrics
 
 
@@ -90,8 +90,8 @@ class EngineObserver:
                 if now-reported >= 5:
                     rows = model_metrics(reset=True)
                     if rows:
-                        from .mlx import gpu_loop
-                        from .torch import torch_snapshot
+                        from ..backends.mlx.scheduler import gpu_loop
+                        from ..backends.torch import torch_snapshot
                         print("[engine-system] " + " ".join(f"{k}={v:.2f}" for k, v in rates.items())
                               + " " + " ".join(f"{k}={v:.2f}" for k, v in gauges.items())
                               + f" admission={resources.snapshot()} mlx={gpu_loop().snapshot()}"

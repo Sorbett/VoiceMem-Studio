@@ -8,10 +8,10 @@ import queue
 import threading
 import time
 
-from .admission import observe_speech, speech_scope
-from .context import Service, inference_scope
+from ..scheduling.admission import observe_speech, speech_scope
+from ..scheduling.context import Service, inference_scope
 from .devices import device_key
-from .metrics import inference_call
+from ..telemetry.metrics import inference_call
 from .torch import cuda_initialization, device_lock
 
 

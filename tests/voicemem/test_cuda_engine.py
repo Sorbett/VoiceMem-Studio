@@ -12,9 +12,9 @@ from unittest.mock import Mock, patch
 from voicemem.engine import (CudaWorker, Service, SpeechFeedback, cuda_initialization,
                              device_lock, inference_call, model_metrics, speech_scope,
                              torch_snapshot)
-from voicemem.engine.admission import ResourceAdmission, _speech
-from voicemem.engine.context import _service
-from voicemem.engine.torch import InferenceLock, _capture_gate
+from voicemem.engine.scheduling.admission import ResourceAdmission, _speech
+from voicemem.engine.scheduling.context import _service
+from voicemem.engine.backends.torch import InferenceLock, _capture_gate
 from voicemem.leftbrain.local_embedder import _LockedEncoder
 
 
@@ -208,7 +208,7 @@ class CudaWorkerTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 self.assertTrue(device_lock("cuda:0")._is_owned())
                 closed.set()
-        with patch("voicemem.engine.admission.resources", admission):
+        with patch("voicemem.engine.scheduling.admission.resources", admission):
             with speech_scope(feedback, producing=False):
                 token = marker.set("captured")
                 stream = self.worker.stream(generate)
@@ -306,7 +306,7 @@ class CudaWorkerTests(unittest.IsolatedAsyncioTestCase):
         def generate(cancelled):
             yield b"\x01\x00"
             yield b"\x02\x00"
-        with patch("voicemem.engine.cuda.asyncio.to_thread", side_effect=AssertionError("blocking bridge")):
+        with patch("voicemem.engine.backends.cuda.asyncio.to_thread", side_effect=AssertionError("blocking bridge")):
             chunks = [pcm async for pcm in self.worker.stream(generate)]
         self.assertEqual(chunks, [b"\x01\x00", b"\x02\x00"])
 

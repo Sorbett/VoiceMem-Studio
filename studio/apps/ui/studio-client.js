@@ -216,7 +216,10 @@
       if (message.output_id && message.type !== 'answer_start' && message.output_id !== owner.output) return;
       switch (message.type) {
         case 'session_ready':
-          owner.player.port.postMessage({ type: 'config', prebuffer: message.mode === 'realtime' ? .08 : .16 });
+          owner.player.port.postMessage({
+            type: 'config', prebuffer: message.mode === 'realtime' ? .08 : .16,
+            startGrace: message.mode === 'realtime' ? 0 : .04,
+          });
           clearTimeout(owner.timeout); owner.resolve(owner); break;
         case 'user_transcript':
           phase(owner, 'short-thinking'); break;

@@ -1692,6 +1692,7 @@ function resolvePcmDrain(){
 function configurePcmPlayer(){
   if(pcmNode){
     pcmNode.port.postMessage({type:'config',prebuffer:pcmPrebuffer,
+                              startGrace:pcmPrebuffer>=0.16?0.04:0,
                               comfortDb:pcmComfortDb});
     pcmNode.port.postMessage({type:'gain',value:replyGain});
   }

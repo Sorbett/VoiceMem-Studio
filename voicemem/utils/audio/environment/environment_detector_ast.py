@@ -65,7 +65,7 @@ class ASTEnvironmentDetector:
             "VOICEMEM_ENVIRONMENT_MODEL", DEFAULT_MODEL
         )
         device = self._device or ("cuda" if torch.cuda.is_available() else "cpu")
-        from voicemem.engine.devices import device_key
+        from voicemem.engine.backends.devices import device_key
         device = device_key(device)
         processor = AutoProcessor.from_pretrained(source)
         model = ASTForAudioClassification.from_pretrained(source).to(device).eval()

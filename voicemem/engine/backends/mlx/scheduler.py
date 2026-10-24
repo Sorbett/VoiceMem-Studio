@@ -13,7 +13,7 @@ import queue
 import threading
 import time
 
-from .context import inference_scope
+from ...scheduling.context import inference_scope
 
 
 _DONE = None
@@ -338,7 +338,7 @@ class GpuLoop:
             raise
         finally:
             entry.cost = time.perf_counter() - started
-            from .metrics import record
+            from ...telemetry.metrics import record
             record(entry.job.label, "mlx", entry.cost,
                    queue_s=started-entry.job.submitted if first else 0, error=failed)
 

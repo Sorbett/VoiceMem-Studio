@@ -6,8 +6,7 @@ import threading
 from contextlib import aclosing
 from typing import AsyncIterator
 
-from voicemem.engine import gpu_loop
-from voicemem.engine.prefill import prefill_steps
+from voicemem.engine import gpu_loop, prefill_steps
 
 MODEL = 'mlx-community/Qwen3.5-4B-4bit'
 

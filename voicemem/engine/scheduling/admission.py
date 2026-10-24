@@ -7,7 +7,7 @@ import math
 import threading
 import time
 
-from .devices import device_key
+from ..backends.devices import device_key
 
 
 _speech = ContextVar("voicemem_speech_feedback", default=None)

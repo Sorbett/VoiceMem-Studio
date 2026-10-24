@@ -9,10 +9,10 @@ from unittest.mock import patch
 
 from voicemem.engine import (InferenceLock, Service, background_scope, inference_call,
                              model_metrics, speech_scope)
-from voicemem.engine.admission import ResourceAdmission, SpeechFeedback, _speech
-from voicemem.engine.admission import _budget
-from voicemem.engine.system import EngineObserver, paging_rates
-from voicemem.engine.darwin import DarwinCounters, VMStatistics64
+from voicemem.engine.scheduling.admission import ResourceAdmission, SpeechFeedback, _speech
+from voicemem.engine.scheduling.admission import _budget
+from voicemem.engine.telemetry.system import EngineObserver, paging_rates
+from voicemem.engine.telemetry.darwin import DarwinCounters, VMStatistics64
 
 
 class SpeechAdmissionTests(unittest.TestCase):
@@ -187,7 +187,7 @@ class SpeechAdmissionTests(unittest.TestCase):
 
     def test_nested_scope_and_failure_release_output_ownership(self):
         admission, feedback = ResourceAdmission(), SpeechFeedback()
-        with patch("voicemem.engine.admission.resources", admission):
+        with patch("voicemem.engine.scheduling.admission.resources", admission):
             with self.assertRaisesRegex(RuntimeError, "fixture"):
                 with speech_scope(feedback, producing=False):
                     self.assertEqual(admission.snapshot()["speech_jobs"], 0)
@@ -201,7 +201,7 @@ class SpeechAdmissionTests(unittest.TestCase):
 
     def test_output_reserves_between_segments_after_first_local_producer(self):
         admission, feedback = ResourceAdmission(), SpeechFeedback()
-        with patch("voicemem.engine.admission.resources", admission):
+        with patch("voicemem.engine.scheduling.admission.resources", admission):
             with speech_scope(feedback, producing=False):
                 self.assertEqual(admission.snapshot()["speech_jobs"], 0)
                 with speech_scope():
@@ -218,7 +218,7 @@ class SpeechAdmissionTests(unittest.TestCase):
             self.assertFalse(lock._is_owned())
             return .25, True
 
-        with patch("voicemem.engine.metrics.resources.wait", side_effect=admit):
+        with patch("voicemem.engine.telemetry.metrics.resources.wait", side_effect=admit):
             with background_scope(None), self.assertRaisesRegex(ValueError, "fixture"):
                 with inference_call("fixture", "torch", lock=lock):
                     state = lock.snapshot()
@@ -229,14 +229,14 @@ class SpeechAdmissionTests(unittest.TestCase):
         self.assertEqual((row["errors"], row["forced"], row["admission_ms"]), (1, 1, 250))
 
     def test_audio_does_not_wait_for_background_admission(self):
-        with patch("voicemem.engine.metrics.resources.wait") as wait:
+        with patch("voicemem.engine.telemetry.metrics.resources.wait") as wait:
             with background_scope(None), inference_call("fixture", "torch", service=Service.AUDIO):
                 pass
             wait.assert_not_called()
 
     def test_reentrant_native_call_never_waits_while_holding_outer_lock(self):
         lock = InferenceLock()
-        with patch("voicemem.engine.metrics.resources.wait") as wait:
+        with patch("voicemem.engine.telemetry.metrics.resources.wait") as wait:
             with background_scope(None), lock, inference_call("fixture", "torch", lock=lock):
                 self.assertTrue(lock._is_owned())
             wait.assert_not_called()
@@ -280,9 +280,9 @@ class SpeechAdmissionTests(unittest.TestCase):
         row = dict(model="fixture", backend="torch", service="audio", calls=1,
                    run_ms=1, max_run_ms=1, lock_ms=0, admission_ms=0,
                    queue_ms=0, forced=0, errors=0)
-        with patch("voicemem.engine.system._counters", side_effect=NotImplementedError), \
-                patch("voicemem.engine.system.time.monotonic", side_effect=[0, 6]), \
-                patch("voicemem.engine.system.model_metrics", return_value=[row]), \
+        with patch("voicemem.engine.telemetry.system._counters", side_effect=NotImplementedError), \
+                patch("voicemem.engine.telemetry.system.time.monotonic", side_effect=[0, 6]), \
+                patch("voicemem.engine.telemetry.system.model_metrics", return_value=[row]), \
                 patch.object(observer._stop, "wait", side_effect=lambda _: observer._stop.set()), \
                 patch("builtins.print") as output:
             observer._run()
@@ -300,7 +300,7 @@ class SpeechAdmissionTests(unittest.TestCase):
         from unittest.mock import Mock
         library = SimpleNamespace(mach_host_self=Mock(return_value=7),
                                   host_statistics64=Mock(side_effect=sample))
-        with patch("voicemem.engine.darwin.os.sysconf", return_value=16384, create=True):
+        with patch("voicemem.engine.telemetry.darwin.os.sysconf", return_value=16384, create=True):
             reader = DarwinCounters(library)
         result = reader.sample()
         self.assertEqual(ctypes.sizeof(VMStatistics64), 152)

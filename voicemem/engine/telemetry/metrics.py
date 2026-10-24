@@ -6,9 +6,9 @@ from contextvars import ContextVar
 import threading
 import time
 
-from .admission import resources
-from .context import Service, _service, inference_scope
-from .devices import device_key
+from ..scheduling.admission import resources
+from ..scheduling.context import Service, _service, inference_scope
+from ..backends.devices import device_key
 
 
 _model = ContextVar("voicemem_inference_model", default="unlabelled")
