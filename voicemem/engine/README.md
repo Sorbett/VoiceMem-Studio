@@ -21,6 +21,7 @@ engine/
 ├── scheduling/
 │   ├── context.py          # Audio, interactive and background priority
 │   ├── admission.py        # Speech inventory, stage cost and resource pressure
+│   ├── capacity.py         # Optional cross-provider background native capacity
 │   └── background.py       # Captured admission and native task lifetime
 └── telemetry/
     ├── metrics.py          # Native execution, lock, admission and queue time
@@ -61,6 +62,29 @@ Known work on another CUDA GPU can proceed independently; unknown placement is
 treated conservatively. Browser inventory is accepted only after output ownership
 validation and is never evidence that the user heard audio.
 
+`scheduling/capacity.py` provides background native capacity before speech
+admission and model locks. Studio enables it during startup through
+`configure_background_capacity(default=True)`; the standalone SDK keeps its
+disabled default. Set `VOICEMEM_ENGINE_BACKGROUND_CAPACITY=0` to explicitly
+disable it or `1` to enable it; invalid values fail explicitly. CPU and MPS share
+one host reservation. Known CUDA devices can run independently; unknown placement
+conflicts conservatively with every domain. Competing background waiters are
+FIFO. Audio and interactive calls bypass this budget. Reservations release on
+failure and retain ownership through already-started native work after caller
+cancellation. Capacity waiting does not consume the speech-admission timeout.
+
+The policy changes neither provider settings nor playback pacing. Keep baseline
+and candidate measurements on the same models, prompts and native environment.
+`capacity_ms` reports native-capacity queueing separately from model lock,
+speech admission and execution; system summaries include capacity owner/waiter
+counts. Configure programmatic `background_capacity` only at a quiescent boundary.
+
+`backends/cpu.py` also supplies `cpu_thread_budget()` for FunASR model creation.
+Studio defaults to two CPU intra-op threads on MLX and four on CUDA; the SDK
+retains four. `VOICEMEM_ENGINE_CPU_THREADS` overrides the positive integer.
+Streaming ASR, SenseVoice and emotion2vec receive the same budget, preserving
+their model and decoding settings while avoiding competing thread-pool defaults.
+
 One `background_scope` shares accumulated admission wait across captured child
 workers. After sustained waiting, a stage can use a smaller safe inventory
 reserve that covers its own cost and the next observed synthesis step, once per
@@ -92,6 +116,12 @@ allocated/reserved/peak and global free/total bytes, or MPS tensor/process-wide
 Metal driver allocation. Reading snapshots never initializes CUDA. Sampling
 failure is visible and must not leak an admission permit.
 
+`telemetry/thermal.py` reads the optional macOS thermal category on the observer
+thread without subprocesses or model imports. Five-second system summaries
+continue while idle so cooling remains observable. Unsupported platforms and
+failed or unknown reads remain explicit; a category is neither a temperature
+nor a measured clock rate and does not alter model quality or system power.
+
 Deterministic checks run without NVIDIA hardware:
 
 ```bash
@@ -107,3 +137,8 @@ browser-perceived latency. See [evaluation entry points](../../evals/README.md).
 native scheduling on a seeded small architecture without downloading weights.
 Use `--architecture qwen3 --step-size 128` to probe the router architecture.
 Its competing arithmetic probe is not an audio or production-model benchmark.
+
+`python -m evals.engine_contention --capacity-crossover --background-workers 2`
+compares baseline speech-aware admission with the added capacity budget in ABBA
+order. It waits for every background pipeline to finish before switching policy.
+The probe does not measure browser stalls or Studio end-to-end reply latency.

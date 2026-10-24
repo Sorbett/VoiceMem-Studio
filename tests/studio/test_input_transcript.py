@@ -1,5 +1,6 @@
 """Offline input-display regressions with real orchestration and fake providers."""
 import asyncio
+import json
 import types
 import unittest
 from unittest.mock import AsyncMock, Mock, patch
@@ -8,6 +9,7 @@ from studio.core.core import converse
 from studio.core.utils.audio_timeline.component import AudioTimeline
 from studio.core.utils.contracts.component import Pending, ReplySink, input_transcript_event
 from studio.core.utils.conversation.component import Conversation
+from studio.core.utils.conversation.input_turn import can_continue_input
 from studio.core.utils.session_context.component import SessionBuffer
 from voicemem.stream import empty_result
 from tests.helpers.display import display_namespace
@@ -33,6 +35,60 @@ class InputIdentityTests(unittest.IsolatedAsyncioTestCase):
             expected = turns[0] if message['text'].startswith('第一') else turns[1]
             self.assertEqual(message['input_turn_id'], expected.input_turn_id)
         self.assertTrue(partials)
+
+    async def test_capture_timing_counts_quiet_pcm_between_confirmed_turns(self):
+        quiet = capture_fixtures.state('')
+        quiet.state, quiet.spoke = '<silence>', False
+        first_voice = capture_fixtures.state('第一个问题')
+        second_voice = capture_fixtures.state('第二个问题')
+        first_voice.speech_end, second_voice.speech_end = 100, 500
+        _, turns, _ = await capture_fixtures.CaptureFixture().run_frames([
+            (False, '', first_voice),
+            (False, '', capture_fixtures.state('第一个完整问题', final=True)),
+            *[(False, '', quiet)] * 60,
+            (False, '', second_voice),
+            (False, '', capture_fixtures.state('第二个完整问题', final=True)),
+        ])
+        self.assertEqual(len(turns), 2)
+        for actual, expected in zip(turns[0].input_audio_span, (0, .04)):
+            self.assertAlmostEqual(actual, expected)
+        for actual, expected in zip(turns[1].input_audio_span, (2.48, 2.52)):
+            self.assertAlmostEqual(actual, expected)
+        self.assertFalse(can_continue_input(turns[0], turns[1]))
+
+    async def test_short_audio_gap_is_independent_of_asr_and_model_wall_time(self):
+        snapshots = [capture_fixtures.state('首句'), capture_fixtures.state('首句', final=True),
+                     capture_fixtures.state('补充'), capture_fixtures.state('补充', final=True)]
+        for index, snapshot in enumerate(snapshots):
+            snapshot.speech_end = 100 + index * 30
+        _, turns, _ = await capture_fixtures.CaptureFixture().run_frames(
+            [(False, '', snapshot) for snapshot in snapshots])
+        self.assertTrue(can_continue_input(turns[0], turns[1]))
+        self.assertAlmostEqual(turns[1].input_audio_span[0] - turns[0].input_audio_span[1], .04)
+
+    async def test_microphone_restart_breaks_continuation_on_the_same_socket(self):
+        ns = capture_fixtures.anticipate_namespace()
+        snapshots = iter([capture_fixtures.state('首句'), capture_fixtures.state('首句', final=True),
+                          capture_fixtures.state('另一句'), capture_fixtures.state('另一句', final=True)])
+        raw = bytes(960 * 2)
+        start = {'text': json.dumps({'type': 'conversation_start'})}
+        messages = iter([start, {'bytes': raw}, {'bytes': raw},
+                         start, {'bytes': raw}, {'bytes': raw}])
+
+        async def receive():
+            return next(messages, {'type': 'websocket.disconnect'})
+
+        async def feed(_):
+            return next(snapshots)
+
+        stream = types.SimpleNamespace(feed=feed, confirm_s=.2, aclose=AsyncMock())
+        ns['vm'] = types.SimpleNamespace(stream=lambda **kw: stream)
+        sock = types.SimpleNamespace(receive=receive, send_json=AsyncMock())
+        with patch('studio.core.utils.turn_taking.backchannel.emitting', return_value=False):
+            turns = [turn async for turn in ns['anticipate'](sock)]
+        self.assertEqual(len(turns), 2)
+        self.assertEqual([turn.input_audio_epoch for turn in turns], [1, 2])
+        self.assertFalse(can_continue_input(turns[0], turns[1]))
 
     def test_display_ids_do_not_become_output_or_memory_ids(self):
         message = input_transcript_event(pending(replace_input_turn_id="prefix"))
@@ -108,24 +164,27 @@ class InputIdentityTests(unittest.IsolatedAsyncioTestCase):
             await Conversation.publish_user_input(session, value)
         self.assertFalse(value.transcript_managed)
 
-    async def test_continuation_preserves_text_and_only_adds_display_replacement(self):
+    async def test_continuation_revalidates_complete_text_and_replaces_display(self):
         memory = object()
         agent = types.SimpleNamespace(BC_ECHO_WINDOW_S=3, ACTIVE_SPACE='fixture', vm=memory,
-                                      BARGE_DEBUG=False, space_language=lambda _: 'zh')
+                                      BARGE_DEBUG=False, space_language=lambda _: 'zh',
+                                      _ensure_pending_memory=AsyncMock())
         sock = types.SimpleNamespace(send_json=AsyncMock())
         session = Conversation(agent, sock)
-        base = pending('我想问一下', 'prefix')
+        base = pending('我想问一下', 'prefix', input_audio_span=(0, 1))
         await session.publish_user_input(base)
         waiting = asyncio.create_task(asyncio.Event().wait())
         session.unfinished_wait = {'pending':base, 'task':waiting, 'space':'fixture', 'memory_vm':memory}
         session.turn['continuation_task'] = waiting
-        value = pending('模型应该怎么选？', 'continuation', early_ok=True)
+        value = pending('模型应该怎么选？', 'continuation', early_ok=True,
+                        input_audio_span=(1.3, 2))
         result_before = value.result
         merged = await session.merge_continuation(value)
         self.assertEqual(merged.text, '我想问一下模型应该怎么选？')
         self.assertEqual(merged.input_turn_id, 'continuation')
         self.assertEqual(merged.replace_input_turn_id, 'prefix')
-        self.assertIs(merged.result, result_before)
+        self.assertIsNot(merged.result, result_before)
+        agent._ensure_pending_memory.assert_awaited_once_with(merged, memory)
         self.assertFalse(merged.early_ok)
         self.assertFalse(merged.transcript_managed)
         self.assertTrue(waiting.cancelled())

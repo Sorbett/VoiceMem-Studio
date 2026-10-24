@@ -431,6 +431,8 @@ class VoiceStream:
         self._snapshot_jobs = set()
         # Mutable state belongs to this input session and is reset at turn boundaries.
         self._text = ""
+        # Text covering audio before the current streaming-decoder epoch.
+        self._asr_prefix = ""
         self._silence = 0.0
         self._spoke = False
         self._speech_end = 0.0
@@ -506,6 +508,7 @@ class VoiceStream:
             await asyncio.to_thread(worker.t.join, ASR_FINISH_TIMEOUT_S)
         self._asr = self._vad = self._asr_w = None
         self._pcm, self._preroll = [], []
+        self._asr_prefix = ""
 
     @property
     def asr_worker(self) -> "_AsrWorker":
@@ -635,6 +638,24 @@ class VoiceStream:
             self._raw_text = self._text
             self._text = text
 
+    def _streaming_text(self, text):
+        """Join nonoverlapping decoder epochs without deduplicating spoken words."""
+        prefix = self._asr_prefix
+        if not prefix:
+            return text
+        if not text:
+            return prefix
+        no_space = (prefix[-1].isspace() or text[0].isspace()
+                    or "\u3000" <= prefix[-1] <= "\u9fff"
+                    or "\u3000" <= text[0] <= "\u9fff"
+                    or text[0] in ",.!?;:)]}")
+        return prefix + ("" if no_space else " ") + text
+
+    def _restart_asr(self):
+        """Retain the current turn text when discarding a decoder's queued audio."""
+        self._asr_prefix = self._text
+        self.asr_worker.reset()
+
     def _refine(self, pcm) -> None:
         """Synchronous compatibility helper; the audio loop uses _refine_async."""
         self._apply_refined(self._transcribe_final(pcm))
@@ -723,7 +744,7 @@ class VoiceStream:
                         if task is final:
                             text = result
                         else:
-                            stream_text = result
+                            stream_text = self._streaming_text(result)
                 if text or stream_text or not pending:
                     break
                 remaining = deadline - time.monotonic()
@@ -734,19 +755,20 @@ class VoiceStream:
                                    return_when=asyncio.FIRST_COMPLETED)
             if text:
                 if stream_text:
-                    self._text = stream_text
+                    self._text = self._raw_text = stream_text
                     self._apply_refined(text)
                     source = "完整复核（流式已就绪）"
                 else:
                     # Partial streaming text cannot prove full snapshot coverage.
                     self._text = self._raw_text = text
-                    self.asr_worker.reset()
+                    self._restart_asr()
                     source = "完整复核（绕过流式积压）"
             elif stream_text:
-                self._text = stream_text
+                self._text = self._raw_text = stream_text
                 source = "流式收尾"
             else:
-                self.asr_worker.reset()
+                self._raw_text = self._text
+                self._restart_asr()
                 source = "最近可用转写回退"
             if timed_out:
                 print(f"[asr-final] 收尾等待超时（{ASR_FINISH_TIMEOUT_S*1000:.0f}ms），使用最近可用转写",
@@ -797,6 +819,7 @@ class VoiceStream:
         elif self._asr is not None:
             self._asr.reset()
         self._text, self._silence, self._spoke = "", 0.0, False
+        self._asr_prefix = ""
         self._vad_silence = self._voiced_s = 0.0
         self._textless_probed = False
         self._speech_end = 0.0
@@ -844,7 +867,7 @@ class VoiceStream:
             await self.prepare_audio()
         frame = resample(np.frombuffer(pcm_bytes, np.int16).astype(np.float32) / 32768.0,
                          src=self.src_rate)
-        self._text = self.asr_worker.push(frame)  # Queue audio; decoding runs on the ASR worker.
+        self._text = self._streaming_text(self.asr_worker.push(frame))
         speaking = self.vad.is_speech(frame)
         if speaking:
             self._held_final_text = ""
@@ -949,7 +972,7 @@ class VoiceStream:
             refined = await self._final_text_async(pcm)
             if refined and refined.strip():
                 self._text = self._raw_text = refined.strip()
-                self.asr_worker.reset()
+                self._restart_asr()
                 fast_final = True
                 if ASR_DEBUG:
                     print(f"[asr-final] 无流式字短句快速复核 · VAD静音 {self._vad_silence*1000:.0f}ms", flush=True)

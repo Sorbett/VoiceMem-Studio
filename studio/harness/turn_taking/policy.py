@@ -10,6 +10,7 @@ BACKCHANNEL_EXCLUDED = ({"哦", "哦哦"}, {"是吗？"})
 CONTROLS = {
     "pause_ms": 100,
     "unfinished_wait_ms": 1200,
+    "continuation_gap_ms": 1200,
     "unfinished_followup_s": 2.5,
     "backchannel_resume_ms": 300,
     "backchannel_cooldown_ms": 2000,

@@ -154,6 +154,7 @@
       if (!owner) return;
       if (recordings.get(owner.output)?.state === 'recording') deleteRecording(owner.output);
       stopMic(owner);
+      owner.replyEvents = []; owner.replyStarted = false;
       owner.closed = true;
       run = null;
       clearTimeout(owner.timeout);
@@ -181,6 +182,15 @@
       if (value === 'short-thinking') owner.thinking = setTimeout(() => {
         if (active(owner)) onPhase('long-thinking');
       }, 1500);
+    }
+    function flushReply(owner) {
+      if (!owner.replyStarted || owner.paused) return;
+      const output = owner.output, events = owner.replyEvents;
+      owner.replyEvents = [];
+      for (const event of events) {
+        if (!active(owner) || owner.output !== output) return;
+        emit(owner, event);
+      }
     }
     function audio(owner, buffer) {
       if (!owner.output) return;
@@ -226,26 +236,41 @@
         case 'answer_start':
           stopReplay();
           owner.output = message.output_id || '';
+          owner.replyStarted = false;
+          owner.replyEvents = [];
           owner.rate = Number(message.sample_rate) || RATE;
           beginRecording(owner.output, owner.rate);
           owner.paused = false;
           owner.player.port.postMessage({ type: 'start', outputId: owner.output, sampleRate: owner.rate });
           if (owner.clips.size) owner.player.port.postMessage({ type: 'pause' });
           phase(owner, 'short-thinking'); break;
+        case 'answer_delta':
+          if (!owner.output) return;
+          if (!owner.replyStarted || owner.paused) {
+            owner.replyEvents.push(message); return;
+          }
+          break;
         case 'answer_pause':
           owner.paused = true; owner.player.port.postMessage({ type: 'pause' }); phase(owner, 'listening'); break;
         case 'answer_resume':
           owner.paused = false;
           if (!owner.clips.size) owner.player.port.postMessage({ type: 'resume' });
+          flushReply(owner);
           break;
         case 'answer_done':
-          owner.player.port.postMessage({ type: 'drain' }); break;
+          owner.player.port.postMessage({ type: 'drain' });
+          if (!owner.replyStarted || owner.paused) {
+            owner.replyEvents.push(message); return;
+          }
+          break;
         case 'answer_interrupt':
+          owner.replyEvents = []; owner.replyStarted = false; owner.paused = false;
           owner.player.port.postMessage({ type: 'clear', reason: 'interrupted' });
           owner.output = ''; phase(owner, owner.mic ? 'listening' : 'idle'); break;
         case 'backchannel':
           backchannel(owner, message); break;
         case 'error':
+          owner.replyEvents = []; owner.replyStarted = false; owner.paused = false;
           owner.player.port.postMessage({ type: 'clear', reason: 'interrupted' });
           owner.output = ''; phase(owner, owner.mic ? 'listening' : 'idle');
           VMUI.notify(message.message || '服务返回错误，请重试。'); break;
@@ -283,10 +308,17 @@
             state: states[data.type] || data.type, event: data.type,
           });
           if (data.outputId !== owner.output) return;
-          if (data.type === 'started' || data.type === 'resumed') phase(owner, 'speaking');
+          if (data.type === 'started') owner.replyStarted = true;
+          if (data.type === 'started' || data.type === 'resumed') {
+            flushReply(owner);
+            if (owner.replyStarted && !owner.paused) phase(owner, 'speaking');
+          }
           if (data.type === 'drained') {
-            phase(owner, owner.mic ? 'listening' : 'idle');
-            emit(owner, { type: 'playback_done', output_id: owner.output });
+            // A text-only completion has no started checkpoint; keep its events ordered.
+            owner.replyStarted = true;
+            owner.replyEvents.push({ type: 'playback_done', output_id: owner.output });
+            flushReply(owner);
+            if (!owner.paused) phase(owner, owner.mic ? 'listening' : 'idle');
             if (owner.memoryClip) {
               const id = owner.memoryClip; owner.memoryClip = '';
               void playMemory(owner, id);
@@ -324,7 +356,7 @@
     }
     function connect() {
       if (run) return run.ready;
-      const owner = run = { closed: false, clips: new Set(), rate: RATE, output: '' };
+      const owner = run = { closed: false, clips: new Set(), rate: RATE, output: '', replyStarted: false, replyEvents: [] };
       owner.ready = new Promise((resolve, reject) => { owner.resolve = resolve; owner.reject = reject; });
       // A handler is attached immediately so cancellation never leaves an unhandled rejection.
       owner.ready.catch(() => {});
@@ -416,9 +448,10 @@
   function applyUser(messages, event, role) {
     const id = event.input_turn_id;
     const finalized = messages.find(message => message.role === role && message.inputIds?.includes(id));
-    if (finalized && !event.replace_input_turn_id) return finalized;
+    if (finalized) return finalized;
     let item = messages.find(message => message.role === role &&
-      ((id && message.inputId === id) || (event.replace_input_turn_id && message.inputId === event.replace_input_turn_id)));
+      ((id && message.inputId === id) || (event.replace_input_turn_id &&
+        (message.inputId === event.replace_input_turn_id || message.inputIds?.includes(event.replace_input_turn_id)))));
     if (!item) item = messages.find(message => message.role === role && message.pending && message.text === event.text);
     if (!item) { item = {role, time:new Date().toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'})}; messages.push(item); }
     Object.assign(item, {text:event.text, inputId:id, pending:false,

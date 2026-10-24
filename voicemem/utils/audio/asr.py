@@ -230,13 +230,13 @@ class FunASRStreamingASR:
         if model is None:
             local = self._cached_model()
             model = str(local) if local is not None else "paraformer-zh-streaming"
-        from voicemem.engine import device_lock
+        from voicemem.engine import cpu_thread_budget, device_lock
         selected = device or _os.environ.get("VOICEMEM_ASR_DEVICE") or pick_device()
         lock = device_lock(selected)
         self.device = lock.device or selected
         with lock:
             self.model = AutoModel(model=model, device=self.device, disable_update=True,
-                                   log_level="ERROR" if _quiet else "INFO")
+                                   log_level="ERROR" if _quiet else "INFO", ncpu=cpu_thread_budget())
         self.reset()
 
     def _run(self, samples, is_final: bool) -> str:
@@ -291,7 +291,7 @@ class Transcriber:
     """Decode full utterances with SenseVoiceSmall and serialize model access."""
 
     def __init__(self, device: str, model: str | None = None) -> None:
-        from voicemem.engine import device_lock
+        from voicemem.engine import cpu_thread_budget, device_lock
         # CPU recognition shares no accelerator state with streaming ASR.
         self._inference_lock = (threading.RLock() if str(device).split(':')[0] == 'cpu'
                                 else device_lock(device))
@@ -301,7 +301,7 @@ class Transcriber:
         with self._inference_lock:
             self.model = AutoModel(model=_name, hub="hf",
                                    device=getattr(self._inference_lock, "device", None) or device,
-                                   disable_update=True, trust_remote_code=False)
+                                   disable_update=True, trust_remote_code=False, ncpu=cpu_thread_budget())
 
     def _generate(self, audio) -> str:
         from voicemem.engine import inference_call

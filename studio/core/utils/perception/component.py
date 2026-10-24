@@ -9,7 +9,7 @@ from studio.core.utils.memory.background import background_lane
 
 def emotion_inference(cache, audio_path):
     """Reuse emotion2vec on its configured device for warmup and runtime calls."""
-    from voicemem.engine import device_lock, inference_call
+    from voicemem.engine import cpu_thread_budget, device_lock, inference_call
     if "m" not in cache:
         from funasr import AutoModel
         import torch
@@ -18,7 +18,8 @@ def emotion_inference(cache, audio_path):
         with lock:
             if "m" not in cache:
                 cache["m"] = AutoModel(model=str(MODELS / 'emotion2vec'),
-                                       device=lock.device or device, hub="hf", disable_update=True)
+                                       device=lock.device or device, hub="hf", disable_update=True,
+                                       ncpu=cpu_thread_budget())
     config = getattr(cache["m"], "kwargs", {})
     device = config.get("device", "cpu") if isinstance(config, dict) else "cpu"
     lock = device_lock(device) if str(device).startswith("cuda") else None

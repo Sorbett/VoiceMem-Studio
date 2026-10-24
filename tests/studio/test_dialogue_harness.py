@@ -370,11 +370,40 @@ class PauseStreamTests(unittest.IsolatedAsyncioTestCase):
         turns = [s.turn for s in await self.feed(stream, .04) if s.turn]
         self.assertEqual([turn.text for turn in turns], ["你还能更快吗"])
 
-    async def test_high_eot_ends_a_complete_turn_without_confirm_timeout(self):
+    async def test_high_eot_respects_the_studio_confirmation_floor(self):
         stream = self.make_stream(text="今天下雨了", eot_score=.99)
         await self.feed(stream, .2, speaking=True)
+        self.assertFalse(any(state.turn for state in await self.feed(stream, .18)))
         turns = [state.turn for state in await self.feed(stream, .04) if state.turn]
         self.assertEqual([turn.text for turn in turns], ["今天下雨了"])
+
+    async def test_resumed_speech_inside_confirmation_floor_is_not_split(self):
+        stream = self.make_stream(text="我想做账号", final_text="我想做账号主要做美妆")
+        await self.feed(stream, .2, speaking=True)
+        self.assertFalse(any(state.turn for state in await self.feed(stream, .12)))
+        self.text = "我想做账号主要做美妆"
+        await self.feed(stream, .2, speaking=True)
+        turns = [state.turn for state in await self.feed(stream, .22) if state.turn]
+        self.assertEqual([turn.text for turn in turns], [self.text])
+
+    async def test_terminal_hesitation_waits_without_triggering_a_followup_prompt(self):
+        from studio.core.utils.turn_taking.pause import needs_continuation
+        for text in ("主要是想做美妆的呃。", "I want to start a channel, um."):
+            with self.subTest(text=text):
+                stream = self.make_stream(text=text)
+                await self.feed(stream, .2, speaking=True)
+                self.assertFalse(any(state.turn for state in await self.feed(stream, 1.16)))
+                self.assertTrue(any(state.turn for state in await self.feed(stream, .08)))
+                self.assertFalse(needs_continuation(text))
+        for text in ("当前余额", "本月总额", "嗯", "um", "a museum"):
+            self.assertFalse(is_unfinished(text), text)
+
+    async def test_studio_confirmation_floor_is_configurable(self):
+        stream = self.make_stream(text="今天下雨了")
+        self.pause_gate.min_silence_s = .4
+        await self.feed(stream, .2, speaking=True)
+        self.assertFalse(any(state.turn for state in await self.feed(stream, .38)))
+        self.assertTrue(any(state.turn for state in await self.feed(stream, .04)))
 
     async def test_question_preface_and_question_remain_one_turn(self):
         stream = self.make_stream(
@@ -383,7 +412,7 @@ class PauseStreamTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(any(s.turn for s in await self.feed(stream, 1.0)))
         self.text = "我想问一下你还能更快吗"
         await self.feed(stream, .2, speaking=True)
-        turns = [s.turn for s in await self.feed(stream, .04) if s.turn]
+        turns = [s.turn for s in await self.feed(stream, .22) if s.turn]
         self.assertEqual(
             [turn.text for turn in turns], ["我想问一下你还能更快吗"])
 
@@ -413,7 +442,7 @@ class PauseStreamTests(unittest.IsolatedAsyncioTestCase):
         states = await self.feed(stream, .2, speaking=True)
         self.assertFalse(any(s.turn for s in states))
         self.assertEqual(self.pause_gate.hold_until, 0)
-        turns = [s.turn for s in await self.feed(stream, .04) if s.turn]
+        turns = [s.turn for s in await self.feed(stream, .22) if s.turn]
         self.assertEqual([t.text for t in turns], [self.text])
 
     async def test_late_offline_incomplete_text_is_held_without_redecoding(self):

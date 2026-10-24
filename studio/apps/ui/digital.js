@@ -11,6 +11,7 @@ const el = (t,c,x) => { const n=document.createElement(t); if(c)n.className=c; i
 const conversations = [{id:'c1',title:'新对话',space:'',pinned:false,messages:[]}];
 const firstConversation = conversations[0];
 let current = conversations[0], replyMessage = null;
+const messageBodies = new Map();
 let conversationSwitch = 0;
 const state = {get messages(){return current.messages;},busy:false,listening:false,memory:false};
 let toastTimer, typeTimer, markTimer;
@@ -116,12 +117,14 @@ function renderMarks(host, marks, animate){
 /* ── 聊天记录 ── */
 function renderLog(){
   const host = $('logScroll');
+  messageBodies.clear();
   host.replaceChildren();
   if(!state.messages.length){ host.append(el('p','log-empty','还没有记录。说第一句话，它会出现在这里。')); return; }
   state.messages.forEach((m, idx) => {
     const turn = el('article','turn '+(m.role==='me'?'me':'her'));
     turn.style.animationDelay = (idx*0.05)+'s';
     const body=el('div','turn-body',m.text);
+    messageBodies.set(m,body);
     if(m.role==='her') VMMarkdown.render(body,m.text,{streaming:!!m.truncated});
     turn.append(el('div','from', m.role==='me'?'你':'Echo'),body);
     if(m.marks){ const mk = el('div','marks'); renderMarks(mk, m.marks, false); turn.append(mk); }
@@ -166,6 +169,7 @@ function handleStudio(message) {
     if (!VMStudio.acceptsPartial(current.messages, message)) return;
     $('said').textContent = message.text; $('said').classList.add('on');
   } else if (message.type === 'user_transcript' || message.type === 'user_backchannel') {
+    if (!VMStudio.acceptsPartial(current.messages, message)) return;
     if(message.type === 'user_transcript') {memoryList('retrievedMemories',[],'检索中…');void watchStoredMemories();}
     VMStudio.applyUser(current.messages, message, 'me');
     $('said').textContent = message.text; $('said').classList.add('on');
@@ -178,14 +182,23 @@ function handleStudio(message) {
     VMMarkdown.render($('voice'),''); renderLog(); syncSend();
   } else if (message.type === 'answer_delta' && replyMessage) {
     replyMessage.text += message.text || ''; VMMarkdown.render($('voice'),replyMessage.text,{streaming:true});
-    const body = $('logScroll').querySelector('.turn:last-child .turn-body');
+    const body = messageBodies.get(replyMessage);
     if (body) VMMarkdown.render(body,replyMessage.text,{streaming:true,onRender:()=>{$('logScroll').scrollTop=$('logScroll').scrollHeight;}});
     else renderLog();
   } else if (message.type === 'answer_done' && replyMessage) {
     VMMarkdown.render($('voice'),replyMessage.text);
-    VMMarkdown.render($('logScroll').querySelector('.turn:last-child .turn-body'),replyMessage.text);
+    const body = messageBodies.get(replyMessage);
+    if (body) VMMarkdown.render(body,replyMessage.text);
+    else renderLog();
   } else if (message.type === 'answer_interrupt') {
-    if (replyMessage) {replyMessage.text = message.heard_text || '';replyMessage.truncated=true;VMMarkdown.render($('voice'),replyMessage.text,{streaming:true});}
+    if (replyMessage) {
+      replyMessage.text = message.heard_text || ''; replyMessage.truncated = true;
+      if (!replyMessage.text) {
+        const index = current.messages.indexOf(replyMessage);
+        if (index >= 0) current.messages.splice(index, 1);
+      }
+      VMMarkdown.render($('voice'),replyMessage.text,{streaming:true});
+    }
     replyMessage = null; current.busy = state.busy = false; renderLog(); syncSend();
   } else if (['playback_done','disconnected','error'].includes(message.type)) {
     if (message.type !== 'playback_done' && replyMessage) {

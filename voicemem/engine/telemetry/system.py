@@ -6,7 +6,9 @@ import threading
 import time
 
 from ..scheduling.admission import resources
+from ..scheduling.capacity import background_capacity
 from .metrics import model_metrics
+from .thermal import thermal_state
 
 
 def paging_rates(previous, current, elapsed):
@@ -85,17 +87,20 @@ class EngineObserver:
                 if now > cpu_at:
                     rates["process_cpu_cores"] = max(0, current_cpu-cpu_time) / (now-cpu_at)
                 cpu_at, cpu_time = now, current_cpu
+                gauges["thermal_state"] = thermal_state()
                 with self._lock:
                     self._latest = dict(sampled_at=now, **rates, **gauges)
                 if now-reported >= 5:
                     rows = model_metrics(reset=True)
-                    if rows:
-                        from ..backends.mlx.scheduler import gpu_loop
-                        from ..backends.torch import torch_snapshot
-                        print("[engine-system] " + " ".join(f"{k}={v:.2f}" for k, v in rates.items())
-                              + " " + " ".join(f"{k}={v:.2f}" for k, v in gauges.items())
-                              + f" admission={resources.snapshot()} mlx={gpu_loop().snapshot()}"
-                              + f" torch={torch_snapshot()}", flush=True)
+                    from ..backends.mlx.scheduler import gpu_loop
+                    from ..backends.torch import torch_snapshot
+                    print("[engine-system] " + " ".join(f"{k}={v:.2f}" for k, v in rates.items())
+                          + " " + " ".join(f"{k}={v:.2f}" for k, v in gauges.items()
+                                          if isinstance(v, (int, float)))
+                          + f" thermal_state={gauges['thermal_state']}"
+                          + f" admission={resources.snapshot()} capacity={background_capacity.snapshot()}"
+                          + f" mlx={gpu_loop().snapshot()}"
+                          + f" torch={torch_snapshot()}", flush=True)
                     for row in rows:
                         count = row["calls"]
                         print(f'[engine-model] model={row["model"]} backend={row["backend"]}'
@@ -106,6 +111,7 @@ class EngineObserver:
                               f' lock_ms={row["lock_ms"]:.2f}'
                               f' admission_ms={row["admission_ms"]:.2f}'
                               f' queue_ms={row["queue_ms"]:.2f}'
+                              f' capacity_ms={row.get("capacity_ms", 0):.2f}'
                               f' forced={row["forced"]} errors={row["errors"]}', flush=True)
                     reported = now
                 self._stop.wait(1)

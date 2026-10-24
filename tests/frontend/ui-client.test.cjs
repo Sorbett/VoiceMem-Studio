@@ -164,6 +164,117 @@ test('interrupt clears queued audio and preserves the server heard prefix', asyn
   assert.equal(f.nodes[0].messages.at(-1).reason, 'interrupted');
   assert.equal(f.events.at(-1).heard_text, 'heard'); f.client.cancel();
 });
+test('reply text and completion wait for main playback, including short replies', async () => {
+  const f = fixture(); await f.connected(); const socket = f.sockets[0], player = f.nodes[0];
+  socket.receive({type:'answer_start',output_id:'one'});
+  socket.receive({type:'answer_delta',output_id:'one',text:'first'});
+  player.port.onmessage({data:{type:'resumed',outputId:'one'}});
+  socket.receive(new Int16Array([100,200]).buffer);
+  socket.receive({type:'answer_delta',output_id:'one',text:'second'});
+  socket.receive({type:'answer_done',output_id:'one'});
+  const replies = () => f.events.filter(e => ['answer_delta','answer_done'].includes(e.type));
+  assert.equal(replies().length,0);
+  assert.equal(player.messages.at(-1).type,'drain');
+  player.port.onmessage({data:{type:'started',outputId:'one'}});
+  assert.deepEqual(replies().map(e => e.text || e.type),['first','second','answer_done']);
+  player.port.onmessage({data:{type:'drained',outputId:'one',renderedSamples:2}});
+  assert.equal(f.events.at(-1).type,'playback_done'); f.client.cancel();
+});
+test('candidate pauses hold text and completion while PCM continues buffering', async () => {
+  const f = fixture(); await f.connected(); const socket = f.sockets[0], player = f.nodes[0];
+  socket.receive({type:'answer_start',output_id:'one'});
+  player.port.onmessage({data:{type:'started',outputId:'one'}});
+  socket.receive({type:'answer_delta',output_id:'one',text:'visible'});
+  socket.receive({type:'answer_pause',output_id:'one'});
+  socket.receive({type:'answer_delta',output_id:'one',text:'held'});
+  socket.receive(new Int16Array([100,200]).buffer);
+  assert.equal(player.messages.at(-1).type,'audio');
+  socket.receive({type:'answer_done',output_id:'one'});
+  assert.deepEqual(f.events.filter(e => e.type==='answer_delta').map(e => e.text),['visible']);
+  assert.equal(f.events.some(e => e.type==='answer_done'),false);
+  socket.receive({type:'answer_resume',output_id:'one'});
+  assert.deepEqual(f.events.filter(e => ['answer_delta','answer_done'].includes(e.type)).map(e => e.text || e.type),['visible','held','answer_done']);
+  f.client.cancel();
+});
+test('resume before the first audio never releases text and a racing start respects pause', async () => {
+  const f = fixture(); await f.connected(); const socket = f.sockets[0], player = f.nodes[0];
+  socket.receive({type:'answer_start',output_id:'one'});
+  socket.receive({type:'answer_delta',output_id:'one',text:'held'});
+  socket.receive({type:'answer_pause',output_id:'one'});
+  socket.receive({type:'answer_resume',output_id:'one'});
+  assert.equal(f.events.some(e => e.type==='answer_delta'),false);
+  socket.receive({type:'answer_pause',output_id:'one'});
+  player.port.onmessage({data:{type:'started',outputId:'one'}});
+  assert.equal(f.events.some(e => e.type==='answer_delta'),false);
+  socket.receive({type:'answer_resume',output_id:'one'});
+  assert.deepEqual(f.events.filter(e => e.type==='answer_delta').map(e => e.text),['held']);
+  f.client.cancel();
+});
+test('interruption and replacement discard private text and ignore late events', async () => {
+  const f = fixture(); await f.connected(); const socket = f.sockets[0], player = f.nodes[0];
+  socket.receive({type:'answer_start',output_id:'one'});
+  socket.receive({type:'answer_delta',output_id:'one',text:'discarded'});
+  socket.receive({type:'answer_done',output_id:'one'});
+  socket.receive({type:'answer_interrupt',output_id:'one',heard_text:''});
+  player.port.onmessage({data:{type:'started',outputId:'one'}});
+  socket.receive({type:'answer_delta',output_id:'one',text:'late'});
+  socket.receive({type:'answer_start',output_id:'two'});
+  socket.receive({type:'answer_delta',output_id:'two',text:'replaced'});
+  socket.receive({type:'answer_start',output_id:'three'});
+  socket.receive({type:'answer_delta',output_id:'three',text:'current'});
+  socket.receive({type:'answer_pause',output_id:'two'});
+  player.port.onmessage({data:{type:'started',outputId:'two'}});
+  player.port.onmessage({data:{type:'started',outputId:'three'}});
+  assert.deepEqual(f.events.filter(e => e.type==='answer_delta').map(e => e.text),['current']);
+  socket.receive({type:'answer_pause',output_id:'three'});
+  socket.receive({type:'answer_delta',output_id:'three',text:'also discarded'});
+  socket.receive({type:'answer_resume',output_id:'two'});
+  socket.receive({type:'error',output_id:'three',message:'synthetic failure'});
+  player.port.onmessage({data:{type:'resumed',outputId:'three'}});
+  assert.deepEqual(f.events.filter(e => e.type==='answer_delta').map(e => e.text),['current']);
+  f.client.cancel();
+});
+test('a successful text-only drain keeps completion ordered, including during pause', async () => {
+  for (const paused of [false,true]) {
+    const f = fixture(); await f.connected(); const socket = f.sockets[0], player = f.nodes[0];
+    socket.receive({type:'answer_start',output_id:'one'});
+    if (paused) socket.receive({type:'answer_pause',output_id:'one'});
+    socket.receive({type:'answer_delta',output_id:'one',text:'text only'});
+    socket.receive({type:'answer_done',output_id:'one'});
+    player.port.onmessage({data:{type:'drained',outputId:'one',renderedSamples:0}});
+    if (paused) {
+      assert.equal(f.events.some(e => ['answer_delta','answer_done','playback_done'].includes(e.type)),false);
+      socket.receive({type:'answer_resume',output_id:'one'});
+    }
+    assert.deepEqual(f.events.filter(e => ['answer_delta','answer_done','playback_done'].includes(e.type)).map(e => e.text || e.type),['text only','answer_done','playback_done']);
+    f.client.cancel();
+  }
+});
+test('backchannel completion cannot release reply text before main playback', async () => {
+  const f = fixture(); await f.connected(); const socket = f.sockets[0], player = f.nodes[0];
+  socket.receive({type:'backchannel',pcm:Buffer.from([0,0,0,0]).toString('base64'),filler_id:'filler'});
+  socket.receive({type:'answer_start',output_id:'one'});
+  socket.receive({type:'answer_delta',output_id:'one',text:'main reply'});
+  f.sources[0].onended();
+  player.port.onmessage({data:{type:'resumed',outputId:'one'}});
+  assert.equal(f.events.some(e => e.type==='answer_delta'),false);
+  player.port.onmessage({data:{type:'started',outputId:'one'}});
+  assert.deepEqual(f.events.filter(e => e.type==='answer_delta').map(e => e.text),['main reply']);
+  f.client.cancel();
+});
+test('disconnect drops held reply text before reconnecting', async () => {
+  const f = fixture(); await f.connected();
+  f.sockets[0].receive({type:'answer_start',output_id:'one'});
+  f.sockets[0].receive({type:'answer_delta',output_id:'one',text:'discarded'});
+  f.client.cancel();
+  const pending=f.client.send('new'); await tick(); f.sockets[1].receive({type:'session_ready'}); await pending;
+  f.sockets[0].receive({type:'answer_resume',output_id:'one'});
+  f.sockets[1].receive({type:'answer_start',output_id:'two'});
+  f.sockets[1].receive({type:'answer_delta',output_id:'two',text:'new reply'});
+  f.nodes.at(-1).port.onmessage({data:{type:'started',outputId:'two'}});
+  assert.deepEqual(f.events.filter(e => e.type==='answer_delta').map(e => e.text),['new reply']);
+  f.client.cancel();
+});
 test('reply replay uses the original PCM without sending new playback checkpoints', async () => {
   const f = fixture(); await f.connected(); const socket = f.sockets[0], player = f.nodes[0];
   socket.receive({type:'answer_start',output_id:'one',sample_rate:24000});
@@ -211,6 +322,18 @@ test('finalized transcripts reject stale partials and pre-merge final events', (
   f.api.applyUser(messages,{text:'merged',input_turn_id:'two',replace_input_turn_id:'one'},'user');
   f.api.applyUser(messages,{text:'stale',input_turn_id:'one'},'user');
   assert.equal(messages.length, 1); assert.equal(messages[0].text, 'merged');
+});
+test('repeated continuations retain aliases and reject stale replacement events', () => {
+  const f = fixture(), messages = [];
+  f.api.applyUser(messages,{text:'first',input_turn_id:'one'},'user');
+  f.api.applyUser(messages,{text:'first second',input_turn_id:'two',replace_input_turn_id:'one'},'user');
+  f.api.applyUser(messages,{text:'first second third',input_turn_id:'three',replace_input_turn_id:'one'},'user');
+  f.api.applyUser(messages,{text:'stale second',input_turn_id:'two',replace_input_turn_id:'one'},'user');
+  assert.equal(messages.length, 1);
+  assert.equal(messages[0].text, 'first second third');
+  for (const id of ['one','two','three']) assert.equal(f.api.acceptsPartial(messages,{input_turn_id:id}),false);
+  f.api.applyUser(messages,{text:'a new question',input_turn_id:'four'},'user');
+  assert.equal(messages.length, 2);
 });
 test('the new home page passes the unchanged desktop readiness probe', async () => {
   const html = fs.readFileSync(require('node:path').join(__dirname, '../../studio/apps/ui/index.html'), 'utf8');

@@ -19,12 +19,13 @@ sys.path.insert(0, str(ROOT))
 from tests.helpers.studio import studio_tree, studio_source, execute
 from voicemem.lang import detect_language
 from tests.helpers.gpu import cpu_gpu_loop
+from studio.core.utils.conversation.input_turn import InputContinuation
 
 
 def session_namespace():
     tree = studio_tree()
     names = {"prewarm_local", "stop_prewarm", "hearing", "close_session",
-             "start_early", "drop_early"}
+             "start_early", "drop_early", "flush_continuation"}
     functions = [n for n in tree.body if getattr(n, "name", "") in names]
     async def route_pending(pending, memory_vm=None, history=None):
         return pending
@@ -43,6 +44,7 @@ def session_namespace():
         build_memory_context=lambda _: "memory",
         build_reply_context=lambda *a, **kw: "context", _replay_id=lambda *a: "",
         BARGE_DEBUG=False, owner={}, speech_rate=None, vm=object(),
+        input_continuation=InputContinuation(),
         Pending=lambda *a, **kw: types.SimpleNamespace(),
         ReplySink=lambda *a: types.SimpleNamespace(send=None, send_audio=None),
         AudioTimeline=lambda **kw: types.SimpleNamespace(),

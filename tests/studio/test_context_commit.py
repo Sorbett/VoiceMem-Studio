@@ -11,6 +11,7 @@ from unittest.mock import AsyncMock, Mock, patch
 from tests.helpers.conversation import ConversationFixture
 from studio.core.utils.audio_timeline.component import AudioTimeline
 from studio.core.utils.conversation.component import Conversation
+from studio.core.utils.conversation.input_turn import InputContinuation
 from studio.core.utils.contracts.component import Pending
 from studio.core.utils.session_context.component import SessionBuffer
 from studio.core.voicemem import greeting_memories
@@ -706,7 +707,7 @@ class ContextCommitTests(ConversationFixture, unittest.IsolatedAsyncioTestCase):
 class RealtimePlaybackAuthorityTests(unittest.IsolatedAsyncioTestCase):
     def fixture(self, interrupted=False):
         source = Path(__file__).resolve().parents[2] / 'studio/core/utils/realtime_session/component.py'
-        names = {'pump', 'close_turn', 'playback_checkpoint', 'playback_fallback'}
+        names = {'pump', 'save_input', 'close_turn', 'playback_checkpoint', 'playback_fallback'}
         nodes = [n for n in ast.walk(ast.parse(source.read_text()))
                  if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name in names]
         timeline = AudioTimeline(track_delivery=True)
@@ -726,6 +727,7 @@ class RealtimePlaybackAuthorityTests(unittest.IsolatedAsyncioTestCase):
         sock = types.SimpleNamespace(send_json=AsyncMock(), send_bytes=AsyncMock())
         ns = dict(asyncio=asyncio, time=time, base64=base64, self=agent, sock=sock, owner={},
                   turn=turn, timelines={timeline.output_id:timeline}, context_session='fixture-session',
+                  input_continuation=InputContinuation(),
                   response_idle=asyncio.Event(), conn=events(), schedule_playback_fallback=Mock())
         exec(compile(ast.Module(body=nodes, type_ignores=[]), str(source), 'exec'), ns)
         return ns, agent, timeline

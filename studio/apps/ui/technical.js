@@ -20,6 +20,7 @@ const MEMORIES = {facts: [], traits: []};
 const CONVERSATIONS = [{id:'c1',title:'New conversation',space:'',messages:[]}];
 const firstConversation = CONVERSATIONS[0];
 let activeConv = 'c1', activeDomain = null, replyMessage = null;
+const messageBodies = new Map();
 let conversationSwitch = 0;
 let voiceActive = false;
 let perception = {};
@@ -79,7 +80,9 @@ function messageNode(m) {
       <div class="msg-body">${esc(m.text)}</div>
       ${grounded}${foot}
     </div>`;
-  if(m.role==='ai') VMMarkdown.render(wrap.querySelector('.msg-body'),m.text,{streaming:!!m.truncated});
+  const body = wrap.querySelector('.msg-body');
+  messageBodies.set(m, body);
+  if(m.role==='ai') VMMarkdown.render(body,m.text,{streaming:!!m.truncated});
   const buttons=wrap.querySelectorAll('.msg-foot button');
   if(buttons[0]) {buttons[0].setAttribute('aria-label','复制回复');buttons[0].onclick=()=>VMUI.copy(m.text);}
   if(buttons[1]) {
@@ -102,6 +105,7 @@ function messageNode(m) {
 function renderThread() {
   const conv = CONVERSATIONS.find(c => c.id === activeConv);
   const t = $('thread');
+  messageBodies.clear();
   t.innerHTML = '';
   const card = document.createElement('div');
   card.className = 'thread-card';
@@ -213,6 +217,7 @@ function handleStudio(message) {
     if (!VMStudio.acceptsPartial(conv.messages, message)) return;
     $('liveEcho').textContent = message.text; $('liveEcho').classList.remove('empty');
   } else if (message.type === 'user_transcript' || message.type === 'user_backchannel') {
+    if (!VMStudio.acceptsPartial(conv.messages, message)) return;
     VMStudio.applyUser(conv.messages, message, 'user');
     $('liveEcho').textContent = message.text; $('liveEcho').classList.remove('empty');
     if (conv.title.startsWith('New conversation')) conv.title = message.text.slice(0, 34);
@@ -225,14 +230,23 @@ function handleStudio(message) {
   } else if (message.type === 'answer_delta' && replyMessage) {
     replyMessage.text += message.text || ''; VMMarkdown.render($('aiEcho'),replyMessage.text,{streaming:true});
     $('aiEcho').classList.remove('empty');
-    const body = $('thread').querySelector('.thread-card .msg:last-child .msg-body');
+    const body = messageBodies.get(replyMessage);
     if (body) VMMarkdown.render(body,replyMessage.text,{streaming:true,onRender:()=>{$('thread').scrollTop=$('thread').scrollHeight;}});
     else renderThread();
   } else if (message.type === 'answer_done' && replyMessage) {
     VMMarkdown.render($('aiEcho'),replyMessage.text);
-    VMMarkdown.render($('thread').querySelector('.thread-card .msg:last-child .msg-body'),replyMessage.text);
+    const body = messageBodies.get(replyMessage);
+    if (body) VMMarkdown.render(body,replyMessage.text);
+    else renderThread();
   } else if (message.type === 'answer_interrupt') {
-    if (replyMessage) { replyMessage.text = message.heard_text || '';replyMessage.truncated=true;VMMarkdown.render($('aiEcho'),replyMessage.text,{streaming:true}); }
+    if (replyMessage) {
+      replyMessage.text = message.heard_text || ''; replyMessage.truncated = true;
+      if (!replyMessage.text) {
+        const index = conv.messages.indexOf(replyMessage);
+        if (index >= 0) conv.messages.splice(index, 1);
+      }
+      VMMarkdown.render($('aiEcho'),replyMessage.text,{streaming:true});
+    }
     replyMessage = null; conv.busy = false; renderThread();
   } else if (['playback_done','disconnected','error'].includes(message.type)) {
     if (message.type !== 'playback_done' && replyMessage) {

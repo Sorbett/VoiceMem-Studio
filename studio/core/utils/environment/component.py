@@ -37,3 +37,8 @@ def prepare(args):
     })
     from voicemem.lang import set_memory_language
     set_memory_language(args.lang)
+    from voicemem.engine import configure_background_capacity, cpu_thread_budget
+    os.environ.setdefault('VOICEMEM_ENGINE_CPU_THREADS', '2' if args.backend == 'mlx' else '4')
+    threads = cpu_thread_budget()
+    enabled = configure_background_capacity(default=True)
+    print(f'[engine-policy] background_capacity={enabled} cpu_threads={threads}', flush=True)

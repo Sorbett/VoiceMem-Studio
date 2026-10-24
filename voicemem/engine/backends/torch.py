@@ -225,6 +225,13 @@ def torch_snapshot():
             "devices": {key: lock.snapshot() for key, lock in devices.items()}}
 
 
+def owns_device_lock():
+    """Detect caller ownership before any cross-backend admission wait."""
+    with _devices_lock:
+        locks = tuple(_devices.values())
+    return TORCH_LOCK._is_owned() or any(lock._is_owned() for lock in locks)
+
+
 def cuda_initialization():
     """Exclude registered CUDA work while loading and capturing streaming graphs.
 

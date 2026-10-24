@@ -1,6 +1,24 @@
 """CPU inference budgets supplied to optional provider runtimes."""
 from __future__ import annotations
 
+import os
+
+
+def cpu_thread_budget():
+    """Return the shared FunASR intra-op budget without importing a runtime.
+
+    Studio configures the process before models are created. The standalone
+    SDK retains FunASR's four-thread default. Invalid values raise ValueError.
+    """
+    value = os.environ.get("VOICEMEM_ENGINE_CPU_THREADS", "4")
+    try:
+        threads = int(value)
+    except ValueError:
+        raise ValueError("VOICEMEM_ENGINE_CPU_THREADS must be a positive integer") from None
+    if threads < 1:
+        raise ValueError("VOICEMEM_ENGINE_CPU_THREADS must be a positive integer")
+    return threads
+
 
 def cpu_session_options(runtime, *, threads=2):
     """Build bounded ONNX CPU execution without idle worker spinning.

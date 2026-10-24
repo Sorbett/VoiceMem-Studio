@@ -411,7 +411,8 @@ class Reply:
                     return
                 reply += delta
                 timeline.append_source_text(delta)
-                await send({"type": "answer_delta", "text": delta})
+                await send({"type": "answer_delta", "text": delta,
+                            "output_id": timeline.output_id})
                 emit_speech(delta)
 
             async def consume_tone(delta, *, final=False):

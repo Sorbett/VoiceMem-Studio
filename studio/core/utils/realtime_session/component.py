@@ -5,6 +5,7 @@ import time
 import uuid
 from studio.web import transport as utils
 from studio.core.utils.audio_timeline.component import AudioTimeline, SpeechRateEstimator
+from studio.core.utils.conversation.input_turn import InputContinuation, refresh_continuation
 from voicemem import gate
 
 class RealtimeSession:
@@ -131,6 +132,7 @@ class RealtimeSession:
                 playback_tasks: set[asyncio.Task] = set()
                 candidate_paused = False
                 candidate_paused_at = 0.0
+                input_continuation = InputContinuation()
 
                 response_idle = asyncio.Event()
                 response_idle.set()
@@ -148,7 +150,9 @@ class RealtimeSession:
                     if hearing() and not candidate_paused:
                         candidate_paused = True
                         candidate_paused_at = time.monotonic()
-                        await sock.send_json({"type": "answer_pause"})
+                        timeline = turn["timeline"]
+                        await sock.send_json({"type": "answer_pause",
+                                              "output_id": timeline.output_id if timeline else ""})
 
                 async def resume_candidate():
                     nonlocal candidate_paused, candidate_paused_at
@@ -157,7 +161,28 @@ class RealtimeSession:
                         if turn["until"]:
                             turn["until"] += max(0.0, time.monotonic() - candidate_paused_at)
                         candidate_paused_at = 0.0
-                        await sock.send_json({"type": "answer_resume"})
+                        timeline = turn["timeline"]
+                        await sock.send_json({"type": "answer_resume",
+                                              "output_id": timeline.output_id if timeline else ""})
+
+                def save_input(p, timeline, space, memory_vm, captured_owner):
+                    if timeline and timeline.context_saved:
+                        return
+                    reply = timeline.heard_text() if timeline else ''
+                    if timeline:
+                        timeline.context_saved = True
+                    history_turn_id = self._push_history(
+                        context_session, space, p.text, reply,
+                        interrupted=bool(timeline and timeline.interrupted))
+                    self.queue_remember_turn(
+                        p, reply, captured_owner, history_turn_id, memory_vm=memory_vm)
+
+                def flush_continuation():
+                    held = input_continuation.take()
+                    if held:
+                        held.timeline.mark_interrupted()
+                        save_input(held.pending, held.timeline, held.space,
+                                   held.memory_vm, held.owner)
 
                 def close_turn(interrupted=False):
                     p, reply = turn["pending"], turn["reply"]
@@ -179,11 +204,8 @@ class RealtimeSession:
                         if self.BARGE_DEBUG and timeline:
                             print(f"[context] 打断于 {timeline.rendered_ms()}ms，保留回复 "
                                   f"{reply!r}", flush=True)
-                    history_turn_id = self._push_history(
-                        context_session, space, p.text, reply,
-                        interrupted=interrupted)
-                    self.queue_remember_turn(
-                        p, reply, owner, history_turn_id, memory_vm=memory_vm)
+                    if not input_continuation.owns(timeline):
+                        save_input(p, timeline, space, memory_vm, owner)
                     if timeline:
                         timelines.pop(timeline.output_id, None)
 
@@ -195,6 +217,8 @@ class RealtimeSession:
                         data.get("rendered_samples", 0),
                         data.get("sample_rate", self.MIC_RATE),
                         data.get("state", "playing"))
+                    if turn["timeline"] is timeline and data.get('event') == 'started':
+                        turn['play_started'] = True
                     if turn["timeline"] is timeline and timeline.playback_done:
                         turn["until"] = 0.0
                         if turn["response_done"]:
@@ -249,7 +273,8 @@ class RealtimeSession:
                                         timeline.add_timestamps(tuple(timestamps))
                                 turn["provider_item_id"] = (
                                     getattr(ev, "item_id", "") or turn["provider_item_id"])
-                                await sock.send_json({"type": "answer_delta", "text": ev.delta})
+                                await sock.send_json({"type": "answer_delta", "text": ev.delta,
+                                                      "output_id": timeline.output_id if timeline else ""})
                         elif t == "error" or t.endswith(".error"):
                             err = getattr(ev, "error", None)
                             code = getattr(err, "code", "")
@@ -326,11 +351,6 @@ class RealtimeSession:
                             print("[barge] 有人声但助手没在说，忽略", flush=True)
                         return
 
-                    since = (time.monotonic() - turn["t0"]) * 1000
-                    if since < self.BARGE_GRACE_MS:
-                        if self.BARGE_DEBUG:
-                            print(f"[barge] 才说了 {since:.0f}ms，还在宽限期内，不打断", flush=True)
-                        return
                     if self.BARGE_DEBUG:
                         left = max(0.0, turn["until"] - time.monotonic()) * 1000
                         print(f"[barge] ★ 打断：转写触发（前端还剩 {left:.0f}ms 没播完）",
@@ -339,6 +359,12 @@ class RealtimeSession:
                     timeline = turn["timeline"]
                     output_id = timeline.output_id if timeline else ""
                     provider_item_id = turn["provider_item_id"]
+                    held = input_continuation.defer(
+                        turn.get('pending'), timeline, turn.get('memory_vm'),
+                        turn.get('space'), turn.get('context_owner', owner),
+                        started=turn.get('play_started', False))
+                    if held and self.BARGE_DEBUG:
+                        print('[turn] holding confirmed input: main output not started', flush=True)
                     if timeline:
                         timeline.mark_interrupted()
                     heard_text = timeline.heard_text() if timeline else ""
@@ -388,6 +414,25 @@ class RealtimeSession:
                             await response_idle.wait()
                         context_space = self.ACTIVE_SPACE
                         memory_vm = self.vm
+                        if input_continuation.held is not None:
+                            held = input_continuation.held
+                            base_pending = held.pending
+                            incoming = pending
+                            pending = input_continuation.merge(
+                                pending, memory_vm, context_space, owner,
+                                explicit=self._is_explicit_interrupt(pending.text))
+                            if pending is incoming:
+                                flush_continuation()
+                            else:
+                                if self.BARGE_DEBUG:
+                                    print(f'[turn] continuation merged chars={len(pending.text)}', flush=True)
+                                await refresh_continuation(self, pending, memory_vm)
+                                if not input_continuation.in_scope(
+                                        self.vm, self.ACTIVE_SPACE, owner):
+                                    held.pending = base_pending
+                                    flush_continuation()
+                                    pending = incoming
+                                    context_space, memory_vm = self.ACTIVE_SPACE, self.vm
                         timeline = AudioTimeline(
                             prebuffer_seconds=0.08, rate_estimator=speech_rate, track_delivery=True)
                         timelines[timeline.output_id] = timeline
@@ -396,7 +441,9 @@ class RealtimeSession:
                             t0=time.monotonic(), until=0.0, first=False,
                             timeline=timeline, response_done=False,
                             provider_item_id="", space=context_space,
-                            memory_vm=memory_vm)
+                            memory_vm=memory_vm, play_started=False,
+                            context_owner=dict(owner))
+                        input_continuation.adopt(pending)
                         response_idle.clear()
                         try:
                             for task in acoustic_tasks:
@@ -426,6 +473,7 @@ class RealtimeSession:
                             fully_played = bool(
                                 turn["response_done"] and timeline and timeline.playback_done)
                             close_turn(interrupted=not fully_played)
+                        flush_continuation()
                         for task in playback_tasks:
                             task.cancel()
                         if playback_tasks:

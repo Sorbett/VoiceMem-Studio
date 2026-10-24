@@ -5,11 +5,15 @@ ABBA uses the same resident weights, synthetic input and decoding settings in
 one process. PCM is discarded; no microphone, API, Memory Space or browser is
 used. This measures production under contention, not perceived playback latency.
 Host temperature, paging by other applications and phase order still matter.
+Capacity crossover retains speech admission in both arms: A is the baseline;
+B adds process-wide background capacity. Use multiple background workers to
+exercise overlap. This probe does not traverse Studio reply playback pacing.
 """
 from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import json
 from importlib.metadata import version
 import os
@@ -39,7 +43,7 @@ async def main(args):
     os.environ["VOICEMEM_MODELS_DIR"] = str(MODELS)
     from studio.core.utils.startup.audio import warmup_audio
     from studio.core.utils.tts.component import BreezeMLXTTS
-    from voicemem.engine import (SpeechFeedback, background_scope, model_metrics,
+    from voicemem.engine import (SpeechFeedback, background_capacity, background_scope, cpu_thread_budget, model_metrics,
                                 observer, resources, speech_scope)
     from voicemem.stream import _EOT_EXECUTOR
     from voicemem.utils.audio.eot import EndOfTurn
@@ -84,6 +88,9 @@ async def main(args):
                                                 "mlx", "mlx-lm", "mlx-audio", "torch", "onnxruntime", "funasr")},
                                             order=args.order, utterances=args.utterances,
                                             background_jobs=args.background_jobs,
+                                            background_workers=args.background_workers,
+                                            capacity_crossover=args.capacity_crossover,
+                                            cpu_threads=cpu_thread_budget(),
                                             studio_voice=args.studio_voice,
                                             threads_a=args.threads_a, threads_b=args.threads_b,
                                             depth_a=args.depth_a, depth_b=args.depth_b,
@@ -132,8 +139,11 @@ async def main(args):
             return time.perf_counter()-begin
 
         workers = []
+        initial_capacity = background_capacity.snapshot()["enabled"]
         try:
             for phase, policy in enumerate(args.order):
+                if args.capacity_crossover:
+                    background_capacity.configure(policy == "B")
                 depth = args.depth_a if policy == "A" else args.depth_b
                 if depth is not None:
                     def configure_depth():
@@ -151,10 +161,11 @@ async def main(args):
                             model._base_kwargs_map["kwargs"]["ncpu"] = threads
                         torch.set_num_threads(threads)
                     await asyncio.to_thread(configure_threads)
+                phase_cpu_at = time.process_time()
                 stop, done = threading.Event(), asyncio.Event()
                 workers = [asyncio.create_task(asyncio.to_thread(listen)),
                            asyncio.create_task(heartbeat()), asyncio.create_task(scores())]
-                resources.enabled = (args.fixed_policy or policy) == "B"
+                resources.enabled = args.capacity_crossover or (args.fixed_policy or policy) == "B"
                 model_metrics(reset=True)
                 first, gaps, utterances = [], [], []
                 asr_start, lag_start = len(asr_times), len(loop_lags)
@@ -167,31 +178,36 @@ async def main(args):
                         durations.append(await asyncio.to_thread(background))
                     return durations
 
-                job = asyncio.create_task(background_job())
+                jobs = [asyncio.create_task(background_job()) for _ in range(args.background_workers)]
                 try:
                     with speech_scope(SpeechFeedback(), producing=False):
                         for _ in range(args.utterances):
                             begin, arrivals, audio = time.perf_counter(), [], 0
+                            digest = hashlib.sha256()
                             async for chunk in tts.stream("这是一条语音延迟测试，用来检查连续播放是否平稳。"):
+                                digest.update(chunk)
                                 arrivals.append(time.perf_counter()-begin)
                                 audio += len(chunk)/48000
                             first.append(arrivals[0])
                             local_gaps = [b-a for a, b in zip(arrivals, arrivals[1:])]
                             gaps.extend(local_gaps)
                             utterances.append(dict(rtf=round((time.perf_counter()-begin)/audio, 3),
-                                                   audio_s=round(audio, 3), gaps=summary(local_gaps)))
+                                                   audio_s=round(audio, 3), pcm_sha256=digest.hexdigest(),
+                                                   gaps=summary(local_gaps)))
                     asr_result, loop_result = summary(asr_times[asr_start:]), summary(loop_lags[lag_start:])
-                    background_s = await job
+                    background_s = [duration for result in await asyncio.gather(*jobs) for duration in result]
                     print("PHASE", json.dumps(dict(phase=phase, policy=policy, first=summary(first),
                                                   threads=threads, admission_enabled=resources.enabled,
+                                                  capacity=background_capacity.snapshot(),
                                                   depth=depth,
                                                   gaps=summary(gaps), utterances=utterances,
                                                   asr=asr_result, event_loop=loop_result,
                                                   background_completed=len(background_s),
                                                   background_s=[round(s, 3) for s in background_s],
+                                                  process_cpu_s=round(time.process_time()-phase_cpu_at, 3),
                                                   admission=resources.snapshot(), paging=observer.snapshot())), flush=True)
                 finally:
-                    await asyncio.gather(job, return_exceptions=True)
+                    await asyncio.gather(*jobs, return_exceptions=True)
                     stop.set(); done.set()
                     await asyncio.gather(*workers, return_exceptions=True)
                     models[0].reset()
@@ -201,6 +217,7 @@ async def main(args):
             resources.enabled = True
             resources.wake()
             await asyncio.gather(*workers, return_exceptions=True)
+            background_capacity.configure(initial_capacity)
             observer.stop()
             process = models[5]._proc
             if process is not None and process.poll() is None:
@@ -210,9 +227,14 @@ async def main(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--order", default="ABBA", help="A disables dynamic admission; B enables it")
+    parser.add_argument("--order", default="ABBA",
+                        help="A/B speech-admission order, or baseline/bounded with --capacity-crossover")
     parser.add_argument("--utterances", type=int, default=2)
     parser.add_argument("--background-jobs", type=int, default=1)
+    parser.add_argument("--background-workers", type=int, default=1,
+                        help="Independent background pipelines sharing the loaded models")
+    parser.add_argument("--capacity-crossover", action="store_true",
+                        help="Keep baseline speech admission; A disables capacity, B enables it")
     parser.add_argument("--reference-audio", help="Optional explicit reference; generated PCM is never saved")
     parser.add_argument("--studio-voice", action="store_true", help="Read the configured bundled Studio reference")
     parser.add_argument("--threads-a", type=int, help="Optional CPU thread-budget crossover, phase A")
@@ -221,8 +243,14 @@ if __name__ == "__main__":
     parser.add_argument("--depth-a", choices=("cached", "compiled"), help="Optional depth-decoder crossover, phase A")
     parser.add_argument("--depth-b", choices=("cached", "compiled"), help="Optional depth-decoder crossover, phase B")
     args = parser.parse_args()
-    if args.utterances < 1 or args.background_jobs < 1 or not args.order or set(args.order)-set("AB"):
+    if min(args.utterances, args.background_jobs, args.background_workers) < 1 or not args.order or set(args.order)-set("AB"):
         parser.error("use a nonempty A/B order and at least one utterance")
     if any(value is not None and value < 1 for value in (args.threads_a, args.threads_b)):
         parser.error("thread budgets must be positive")
+    if args.capacity_crossover:
+        if args.background_workers < 2:
+            parser.error("capacity crossover requires at least two background workers")
+        if args.fixed_policy == "A" or any(value is not None for value in
+                (args.threads_a, args.threads_b, args.depth_a, args.depth_b)):
+            parser.error("capacity crossover holds baseline speech, CPU and decoder settings fixed")
     asyncio.run(main(args))

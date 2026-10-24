@@ -32,6 +32,9 @@ class Pending:
     transcript_managed: bool = False
     opening: bool = False
     language: str = ""          # Captured input language; never a forced reply language.
+    # Voiced bounds in seconds on the connection's received-PCM clock.
+    input_audio_span: tuple[float, float] | None = None
+    input_audio_epoch: int = 0  # Microphone restarts break continuation ownership.
 
 
 def input_transcript_event(pending) -> dict:

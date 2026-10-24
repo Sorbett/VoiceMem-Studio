@@ -25,7 +25,7 @@ class Capture:
                          on_speech_start=None, textless_confirm_s=None,
                          turn_taking=None, language_state=None):
         """Own one stream and release its workers when capture ends or is closed."""
-        pause_gate = PauseGate()
+        pause_gate = PauseGate(min_silence_s=self.CONFIRM_S)
         stream = open_stream(
             self.vm, spec_min_chars=self.SPEC_MIN_CHARS, gamble_s=self.GAMBLE_S,
             confirm_s=self.CONFIRM_S, eot=self._eot(),
@@ -100,6 +100,8 @@ class Capture:
         prewarm_idle = True
         prewarm_mem = None
         last_speak_t = 0.0
+        audio_samples = audio_epoch = 0
+        voiced_start = voiced_end = None
         bc_rms_fast = 0.0
         bc_rms_slow = 0.0
         bc_gap = 0.0
@@ -156,6 +158,8 @@ class Capture:
             if msg.get("text"):
                 data = json.loads(msg["text"])
                 if data.get("type") == "conversation_start":
+                    audio_epoch += 1
+                    voiced_start = voiced_end = None
                     if on_conversation_start:
                         on_conversation_start()
                     continue
@@ -198,13 +202,17 @@ class Capture:
                                   reply_mode=MEMORY if gate.needs_memory(turn.route) else DIRECT,
                                   input_turn_id=uuid4().hex)
                     input_turn_id = uuid4().hex
+                    voiced_start = voiced_end = None
                     if on_input_activity:
                         on_input_activity(False)
                 continue
             if msg.get("bytes") is None:
                 continue
             raw = msg["bytes"]
+            frame_start = audio_samples
+            audio_samples += len(raw) // 2
             if turn_finished:
+                voiced_start = voiced_end = None
                 input_turn_id = uuid4().hex
                 utterance = UtteranceGuard()
                 pause_gate.reset()
@@ -223,6 +231,10 @@ class Capture:
                 await on_frame(raw)
             stream.emotion = owner.get('emotion')
             st = await stream.feed(raw)
+            if st.state == '<speak>':
+                if voiced_start is None:
+                    voiced_start = frame_start
+                voiced_end = audio_samples
             if on_input_activity:
                 on_input_activity(st.spoke or bool(st.turn) or st.state == "<speak>")
             turn_finished = bool(st.turn)
@@ -345,8 +357,8 @@ class Capture:
 
             if (busy and st.state == "<speak>" and speak_run >= self.CANDIDATE_MIN_SPEECH_S
                     and not candidate and not barged
-                    and cur and not self._is_echo(cur, heard_from_agent())
-                    and self._has_barge_content(cur)):
+                    and (not cur or (not self._is_echo(cur, heard_from_agent())
+                                     and self._has_barge_content(cur)))):
                 candidate = True
                 discard_candidate_turn = False
                 candidate_updates = 0
@@ -551,6 +563,10 @@ class Capture:
                                           else DIRECT),
                               early_ok=_early_ok,
                               speech_end=last_speak_t,
+                              input_audio_span=((voiced_start / self.MIC_RATE,
+                                                 voiced_end / self.MIC_RATE)
+                                                if voiced_start is not None else None),
+                              input_audio_epoch=audio_epoch,
                               input_turn_id=input_turn_id)
 
     async def _session_anticipate(self, session_id: str, sock, on_close=None, **kwargs):

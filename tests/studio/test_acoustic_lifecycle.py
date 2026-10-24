@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock, Mock, patch
 
 from studio.core.utils.audio_timeline.component import AudioTimeline
 from studio.core.utils.conversation.component import Conversation
+from studio.core.utils.conversation.input_turn import InputContinuation
 from studio.core.utils.perception.component import Perception
 
 
@@ -27,6 +28,8 @@ class AcousticLifecycleTests(unittest.IsolatedAsyncioTestCase):
         session.agent = self.agent
         session.sock = SimpleNamespace(send_json=self.send)
         session.prewarm = {'closed': False}
+        session.owner = {}
+        session.input_continuation = InputContinuation()
         session.acoustic_tasks = set()
         session.turn = {'timeline': None, 'task': None, 'generation_task': None,
                         'continuation_task': None, 'finalize': None}

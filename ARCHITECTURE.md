@@ -852,12 +852,29 @@ reply generation or playback.
 The complete captured audio remains available for archive and final decoding
 even when obsolete streaming chunks are skipped.
 
+`VoiceStream` retains a turn-local text prefix whenever final decoding or a
+deadline fallback resets the streaming worker before turn confirmation. New
+streaming partials and flush results cover only the new decoder epoch and are
+appended to that prefix without textual overlap removal. This preserves repeated
+words and unfinished speech across pauses, including textless final-ASR probes.
+A full-audio refinement remains a replacement for the complete turn rather than
+an appended segment. The prefix is cleared on turn reset and close;
+speculative fallbacks freeze the complete cumulative text. Decoder deadlines,
+pause thresholds and provider interfaces are unchanged.
+
 ### VAD, EOT, and pause policy
 
 VAD provides acoustic speech/silence state. EOT provides semantic completeness
 evidence. `PauseGate` applies Studio dialogue policy for unfinished phrases and
 spoken backchannels. The timeout remains the fallback when semantic evidence is
 not decisive.
+
+Studio's pause gate also requires the configured `CONFIRM_S` of acoustic quiet
+before either high EOT or the timeout can confirm a turn (200 ms by default).
+Semantic confidence can still start private speculative work during this gap.
+Sentence-final hesitation after substantive speech uses the existing unfinished
+pause allowance; a hesitation alone does not authorize a delayed follow-up
+question. VoiceMem's standalone EOT defaults remain independent of this policy.
 
 These stages answer different questions and keep separate state:
 
@@ -942,6 +959,40 @@ continuation follow-ups use the same finalizer. Cancellation before a handoff
 task's first execution still reaps any adopted generator and finalizes the
 confirmed user input once. Legacy direct `Reply` callers retain their existing
 standalone finalization path.
+
+`studio/core/utils/conversation/input_turn.py` owns deferred confirmed speech
+across cancellation of an unheard main reply. Chained and Realtime sessions hold
+that input before cancelling output, so cancellation finalizers cannot separately
+write its fragment to Session Context or memory. The next accepted spoken input
+can extend it only within the same captured VoiceMem instance, Space and speaker
+ownership, before a main-output start checkpoint or any rendered source samples.
+Both voiced spans must belong to the same microphone epoch and their gap must
+not exceed `continuation_gap_ms` (1,200 ms by default). Capture records these
+bounds on the connection's received-PCM clock, independently of ASR completion,
+routing and reply latency. The new utterance's onset determines its gap even
+when that utterance is long. A long pause, microphone restart or unknown timing
+starts a separate input rather than reopening a previous bubble.
+Backchannels do not establish that boundary. Typed input, explicit interruption
+commands and stranger input remain separate turns. Completed outputs already
+finalized to context are never reopened.
+
+A continuation replaces the original user bubble through identified transcript
+events in the shared client, drops incompatible private speculation, and
+revalidates Gate and memory retrieval against the complete text before reply
+routing. This also applies with the reasoning-depth router disabled. Repeated
+input words are retained; display aliases reject late partials and duplicate
+replacement events in both visual styles. Chained reply providers receive the
+combined input. Realtime retains its committed provider audio items and commits
+only each new audio chunk; its response instructions and local context use the
+combined transcript. Recorded audio remains archived per capture chunk, with the
+latest chunk retaining the existing `Pending.audio_path` acoustic contract.
+
+The replacement output adopts exactly-once finalization of the combined input.
+If routing fails, the connection closes or ownership changes before adoption,
+cleanup persists the held accepted text to its captured Space instead. Missing
+playback reports retain the same conservative heard-prefix semantics; the
+buffer never treats delivered PCM as proof of playback. It adds no fixed wait
+to model generation, synthesis or playback.
 
 Studio uses EOT both to start speculative reply work and, after acoustic
 silence plus pause-policy approval, to end the Studio user turn. `VoiceStream` owns the
@@ -1408,6 +1459,29 @@ lock prioritizes streaming ASR over interactive queries and captured background
 work; aged waiters receive a turn to avoid starvation. Timed-out waiters leave
 no admission ticket behind. Native calls already running are not preempted.
 MLX and Torch retain separate execution lanes.
+
+A process-wide background capacity budget sits before speech admission
+and native model locks. Studio enables it during environment preparation,
+including when the engine was imported earlier. The standalone SDK leaves it
+disabled until configured. `VOICEMEM_ENGINE_BACKGROUND_CAPACITY=0` explicitly
+disables it and `1` enables it; invalid values fail at configuration load.
+CPU and MPS background stages share one host reservation;
+explicit CUDA devices have independent reservations, while unknown placement
+conflicts with every domain. FIFO ordering applies between competing background
+waiters. Audio and interactive inference bypass this capacity budget, and native
+calls already running are never preempted.
+
+The reservation spans speech admission, lock acquisition and native execution,
+then releases after model locks. Capacity queueing is measured separately from
+speech admission and cannot spend its per-stage forced-progress wait budget.
+Speech inventory is checked after capacity queueing, before model locks. Nested
+native calls on the same thread inherit the reservation without another wait;
+they cannot expand a known reservation to another domain. Adapters already
+owning model/device locks retain their existing no-wait reentrant path.
+Remote API and persistence waits acquire no capacity reservation. Cancellation
+of an awaiting task cannot release capacity ahead of its already-started native
+thread; existing background-lane ownership still drains that work.
+
 `device_lock` gives each explicit CUDA device a process-owned priority lock;
 equivalent device aliases resolve to the same lock. Different CUDA devices can
 execute independently outside initialization. Streaming recognizers and the
@@ -1433,6 +1507,15 @@ access. Each request owns its KV cache and checks cancellation and deadline
 before each step and while acquiring the lock.
 
 ### CPU inference
+
+Studio supplies one FunASR CPU thread budget before models are constructed:
+two intra-op threads for MLX deployments and four for CUDA deployments.
+`VOICEMEM_ENGINE_CPU_THREADS` explicitly overrides that positive integer.
+The standalone SDK retains FunASR's four-thread default. Streaming ASR,
+SenseVoice and emotion2vec pass the same `ncpu` value at construction so their
+runtime calls do not reset the shared Torch pool to different budgets.
+This changes execution parallelism only; providers retain all model weights,
+input coverage, decoder caches, thresholds and generated-output contracts.
 
 The engine supplies bounded ONNX session options without importing ONNX Runtime
 at module import. EOT uses two intra-op threads and one inter-op thread, sequential
@@ -1510,7 +1593,7 @@ policy cannot guarantee uninterrupted playback when native production itself is
 slower than consumption, and does not evict weights or change model quality.
 
 `engine/telemetry/metrics.py` separates native adapter wall time, model-lock wait, background
-admission wait, and initial MLX queue wait by static model/backend/service labels.
+admission wait, capacity queue wait, and initial MLX queue wait by static model/backend/service labels.
 Materialization remains inside the existing adapter boundary; these are not
 isolated kernel timings. Torch snapshots identify the active model/service.
 `engine/telemetry/system.py` starts one optional Studio lifecycle-owned sampler thread. It
@@ -1534,6 +1617,18 @@ start no samplers or model runtimes. Readiness still does not guarantee physical
 memory residency. `evals/engine_contention.py` provides an offline ABBA native
 crossover probe with synthetic inputs, completed background jobs and no API,
 Memory Space, microphone or playback; it is not a perceived-latency benchmark.
+Its `--capacity-crossover --background-workers 2` mode retains baseline speech
+admission in both ABBA arms and changes only background capacity. It waits for
+every background pipeline before switching policy. Sustained latency and heat
+effects require native and live playback validation; deterministic regressions
+alone do not establish those effects.
+
+The observer also samples macOS `NSProcessInfo.thermalState` on its own thread.
+System summaries continue every five seconds while idle so recovery remains
+observable. The categories are OS thermal assessments, not temperature or
+clock-frequency measurements. Unsupported platforms, failed reads and unknown
+future values are explicit, never interpreted as a cool device. Sampling does
+not change model quality, system power settings or foreground scheduling.
 
 Acoustic-emotion tasks belong to the conversation or realtime session and capture
 their output ID, Memory Space and VoiceMem instance. Ownership is checked before
@@ -1598,12 +1693,30 @@ rules. These bookkeeping changes add no model calls or pre-audio waits.
 
 Interruption separates reversible detection from cancellation:
 
-1. Candidate speech pauses playback while preserving the PCM queue.
+1. Sustained VAD speech can pause playback before ASR produces text, while
+   preserving the PCM queue. Known echo and acknowledgement text still use the
+   existing filters.
 2. ASR growth, explicit control text, backchannel routing, and echo rejection
    confirm or reject the candidate.
 3. Rejection resumes the same output.
 4. Confirmation clears browser playback, cancels reply/provider work, and
    finalizes only the heard assistant prefix.
+
+Confirmed capture interruptions bypass reply-start grace in both chained and
+Realtime sessions. Pause, resume and reply deltas carry the owning output ID.
+The shared desktop/browser client holds reply text until the main output starts
+playing, and holds further deltas and completion events during a candidate
+pause. Rejection resumes the same ordered text and audio; confirmation discards
+the pending text and retains only the server-confirmed heard prefix. Replacement
+outputs, failures and disconnects discard pending display events. A successful
+text-only drain releases its ordered completion without requiring an audio start.
+Both visual styles remove an interrupted reply bubble when nothing was heard,
+without removing the confirmed user input.
+Each renderer binds message objects to their current body nodes, rebuilding those
+bindings with the visible transcript. Reply deltas and completion update the
+owning assistant message even if a user acknowledgement has appended a later row.
+These display rules apply equally to both Studio visual styles and do not defer
+model generation or TTS work.
 
 Generated, sent, buffered, rendered, and heard output are different states. The
 unheard generated tail is not conversation history.
@@ -1695,6 +1808,7 @@ retry journal; forced process termination can still interrupt pending writes.
 | Recent input-language fallback | WebSocket session + Memory Space | Session |
 | Captured input language | Confirmed `Pending` and ingest context | Turn/task |
 | Early output buffer | `ReplySink` | Speculative assistant output |
+| Unheard speech continuation | Session-owned `InputContinuation` | Until replacement output adoption or cleanup |
 | Short-term dialogue | `SessionBuffer` | WebSocket session + Memory Space |
 | Text/media alignment | `AudioTimeline` | Assistant output ID |
 | PCM queue and echo reference | Browser worklets | Assistant output ID/session |

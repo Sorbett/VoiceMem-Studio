@@ -25,6 +25,19 @@ ASR 耗时、事件循环延迟、后台完成时间和真实换页速率。模�
 不请求 API，不读写 Memory Space，不采集或播放音频，也不保存合成语音。
 机器温度和其他进程仍会影响结果；该评测不能替代浏览器播放和真人打断测试。
 
+`python -m evals.engine_contention --capacity-crossover --background-workers 2 --order ABBAABBA --utterances 2`
+单独对照后台原生容量控制：A 使用原有语音准入，B 在相同策略前增加跨模型容量约束。
+两组使用相同的模型、线程设置和解码参数；每组都等待后台流水线完成再切换策略。
+该模式拒绝同时修改线程数、解码方式或关闭原有语音准入，避免多个变量混在一起。
+每句输出 PCM 的 SHA-256 用于校验样本一致性，不保存音频；`capacity_ms` 单独记录
+容量排队时间。运行时应暂停其他评测和单测。结果只能说明原生竞争下的生产表现，
+不能据此认定浏览器断音、端到端回复延迟或持续发热已经改善。
+
+环境记录包含 FunASR 的 `cpu_threads`；`--fixed-policy B --threads-a 4 --threads-b 2`
+可保持语音准入不变，单独对照线程预算。每组的 `process_cpu_s` 是主进程及其线程
+累计 CPU 时间，不包含独立 speaker 子进程，也不是功耗。系统摘要持续记录可用的
+`thermal_state`，包括空闲期；该值是操作系统热状态分类，不是温度或实际时钟频率。
+
 `python -m evals.mlx_prefill --order ABBAABBA` 使用固定种子的小型 Qwen3.5 架构，
 交替对比整段与分块预填充，校验循环状态、注意力缓存和后续贪心 token，记录单步占用
 及竞争计算的等待。无需预训练权重，不请求 API、不读写 Memory Space、不生成音频。

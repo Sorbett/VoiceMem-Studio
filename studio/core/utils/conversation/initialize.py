@@ -7,6 +7,7 @@ from studio.core.utils.audio_timeline.component import SpeechRateEstimator
 from studio.core.utils.self_harness.component import (
     SelfHarnessState, apply_turn_taking_profile,
 )
+from .input_turn import InputContinuation
 
 def initialize(self, agent, sock):
     self.agent = agent
@@ -36,3 +37,4 @@ def initialize(self, agent, sock):
     self.early = {'text': '', 'task': None, 'sink': None, 'timeline': None, 'pending': None, 'said': None, 'space': '', 'memory_vm': None, 'started': 0.0, 'self_harness_update': None}
     self.prewarm = {'task': None, 'cancelled': None, 'closed': False}
     self.unfinished_wait = {'pending': None, 'task': None}
+    self.input_continuation = InputContinuation()

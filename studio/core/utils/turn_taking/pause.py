@@ -32,6 +32,9 @@ def is_unfinished(text: str) -> bool:
     tail = re.sub(r"[\s，。！？、,.!?…；;：:]+$", "", text or "")
     if _OPENING.fullmatch(tail):
         return True
+    hesitation = re.search(r"(?:呃+|嗯+)$|\b(?:uh+|um+|erm+)$", tail, re.IGNORECASE)
+    if hesitation and tail[:hesitation.start()].strip(" ，,"):
+        return True
     # Complete replies and word suffixes are not unfinished clauses.
     if re.search(r"(?:这么|这样|如此)(?:觉得|认为|想)$|(?:怎么|如何|怎样)想$"
                  r"|(?:将就|成就|迁就|造就|梦想|理想|感想|猜想|着想|不想|不觉得)$", tail):
@@ -70,6 +73,7 @@ class PauseGate:
     silence: float = 0.0
     rms_slow: float = 0.0
     unfinished_until: float = 0.0
+    min_silence_s: float = 0.2
 
     def reset(self):
         self.hold_until = self.silence = self.rms_slow = 0.0
@@ -93,7 +97,7 @@ class PauseGate:
         else:
             self.unfinished_until = 0.0
         return self.silence + 1e-9 >= max(
-            self.hold_until, self.unfinished_until)
+            self.min_silence_s, self.hold_until, self.unfinished_until)
 
     def emitted(self, duration_s: float):
         """Leave a short continuation gap after an in-speech acknowledgement."""

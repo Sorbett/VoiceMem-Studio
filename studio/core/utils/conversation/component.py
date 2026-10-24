@@ -20,6 +20,7 @@ from studio.core.voicemem import greeting_memories
 from studio.harness.persona.policy import opening_prompt, opening_memory_context
 from voicemem.stream import empty_result
 from .initialize import initialize
+from .input_turn import can_continue_input, join_input
 
 class Conversation:
 
@@ -80,7 +81,9 @@ class Conversation:
         if self.hearing() and (not self.candidate_paused):
             self.candidate_paused = True
             self.candidate_paused_at = time.monotonic()
-            await self.sock.send_json({'type': 'answer_pause'})
+            timeline = self.turn['timeline']
+            await self.sock.send_json({'type': 'answer_pause',
+                                       'output_id': timeline.output_id if timeline else ''})
 
     async def resume_candidate(self):
         if self.candidate_paused:
@@ -88,7 +91,27 @@ class Conversation:
             if self.turn['until']:
                 self.turn['until'] += max(0.0, time.monotonic() - self.candidate_paused_at)
             self.candidate_paused_at = 0.0
-            await self.sock.send_json({'type': 'answer_resume'})
+            timeline = self.turn['timeline']
+            await self.sock.send_json({'type': 'answer_resume',
+                                       'output_id': timeline.output_id if timeline else ''})
+
+    async def on_user_speech(self):
+        """Cancel confirmed speech output, retaining an unheard input for continuation."""
+        held = self.input_continuation.defer(
+            self.turn.get('pending'), self.turn['timeline'],
+            self.turn.get('memory_vm'), self.turn.get('context_space'),
+            self.turn.get('context_owner', self.owner),
+            started=self.turn['play_started'])
+        if held and self.agent.BARGE_DEBUG:
+            print('[turn] holding confirmed input: main output not started', flush=True)
+        await self.stop_reply(force=True)
+
+    def flush_continuation(self):
+        """Persist an unadopted accepted input on ownership change or disconnect."""
+        held = self.input_continuation.take()
+        if held:
+            self.save_reply_context(held.pending, held.timeline, held.memory_vm,
+                                    held.space, owner=held.owner)
 
     def hearing(self) -> bool:
         """Report active generation or remaining playback, including continuation waiting."""
@@ -209,10 +232,13 @@ class Conversation:
         self.turn.update(context_space=context_space, memory_vm=memory_vm)
         self.turn['finalize'] = lambda: self.save_reply_context(pending, timeline, memory_vm, context_space)
         self.turn['generation_task'] = None
+        self.turn['pending'] = pending
+        self.turn['context_owner'] = dict(self.owner)
+        self.input_continuation.adopt(pending)
 
-    def save_reply_context(self, pending, timeline, memory_vm, context_space) -> None:
+    def save_reply_context(self, pending, timeline, memory_vm, context_space, *, owner=None) -> None:
         """Finalize a confirmed output once, using its final input and frozen heard prefix."""
-        if timeline.context_saved:
+        if timeline.context_saved or self.input_continuation.owns(timeline):
             return
         timeline.freeze_playback()
         timeline.context_saved = True
@@ -251,7 +277,7 @@ class Conversation:
             except RuntimeError:
                 pass
 
-        self.agent.queue_remember_turn(pending, reply, self.owner, history_turn_id,
+        self.agent.queue_remember_turn(pending, reply, self.owner if owner is None else owner, history_turn_id,
                                       memory_vm=memory_vm, on_complete=stored)
 
     async def wait_reply_playback(self, pending, timeline) -> None:
@@ -548,6 +574,7 @@ class Conversation:
                 await asyncio.gather(generation_task, return_exceptions=True)
             if finalize:
                 finalize()
+            self.flush_continuation()
 
     def reply_done(self, done_task):
         try:
@@ -608,6 +635,9 @@ class Conversation:
 
     async def defer_unfinished_reply(self, pending):
         """Emit a short acknowledgement and arm the delayed continuation prompt."""
+        self.input_continuation.defer(
+            pending, AudioTimeline(track_delivery=True), self.agent.vm,
+            self.agent.ACTIVE_SPACE, self.owner)
         ack = self.cached_ack(pending)
         if ack:
             await self.emit_filler(*ack)
@@ -625,6 +655,10 @@ class Conversation:
         return self.agent._is_backchannel(pending.text) and self.hearing()
 
     async def merge_continuation(self, pending):
+        incoming = pending
+        if (pending.spoken and self.input_continuation.held is None
+                and self.unfinished_wait['pending'] is None and self.hearing()):
+            await self.on_user_speech()
         if self.unfinished_wait['pending'] is not None:
             base = self.unfinished_wait['pending']
             wait_task = self.unfinished_wait['task']
@@ -635,14 +669,31 @@ class Conversation:
                 wait_task.cancel()
                 await asyncio.gather(wait_task, return_exceptions=True)
             if self.unfinished_wait.get('space') != self.agent.ACTIVE_SPACE or self.unfinished_wait.get('memory_vm') is not self.agent.vm:
+                self.flush_continuation()
                 return pending
-            joiner = '' if base.text and pending.text and all('\u3400' <= c <= '\u9fff' for c in (base.text[-1], pending.text[0])) else ' '
-            pending = replace(pending, text=f'{base.text}{joiner}{pending.text}'.strip(), continuation_prompt=False, early_ok=False,
-                              replace_input_turn_id=getattr(base, 'input_turn_id', ''),
-                              transcript_managed=False)
-            pending.language = detect_language(pending.text, base.language or "zh")
+            if (self.input_continuation.held is None and pending.spoken and not pending.stranger
+                    and can_continue_input(base, pending)):
+                pending = join_input(base, pending)
+        held = self.input_continuation.held
+        base_pending = held.pending if held else None
+        if held is not None:
+            pending = self.input_continuation.merge(
+                pending, self.agent.vm, self.agent.ACTIVE_SPACE, self.owner,
+                explicit=self.agent._is_explicit_interrupt(pending.text))
+            if pending is incoming:
+                self.flush_continuation()
+        if pending is not incoming:
             if self.agent.BARGE_DEBUG:
-                print(f'[unfinished] 用户续说，合并为 {pending.text!r}', flush=True)
+                print(f'[turn] continuation merged chars={len(pending.text)}', flush=True)
+            await self.drop_early('用户续说，使用完整输入重新路由')
+            from .input_turn import refresh_continuation
+            await refresh_continuation(self.agent, pending, self.agent.vm)
+            if held and not self.input_continuation.in_scope(
+                    self.agent.vm, self.agent.ACTIVE_SPACE, self.owner):
+                if self.input_continuation.held is held:
+                    held.pending = base_pending
+                    self.flush_continuation()
+                return incoming
         return pending
 
     async def route(self, pending):
@@ -854,4 +905,4 @@ class Conversation:
 
     def listen(self):
         self.languages = getattr(self, 'languages', {})
-        return self.agent._session_anticipate(self.context_session, self.sock, on_speech=self.stop_reply, owner=self.owner, is_busy=self.hearing, said=lambda : self.turn['reply']['text'] if self.hearing() or time.monotonic() < self.turn['echo_until'] else '', on_candidate=self.pause_candidate, on_candidate_reject=self.resume_candidate, on_playback_checkpoint=self.playback_checkpoint, on_filler_done=self.filler_done, on_self_harness_get=self.publish_self_harness, on_self_harness_update=self.update_self_harness, on_harness_prompt_update=self.update_harness_prompt, on_backchannel_curve_update=self.update_backchannel_curve, on_conversation_start=self.start_opening, on_close=self.close_session, on_early=self.start_early, on_early_cancel=self.drop_early, on_speech_start=self.prewarm_local, textless_confirm_s=0.2, turn_taking=self.turn_taking, language_state=self.languages)
+        return self.agent._session_anticipate(self.context_session, self.sock, on_speech=self.on_user_speech, owner=self.owner, is_busy=self.hearing, said=lambda : self.turn['reply']['text'] if self.hearing() or time.monotonic() < self.turn['echo_until'] else '', on_candidate=self.pause_candidate, on_candidate_reject=self.resume_candidate, on_playback_checkpoint=self.playback_checkpoint, on_filler_done=self.filler_done, on_self_harness_get=self.publish_self_harness, on_self_harness_update=self.update_self_harness, on_harness_prompt_update=self.update_harness_prompt, on_backchannel_curve_update=self.update_backchannel_curve, on_conversation_start=self.start_opening, on_close=self.close_session, on_early=self.start_early, on_early_cancel=self.drop_early, on_speech_start=self.prewarm_local, textless_confirm_s=0.2, turn_taking=self.turn_taking, language_state=self.languages)
