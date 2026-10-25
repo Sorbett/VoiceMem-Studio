@@ -3,6 +3,8 @@ import asyncio
 from contextlib import aclosing
 import json
 import os
+from pathlib import Path
+import tempfile
 from types import ModuleType, SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
@@ -90,6 +92,75 @@ class ConfigurationTests(unittest.TestCase):
                          {'VOICEMEM_MEMORY_API_KEY / OPENAI_API_KEY','VOICEMEM_STUDIO_API_KEY / OPENAI_API_KEY','STUDIO_ASR_API_KEY','STUDIO_SPEECH_API_KEY'})
         self.assertIn('STUDIO_ASR_API_KEY',{entry[0] for entry in preparation})
         self.assertNotIn('STUDIO_SPEECH_API_KEY',{entry[0] for entry in preparation})
+
+
+class VADBridgeTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        config._vad.cache_clear()
+        self.addCleanup(config._vad.cache_clear)
+
+    def open_memory(self):
+        from studio.core.voicemem import open_memory
+        from voicemem.orchestrator import Utils
+
+        def memory(**kwargs):
+            return SimpleNamespace(utils=Utils(
+                'multi_modal', None, Path(self.directory.name), {'vad': kwargs['vad']}))
+
+        with patch('studio.core.voicemem.VoiceMem', side_effect=memory), \
+                patch('studio.core.utils.llm.initialize.create', return_value=object()), \
+                patch('studio.core.utils.llm.initialize.credential', return_value='fixture'):
+            return open_memory({'mode': 'text_mode',
+                                'reply': {'llm': {'provider': 'deepseek', 'config': {'system': 'shared'}}}})
+
+    def test_recommended_vad_resolves_lazily_and_passes_the_actual_warmup(self):
+        from studio.core.voicemem import memory_warmups
+        detector = SimpleNamespace(is_speech=Mock(return_value=False))
+        with patch.dict(os.environ, {}, clear=True), \
+                patch('voicemem.utils.audio.stream_io.make_vad', return_value=detector) as create:
+            memory = self.open_memory()
+            create.assert_not_called()
+            dict(memory_warmups(memory))['VAD']()
+            self.assertIs(memory.utils.get('vad'), detector)
+            self.assertIs(config.vad(), detector)
+            create.assert_called_once_with()
+        samples = detector.is_speech.call_args.args[0]
+        np.testing.assert_array_equal(samples, np.zeros(512, dtype=np.float32))
+
+    def test_custom_vad_resolves_through_the_bridge_and_keeps_connection_state_private(self):
+        from studio.core.voicemem import memory_warmups
+        from voicemem.stream import VoiceStream
+        children = []
+
+        def new_stream():
+            child = SimpleNamespace(is_speech=lambda samples: False, new_stream=new_stream)
+            children.append(child)
+            return child
+
+        module = ModuleType('fixture_vad')
+        module.create = Mock(return_value=SimpleNamespace(is_speech=lambda samples: False, new_stream=new_stream))
+        values = {'vad': {'provider': 'adapter', 'factory': 'fixture_vad:create'}}
+        with patch.dict(os.environ, {'STUDIO_COMPONENTS': json.dumps(values)}, clear=True), \
+                patch.dict('sys.modules', {'fixture_vad': module}):
+            memory = self.open_memory()
+            module.create.assert_not_called()
+            dict(memory_warmups(memory))['VAD']()
+            first, second = VoiceStream(memory).vad, VoiceStream(memory).vad
+            self.assertIsNot(first, second)
+            self.assertIsNot(first.adapter, second.adapter)
+            self.assertIs(first.adapter, children[0])
+            self.assertIs(second.adapter, children[1])
+            module.create.assert_called_once_with(model='', base_url='', api_key='', options={})
+
+    def test_vad_construction_failure_still_fails_warmup(self):
+        from studio.core.voicemem import memory_warmups
+        with patch.dict(os.environ, {}, clear=True), \
+                patch('voicemem.utils.audio.stream_io.make_vad', side_effect=RuntimeError('synthetic VAD failure')):
+            memory = self.open_memory()
+            with self.assertRaisesRegex(RuntimeError, 'synthetic VAD failure'):
+                dict(memory_warmups(memory))['VAD']()
 
 
 class ContractTests(unittest.IsolatedAsyncioTestCase):

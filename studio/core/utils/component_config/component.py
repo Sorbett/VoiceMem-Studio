@@ -154,8 +154,13 @@ def custom(role, value=None):
     return result
 
 
-@lru_cache(maxsize=1)
 def vad():
+    """Keep VoiceMem's plain-function factory contract while sharing the detector."""
+    return _vad()
+
+
+@lru_cache(maxsize=1)
+def _vad():
     """Return the recommended detector or a checked stream-isolated adapter."""
     value = selection('vad')
     if value['provider'] == 'adapter':
