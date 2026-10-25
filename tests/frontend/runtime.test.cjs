@@ -74,7 +74,7 @@ test('managed model services validate custom endpoints without exposing credenti
   assert.equal(services.memory.model, 'deepseek-chat');
   assert.equal(services.reply.baseUrl, 'https://models.example.com/v1');
   assert.deepEqual(r.publicModelServices(services).reply, {
-    provider: 'openai', model: 'custom-chat', baseUrl: 'https://models.example.com/v1', configured: true,
+    provider: 'openai', model: 'custom-chat', baseUrl: 'https://models.example.com/v1', hasKey: true, configured: true,
   });
   assert.equal(JSON.stringify(r.publicModelServices(services)).includes('secret'), false);
   assert.throws(() => r.modelEndpoint('http://models.example.com/v1'), /HTTPS/);

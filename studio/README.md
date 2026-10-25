@@ -63,7 +63,7 @@ Windows 用户先安装 Node.js 22.12 或更新版本、Docker Desktop（WSL2 �
 - **如何指定已有记忆库？** 用 `--memory_root /path/to/memory --space myspace` 指定一个具体库目录。Studio 保留该库的位置和数据，并固定使用启动时的 Space；界面不能新建或切换其他 Space。不指定 `--memory_root` 时仍可管理多个 Space。
 
 - **两个 API 要怎么选？** VoiceMem API 用于记忆处理，Studio API 用于对话生成；语音输入、语音合成和界面仍属于同一个 Studio 应用。两处可以选同一家服务，也可以分别选择。
-- **从哪里更换模型服务？** 本机 App 的“设置 → 组件”可修改记忆或回复模型服务，并由 App 重启它管理的本机后端。连接已有服务时这里是只读的，需要到服务器修改 `.env` 后重启。
+- **从哪里更换模型服务？** App 管理的本机后端可在“设置 → 组件”填写模型名称、服务地址和 Key，支持多项一起应用并重启，启动失败时回到原配置。当前链路保留为推荐默认；常用接入包括记忆/回复的 Chat API、Deepgram 流式识别和 OpenAI-compatible 语音合成。轮次控制等组件保留高级适配器入口，具体协议见[组件接入说明](core/utils/component_config/README.md)。连接已有或 Docker 服务时这里是只读的，需要在服务器端设置后重启。
 - **启动前想检查环境？** 已装好对应 Python 环境后，可在仓库根目录运行 `python -m studio --check`。它只做检查，不下载模型，也不打开记忆空间。
 - **默认配置文件在哪里？** 样例在 `studio/.env.example`，实际配置是仓库根目录的 `.env` 或进程环境变量。不要提交含真实 Key 的 `.env`。命令行参数优先于环境变量；已导出的变量优先于 `.env`。
 - **如何指定流式 ASR 设备？** 使用 `--asr-device auto/cpu/mps/cuda:N` 或 `.env` 中的 `STUDIO_ASR_DEVICE`。Mac 默认保持自动选择，实际设备会显示在启动日志中；它与 Torch 路由、Breeze 的设备分开配置。

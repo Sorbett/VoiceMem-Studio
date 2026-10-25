@@ -23,6 +23,56 @@ const MODEL_SERVICE_DEFAULTS = Object.freeze({
   openai: Object.freeze({ model: 'gpt-4o', baseUrl: 'https://api.openai.com/v1' }),
   local: Object.freeze({ model: 'mlx-community/Qwen3.5-4B-4bit', baseUrl: '' }),
 });
+const COMPONENT_CATALOG = require('./component-catalog.json');
+
+function componentService(role, value = {}) {
+  const spec = COMPONENT_CATALOG[role];
+  if (!spec || !value || typeof value !== 'object' || Array.isArray(value)) throw new Error('组件配置格式不正确。');
+  if (Object.keys(value).some(key => !['provider', 'model', 'baseUrl', 'apiKey', 'voice', 'language', 'factory', 'options'].includes(key))) {
+    throw new Error('组件包含未知配置字段。');
+  }
+  const provider = value.provider || 'recommended', defaults = spec.providers[provider];
+  if (!Object.hasOwn(spec.providers, provider)) throw new Error(`${spec.title}不支持此接入方式。`);
+  if (provider === 'recommended') return { provider };
+  const result = { provider };
+  for (const name of ['model', 'baseUrl', 'apiKey', 'voice', 'language', 'factory']) {
+    const item = value[name] ?? defaults[name] ?? '';
+    if (typeof item !== 'string' || item.length > (name === 'apiKey' ? 8192 : 1000) || /[\x00-\x1f\x7f]/.test(item)) {
+      throw new Error(`${spec.title}的${name}格式不正确。`);
+    }
+    result[name] = item.trim();
+  }
+  if (result.baseUrl) result.baseUrl = modelEndpoint(result.baseUrl);
+  if (provider === 'deepgram') {
+    if (!result.model || !result.baseUrl || !result.language) throw new Error('识别 API 需要模型、服务地址和语言。');
+    return result;
+  }
+  if (provider === 'openai') {
+    if (!result.model || !result.baseUrl || !result.voice) throw new Error('语音 API 需要模型、服务地址和音色。');
+    return result;
+  }
+  if (!/^[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*:[A-Za-z_]\w*$/.test(result.factory)) {
+    throw new Error('适配器填写已安装的 Python 模块，例如 my_adapter:create。');
+  }
+  const options = value.options ?? {};
+  if (!options || typeof options !== 'object' || Array.isArray(options)) throw new Error('适配器参数必须为 JSON 对象。');
+  const check = (item, depth = 0) => {
+    if (depth > 8) throw new Error('适配器参数嵌套过深。');
+    if (item && typeof item === 'object') {
+      for (const [key, child] of Object.entries(item)) {
+        if (!Array.isArray(item) && /^(api[_-]?key|access[_-]?token|token|secret|password|authorization|credentials)$/i.test(key)) {
+          throw new Error('凭据请填写在 API Key 中，不要放在适配器参数里。');
+        }
+        check(child, depth + 1);
+      }
+    } else if (typeof item === 'number' && !Number.isFinite(item)) throw new Error('适配器参数不能包含非有限数值。');
+    else if (!['string', 'number', 'boolean'].includes(typeof item) && item !== null) throw new Error('适配器参数必须是 JSON 数据。');
+  };
+  check(options);
+  if (JSON.stringify(options).length > 16384) throw new Error('适配器参数过长。');
+  result.options = structuredClone(options);
+  return result;
+}
 
 function managedStartupTimeout(env = process.env) {
   const value = String(env.VOICEMEM_DESKTOP_STARTUP_TIMEOUT_SECONDS || '').trim();
@@ -146,13 +196,15 @@ function modelEndpoint(value) {
 }
 
 function modelService(role, value = {}) {
+  if (Object.hasOwn(COMPONENT_CATALOG, role)) return componentService(role, value);
+  if (!['memory', 'reply'].includes(role)) throw new Error('未知的模型服务角色。');
   const providers = role === 'memory' ? MEMORY_PROVIDERS : MANAGED_PROVIDERS;
   const provider = String(value.provider || '').trim().toLowerCase();
   if (!providers.has(provider)) throw new Error(`${role === 'memory' ? '记忆' : '回复'}服务商不受支持。`);
   const defaults = MODEL_SERVICE_DEFAULTS[provider];
-  if (provider === 'local') return { provider, model: defaults.model, baseUrl: '', apiKey: '' };
   const model = String(value.model || defaults.model).trim();
   if (!model || model.length > 300 || /[\x00-\x1f\x7f]/.test(model)) throw new Error('模型名称格式不正确。');
+  if (provider === 'local') return { provider, model, baseUrl: '', apiKey: '' };
   const apiKey = String(value.apiKey || '').trim();
   if (apiKey.length > 8192 || /[\r\n]/.test(apiKey)) throw new Error('API Key 格式不正确。');
   return { provider, model, baseUrl: modelEndpoint(value.baseUrl || defaults.baseUrl), apiKey };
@@ -160,7 +212,8 @@ function modelService(role, value = {}) {
 
 function modelServices(value) {
   if (!value || typeof value !== 'object') throw new Error('模型服务配置格式不正确。');
-  return { memory: modelService('memory', value.memory), reply: modelService('reply', value.reply) };
+  return { memory: modelService('memory', value.memory), reply: modelService('reply', value.reply),
+    ...Object.fromEntries(Object.keys(COMPONENT_CATALOG).map(role => [role, componentService(role, value[role])])) };
 }
 
 function modelServicesFromLaunch(launch, env = process.env) {
@@ -170,46 +223,79 @@ function modelServicesFromLaunch(launch, env = process.env) {
       provider,
       model: env[`${prefix}_MODEL`],
       baseUrl: env[`${prefix}_BASE_URL`],
-      apiKey: env[`${prefix}_API_KEY`] || env[PROVIDER_CREDENTIALS[provider]],
+      apiKey: Object.hasOwn(env, `${prefix}_API_KEY`) ? env[`${prefix}_API_KEY`] : env[PROVIDER_CREDENTIALS[provider]],
     };
   };
-  return modelServices({
+  let components;
+  try { components = JSON.parse(env.STUDIO_COMPONENTS || '{}'); }
+  catch { throw new Error('STUDIO_COMPONENTS 必须为有效的 JSON 对象。'); }
+  if (!components || typeof components !== 'object' || Array.isArray(components)
+      || Object.keys(components).some(role => !Object.hasOwn(COMPONENT_CATALOG, role))) throw new Error('STUDIO_COMPONENTS 包含未知组件。');
+  if (Object.values(components).some(value => value?.apiKey)) throw new Error('组件凭据请通过 STUDIO_<ROLE>_API_KEY 设置。');
+  return modelServices({ ...Object.fromEntries(Object.keys(COMPONENT_CATALOG).map(role => [role, {
+    ...components[role], apiKey: env[`STUDIO_${role.toUpperCase()}_API_KEY`] || '',
+  }])),
     memory: service('memory', launch.memoryProvider),
     reply: service('reply', launch.replyProvider),
   });
 }
 
 function updateModelService(current, role, value) {
-  if (!['memory', 'reply'].includes(role)) throw new Error('未知的模型服务角色。');
+  if (!['memory', 'reply', ...Object.keys(COMPONENT_CATALOG)].includes(role)) throw new Error('未知的模型服务角色。');
   const existing = modelServices(current);
-  const requestedProvider = String(value?.provider || '').trim().toLowerCase();
   const previous = existing[role];
-  const apiKey = String(value?.apiKey || '').trim()
-    || (requestedProvider === previous.provider ? previous.apiKey : '');
-  const updated = modelService(role, { ...value, apiKey });
-  if (updated.provider !== 'local' && !updated.apiKey) throw new Error('更换服务商时请输入对应的 API Key。');
+  const updated = modelService(role, value);
+  const sameEndpoint = updated.baseUrl === previous.baseUrl;
+  const sameFactory = updated.factory === previous.factory;
+  if (updated.provider !== 'recommended' && !updated.apiKey
+      && updated.provider === previous.provider && sameEndpoint && sameFactory) updated.apiKey = previous.apiKey;
+  const requiresKey = !['local', 'recommended', 'adapter'].includes(updated.provider)
+    && !loopback(new URL(updated.baseUrl).hostname);
+  if (requiresKey && !updated.apiKey) {
+    const title = COMPONENT_CATALOG[role]?.title || (role === 'memory' ? '记忆模型' : '回复模型');
+    throw new Error(`${title}：更换服务商或服务地址时请输入对应的 API Key。`);
+  }
   return { ...existing, [role]: updated };
+}
+
+function updateModelServices(current, updates) {
+  if (!updates || typeof updates !== 'object' || Array.isArray(updates) || !Object.keys(updates).length) throw new Error('没有待应用的组件更改。');
+  let next = modelServices(current);
+  for (const [role, value] of Object.entries(updates)) next = updateModelService(next, role, value);
+  return next;
 }
 
 function publicModelServices(value) {
   const services = modelServices(value);
   return Object.fromEntries(Object.entries(services).map(([role, service]) => [role, {
-    provider: service.provider, model: service.model, baseUrl: service.baseUrl,
-    configured: service.provider === 'local' || Boolean(service.apiKey),
+    ...Object.fromEntries(Object.entries(service).filter(([key]) => key !== 'apiKey')),
+    hasKey: Boolean(service.apiKey),
+    configured: ['local', 'recommended', 'adapter'].includes(service.provider) || Boolean(service.apiKey),
   }]));
 }
 
 function modelServiceEnvironment(env, value) {
   const services = modelServices(value);
   const next = { ...env };
+  const components = {};
   for (const [role, service] of Object.entries(services)) {
+    if (Object.hasOwn(COMPONENT_CATALOG, role)) {
+      const { apiKey, ...config } = service;
+      components[role] = config;
+      const name = `STUDIO_${role.toUpperCase()}_API_KEY`;
+      delete next[name];
+      if (apiKey) next[name] = apiKey;
+      continue;
+    }
     const prefix = role === 'memory' ? 'VOICEMEM_MEMORY' : 'VOICEMEM_STUDIO';
     for (const suffix of ['PROVIDER', 'API_KEY', 'MODEL', 'BASE_URL']) delete next[`${prefix}_${suffix}`];
     next[`${prefix}_PROVIDER`] = service.provider;
     next[`${prefix}_MODEL`] = service.model;
     if (service.baseUrl) next[`${prefix}_BASE_URL`] = service.baseUrl;
-    if (service.apiKey) next[`${prefix}_API_KEY`] = service.apiKey;
+    next[`${prefix}_API_KEY`] = service.apiKey || (
+      service.baseUrl && loopback(new URL(service.baseUrl).hostname) ? 'not-required' : '');
   }
+  next.STUDIO_COMPONENTS = JSON.stringify(components);
   return next;
 }
 
@@ -217,10 +303,10 @@ async function loadModelServices(file, unprotect) {
   try {
     const stored = JSON.parse(await fs.readFile(file, 'utf8'));
     if (stored.schema !== 1) throw new Error('unsupported schema');
-    return modelServices({
-      memory: { ...stored.memory, apiKey: unprotect(stored.memory.secret) },
-      reply: { ...stored.reply, apiKey: stored.reply.provider === 'local' ? '' : unprotect(stored.reply.secret) },
-    });
+    return modelServices(Object.fromEntries(['memory', 'reply', ...Object.keys(COMPONENT_CATALOG)].map(role => {
+      const { secret, ...config } = stored[role] || { provider: 'recommended' };
+      return [role, { ...config, apiKey: secret ? unprotect(secret) : '' }];
+    })));
   } catch (error) {
     if (error.code === 'ENOENT') return null;
     throw new Error('无法读取已保存的模型服务配置，请重新配置。');
@@ -231,10 +317,8 @@ async function saveModelServices(file, value, protect) {
   const services = modelServices(value);
   const stored = { schema: 1 };
   for (const [role, service] of Object.entries(services)) {
-    stored[role] = {
-      provider: service.provider, model: service.model, baseUrl: service.baseUrl,
-      secret: service.provider === 'local' ? '' : protect(service.apiKey),
-    };
+    const { apiKey, ...config } = service;
+    stored[role] = { ...config, secret: apiKey ? protect(apiKey) : '' };
   }
   await fs.mkdir(path.dirname(file), { recursive: true, mode: 0o700 });
   await fs.writeFile(`${file}.tmp`, JSON.stringify(stored, null, 2), { mode: 0o600 });
@@ -294,6 +378,7 @@ async function managedBackendCommand(directory, memoryProvider, replyProvider, {
     [...credentials, 'VOICEMEM_MEMORY_API_KEY', 'VOICEMEM_STUDIO_API_KEY',
       'VOICEMEM_MEMORY_PROVIDER', 'VOICEMEM_MEMORY_MODEL', 'VOICEMEM_MEMORY_BASE_URL',
       'VOICEMEM_STUDIO_PROVIDER', 'VOICEMEM_STUDIO_MODEL', 'VOICEMEM_STUDIO_BASE_URL',
+      'STUDIO_COMPONENTS', 'STUDIO_VALIDATE_SERVICES', ...Object.keys(COMPONENT_CATALOG).map(role => `STUDIO_${role.toUpperCase()}_API_KEY`),
       'STUDIO_DESKTOP_PET', 'PYTHONUNBUFFERED']);
   return {
     file: 'wsl.exe', args: ['--cd', linuxRoot, '--exec', python, ...args],
@@ -475,7 +560,7 @@ module.exports = { DEFAULTS, MANAGED_STARTUP_TIMEOUT_MS, MANAGED_STOP_TIMEOUT_MS
   MANAGED_PROVIDERS, MEMORY_PROVIDERS, managedStartupTimeout,
   serverUrl, settings, sameOrigin, audioPermission, loadSettings, saveSettings,
   validateProject, validateBackendProject, command, managedLaunch, MODEL_SERVICE_DEFAULTS, modelEndpoint,
-  modelService, modelServices, modelServicesFromLaunch, updateModelService,
+  COMPONENT_CATALOG, componentService, modelService, modelServices, modelServicesFromLaunch, updateModelService, updateModelServices,
   publicModelServices, modelServiceEnvironment, loadModelServices, saveModelServices,
   appendWslEnvironment, managedBackendCommand, selectManagedPort,
   startManagedBackend, stopManagedBackend, prepareManagedMemory, publishedUrl, startDocker, probe, waitForStudio };

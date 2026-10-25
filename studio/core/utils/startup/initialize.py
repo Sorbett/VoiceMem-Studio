@@ -15,11 +15,30 @@ def required_credentials(args, stage="all"):
         provider = args.llm if args.mode == 'llm_tts' else 'openai'
         if provider != 'local':
             entries.append((provider, 'reply', 'Studio 可见回复'))
-    return [
+    required = [
         (f'{"VOICEMEM_MEMORY_API_KEY" if purpose == "memory" else "VOICEMEM_STUDIO_API_KEY"}'
          f' / {credential_name(provider)}', provider, label, bool(credential(provider, purpose)))
         for provider, purpose, label in entries
     ]
+    from studio.core.utils.component_config.component import selection
+    from urllib.parse import urlsplit
+    from ipaddress import ip_address
+    components = [('asr', '流式识别')]
+    if stage != 'memory' and args.mode == 'llm_tts':
+        components.append(('speech', '语音合成'))
+    for role, label in components:
+        binding = selection(role)
+        if binding['provider'] not in {'openai', 'deepgram'}:
+            continue
+        host = urlsplit(binding['baseUrl']).hostname
+        local = host == 'localhost'
+        try:
+            local = local or ip_address(host).is_loopback
+        except ValueError:
+            pass
+        required.append((f'STUDIO_{role.upper()}_API_KEY', binding['provider'],
+                         label, local or bool(binding['apiKey'])))
+    return required
 
 
 def inspect(args, stage="all"):
@@ -29,6 +48,9 @@ def inspect(args, stage="all"):
     if sys.version_info[:2] != (3, 12):
         errors.append('Studio 需要 Python 3.12，请切换原有 Studio 环境')
     required_keys = required_credentials(args, stage)
+    from studio.core.utils.component_config.component import selection
+    local_speech = selection('speech')['provider'] == 'recommended'
+    local_router = selection('router')['provider'] == 'recommended'
     mlx = args.backend == 'mlx'
     router = 'mlx-gpu' if mlx and os.environ.get('STUDIO_ROUTER_BACKEND', 'mlx') == 'mlx' else args.device
     speech = 'mlx-gpu' if mlx else args.tts_device
@@ -48,7 +70,7 @@ def inspect(args, stage="all"):
     if args.backend == 'cuda':
         if platform.system() != 'Linux':
             errors.append('CUDA backend 需要 Linux + NVIDIA GPU')
-        if args.mode == 'llm_tts' and stage != 'memory':
+        if args.mode == 'llm_tts' and stage != 'memory' and local_speech:
             packages['qwen-tts'] = '0.1.1'
             from studio.core.utils.tts.cuda import source_directory
             source = source_directory()
@@ -75,8 +97,11 @@ def inspect(args, stage="all"):
         except (ImportError, RuntimeError, OSError) as exc:
             errors.append(f'CUDA 检查失败：{type(exc).__name__}')
     elif args.mode == 'llm_tts' and stage != 'memory':
-        packages.update({'mlx-lm': None, 'mlx': '0.32.2', 'mlx-audio': '0.5.1'})
-        if platform.system() != 'Darwin' or platform.machine() != 'arm64':
+        if local_router or args.llm == 'local':
+            packages.update({'mlx-lm': None, 'mlx': '0.32.2'})
+        if local_speech:
+            packages.update({'mlx': '0.32.2', 'mlx-audio': '0.5.1'})
+        if (local_speech or local_router or args.llm == 'local') and (platform.system() != 'Darwin' or platform.machine() != 'arm64'):
             errors.append('Breeze MLX 需要原生 Apple Silicon macOS 环境')
     for name, expected in packages.items():
         try:
@@ -93,7 +118,7 @@ def inspect(args, stage="all"):
         'voicemem.html', 'index.html', 'mic-capture-worklet.js',
         'pcm-player-worklet.js', 'images/background.webp')]
     assets.append(('studio/prompt/tts.json', prompt_directory() / 'tts.json'))
-    if args.mode == 'llm_tts' and stage != 'memory':
+    if args.mode == 'llm_tts' and stage != 'memory' and local_speech:
         assets += [(f'voice/{name}', VOICE / name) for name in (
             'noctelle_ref_short.wav', 'noctelle_ref_short.txt')]
     for relative, path in assets:

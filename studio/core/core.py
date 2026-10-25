@@ -56,6 +56,7 @@ def build_app(agent):
         await session_for(agent, socket)
 
     def components_for(active_agent):
+        from studio.core.utils.component_config.component import catalog, public_selections
         memory = active_agent.CONFIG["llm"]
         reply = active_agent.REPLY["llm"]
         memory_provider = memory["provider"]
@@ -78,6 +79,8 @@ def build_app(agent):
                 "base_url": reply["config"].get("base_url", ""),
             },
             "speech": {"provider": active_agent.REPLY["tts"]["provider"]},
+            "bindings": public_selections(),
+            "catalog": catalog(),
         }
 
     app = transport.build_app(

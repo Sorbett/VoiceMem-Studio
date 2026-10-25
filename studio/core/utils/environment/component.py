@@ -14,6 +14,9 @@ def load_environment(root=None):
 
 def prepare(args):
     """Apply the selected backend and shared paths before model imports."""
+    from studio.core.utils.component_config.component import selection, catalog
+    for role in catalog():
+        selection(role)
     from studio.paths import ROOT, MODELS
     # VoiceMem retains its public environment API; Studio supplies that adapter
     # configuration internally so worker subprocesses use the same model roots.

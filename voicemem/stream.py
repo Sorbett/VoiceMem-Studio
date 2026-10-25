@@ -324,6 +324,12 @@ class _AsrWorker:
         while True:
             cmd, arg, fut, epoch = self.q.get()
             if cmd == "stop":
+                close = getattr(self.asr, 'close', None)
+                if close is not None:
+                    try:
+                        close()
+                    except Exception as exc:
+                        print(f'[asr] Decoder close failed: {type(exc).__name__}', flush=True)
                 self.asr = None
                 return
             try:

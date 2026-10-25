@@ -16,6 +16,14 @@ def _streaming_model(kind, device):
 
 def streaming(language="auto"):
     """Default to bilingual FunASR; retain the explicit English adapter."""
+    from studio.core.utils.component_config.component import selection
+    value = selection('asr')
+    if value['provider'] == 'deepgram':
+        from .deepgram import DeepgramASR
+        return DeepgramASR(model=value['model'], base_url=value['baseUrl'],
+                           api_key=value['apiKey'], language=value['language'])
+    if value['provider'] == 'adapter':
+        return _custom_streaming().new_stream()
     from voicemem.utils.audio.asr import pick_device
     from voicemem.engine import device_lock
     kind = "funasr" if language in {"auto", "zh"} else "sherpa"
@@ -39,6 +47,21 @@ def _final_model():
 
 def final():
     """Reuse stateless refinement weights without fixing one input language."""
+    from studio.core.utils.component_config.component import selection
+    if selection('asr_final')['provider'] == 'adapter':
+        return _custom_final()
     from voicemem.engine import TORCH_LOCK
     with TORCH_LOCK:
         return _final_model()
+
+
+@lru_cache(maxsize=1)
+def _custom_streaming():
+    from studio.core.utils.component_config.component import custom
+    return custom('asr')
+
+
+@lru_cache(maxsize=1)
+def _custom_final():
+    from studio.core.utils.component_config.component import custom
+    return custom('asr_final')

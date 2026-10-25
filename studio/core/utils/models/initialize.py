@@ -7,6 +7,9 @@ HF = ('config.json', '*.safetensors')
 
 def models(args, stage="all"):
     """List models for VoiceMem preparation or the complete Studio path."""
+    from studio.core.utils.component_config.component import selection
+    def recommended(role):
+        return selection(role)['provider'] == 'recommended'
     shared = [
         Model('E5 记忆向量', 'embedding', 'intfloat/multilingual-e5-small',
               HF + ('tokenizer.json',), ('*.json', '*.safetensors', '*.model', '1_Pooling/*')),
@@ -28,21 +31,25 @@ def models(args, stage="all"):
               ('config.yaml', 'configuration.json', 'model.pt', 'tokens.txt'),
               ('*.json', '*.yaml', '*.pt', '*.txt', '*.npy')),
     ]
-    shared.append(Model('中英双语流式 ASR',
+    if not recommended('vad'):
+        shared = [model for model in shared if model.name != 'Silero VAD']
+    if not recommended('asr_final'):
+        shared = [model for model in shared if model.name != 'SenseVoice 最终转写']
+    if recommended('asr'):
+        shared.append(Model('中英双语流式 ASR',
                         'asr/funasr-paraformer-zh-streaming',
                         'funasr/paraformer-zh-streaming',
                         ('config.yaml', 'model.pt', 'tokens.json', 'am.mvn', 'seg_dict')))
-    if args.eot:
+    if args.eot and recommended('eot'):
         shared.append(Model('Smart Turn EOT', 'eot', 'pipecat-ai/smart-turn-v3',
                             ('smart-turn-v3.2-cpu.onnx',), ('smart-turn-v3.2-cpu.onnx',)))
     if stage == "memory":
         return shared
     if args.mode == 'llm_tts':
-        shared.extend([
-            Model('三级回复路由', 'reply-router/Qwen3-0.6B', 'Qwen/Qwen3-0.6B',
-                  HF + ('tokenizer.json',), ('*.json', '*.safetensors', '*.txt', '*.jinja')),
-        ])
-        if args.backend == 'cuda':
+        if recommended('router'):
+            shared.append(Model('三级回复路由', 'reply-router/Qwen3-0.6B', 'Qwen/Qwen3-0.6B',
+                                HF + ('tokenizer.json',), ('*.json', '*.safetensors', '*.txt', '*.jinja')))
+        if recommended('speech') and args.backend == 'cuda':
             from studio.core.utils.tts.cuda import model_directory
             from studio.paths import ROOT
             shared.append(Model('Breeze CUDA', str(model_directory()), 'BreezeBlue/breeze-tts-2',
@@ -50,12 +57,14 @@ def models(args, stage="all"):
                                  'tokenizer.json', 'audio_tokenizer/config.json',
                                  'audio_tokenizer/*.safetensors'),
                                 legacy=(str(ROOT.parent / 'breeze-tts-2'), 'tts/breeze-tts-2')))
-        else:
+        elif recommended('speech'):
             shared.append(Model('Breeze MLX', 'tts/Breeze-TTS-2-mlx-4bit',
                                 'mlx-community/Breeze-TTS-2-mlx-4bit', HF + ('tokenizer.json',)))
         if args.llm == 'local':
-            shared.append(Model('本地回复', 'llm/Qwen3.5-4B-4bit', 'mlx-community/Qwen3.5-4B-4bit',
-                                HF + ('tokenizer.json',)))
+            from studio.core.utils.llm.initialize import configuration
+            if configuration('local')['config']['model'] == 'mlx-community/Qwen3.5-4B-4bit':
+                shared.append(Model('本地回复', 'llm/Qwen3.5-4B-4bit', 'mlx-community/Qwen3.5-4B-4bit',
+                                    HF + ('tokenizer.json',)))
     return shared
 
 

@@ -101,4 +101,4 @@ include = ["voicemem*", "studio", "studio.core*", "studio.harness*", "studio.web
 [tool.setuptools.package-data]
 "*" = ["data/*.txt"]
 "voicemem" = ["assets/*.wav"]
-"studio" = ["prompt/*.md", "prompt/*.json"]
+"studio" = ["prompt/*.md", "prompt/*.json", "apps/component-catalog.json"]

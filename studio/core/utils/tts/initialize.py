@@ -14,6 +14,14 @@ def create():
 @lru_cache(maxsize=1)
 def _create():
     """Share one speech provider across Studio memory spaces."""
+    from studio.core.utils.component_config.component import selection, custom
+    value = selection('speech')
+    if value['provider'] == 'adapter':
+        return custom('speech', value)
+    if value['provider'] == 'openai':
+        from voicemem.tts import make_tts
+        return make_tts('openai', model=value['model'], voice=value['voice'],
+                        base_url=value['baseUrl'], api_key=value['apiKey'] or 'not-required')
     if os.environ.get('STUDIO_BACKEND') == 'cuda':
         from .cuda import BreezeCUDATTS
         return BreezeCUDATTS(ref_audio=str(REFERENCE),

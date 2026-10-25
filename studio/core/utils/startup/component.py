@@ -36,8 +36,39 @@ class Startup:
         if not math.isfinite(score) or not 0 <= score <= 1:
             raise RuntimeError('EOT 输出无效分数')
 
+    async def _warm_speech(self):
+        """Validate speech and its voice cache, then release loop-bound API clients."""
+        from studio.core.utils.component_config.component import selection
+        provider = selection('speech')['provider']
+        tts = self.vm.utils.get('tts')
+        language = self.space_language(self.ACTIVE_SPACE)
+        text = '你好，我在这里。' if language == 'zh' else 'Hello, I am here.'
+        try:
+            produced_audio = False
+            async with aclosing(tts.stream(text)) as chunks:
+                async for chunk in chunks:
+                    produced_audio |= bool(getattr(chunk, 'pcm', chunk))
+            if not produced_audio:
+                raise RuntimeError('TTS 未输出音频')
+            if self.ARGS.backchannel:
+                from studio.core.utils.turn_taking.initialize import BackchannelVoice
+                voice = BackchannelVoice(tts, lang=language)
+                if provider == 'recommended':
+                    await voice.prime(cache_only=True)
+                else:
+                    tokens = ('嗯', '明白') if language == 'zh' else ('mm-hmm', 'okay')
+                    await voice.prime(tokens=tokens, variants=1)
+                    if not voice.ready:
+                        raise RuntimeError('自定义音色未生成可用附和音频')
+                self._BC_VOICE['obj'] = voice
+        finally:
+            if provider == 'openai':
+                await tts.aclose()
+
     def warmup(self):
         """Report every failed warmup and refuse to serve a degraded pipeline."""
+        from studio.core.utils.component_config.probe import validate_changed_llms
+        validate_changed_llms(self.ARGS)
         from studio.core.voicemem import memory_warmups
         from studio.core.utils.startup.audio import warmup_audio
         from studio.core.utils.reply_modes.initialize import thinking_router
@@ -51,22 +82,6 @@ class Startup:
             except Exception as exc:
                 failures.append(name)
                 print(f'[startup] {name} 失败：{type(exc).__name__}: {exc}', flush=True)
-
-        async def warm_speech():
-            tts = self.vm.utils.get('tts')
-            text = ('你好，我在这里。' if self.space_language(self.ACTIVE_SPACE) == 'zh'
-                    else 'Hello, I am here.')
-            produced_audio = False
-            async with aclosing(tts.stream(text)) as chunks:
-                async for chunk in chunks:
-                    produced_audio |= bool(getattr(chunk, 'pcm', chunk))
-            if not produced_audio:
-                raise RuntimeError('TTS 未输出音频')
-            if self.ARGS.backchannel:
-                from studio.core.utils.turn_taking.initialize import BackchannelVoice
-                voice = BackchannelVoice(tts, lang=self.space_language(self.ACTIVE_SPACE))
-                await voice.prime(cache_only=True)
-                self._BC_VOICE['obj'] = voice
 
         async def warm_reply():
             self._LOCAL_LLM.prewarm()
@@ -89,7 +104,7 @@ class Startup:
             step('本地回复前缀和首字', lambda: asyncio.run(warm_reply()))
         if self.MODE == 'llm_tts':
             # Warm complete speech after other providers have loaded their weights.
-            step('TTS / 附和缓存', lambda: asyncio.run(warm_speech()))
+            step('TTS / 附和缓存', lambda: asyncio.run(self._warm_speech()))
         if failures:
             raise RuntimeError('模型预热失败：' + '、'.join(failures))
         self._print_backchannel_status()

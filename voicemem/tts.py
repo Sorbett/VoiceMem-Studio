@@ -33,19 +33,25 @@ class BaseTTS:
     async def stream(self, text: str, instruction: str | None = None):
         """Yield speech chunks for text and an optional synthesis instruction."""
         tail = b""
-        async for chunk in self._raw(text, instruction):
-            timed = chunk if isinstance(chunk, TimedAudioChunk) else None
-            raw = timed.pcm if timed is not None else chunk
-            buf = tail + raw
-            cut = len(buf) & -2
-            tail = buf[cut:]
-            if cut:
-                if timed is None:
-                    yield buf[:cut]
-                else:
-                    yield TimedAudioChunk(
-                        pcm=buf[:cut], timestamps=timed.timestamps,
-                        sample_rate=timed.sample_rate)
+        chunks = self._raw(text, instruction)
+        try:
+            async for chunk in chunks:
+                timed = chunk if isinstance(chunk, TimedAudioChunk) else None
+                raw = timed.pcm if timed is not None else chunk
+                buf = tail + raw
+                cut = len(buf) & -2
+                tail = buf[cut:]
+                if cut:
+                    if timed is None:
+                        yield buf[:cut]
+                    else:
+                        yield TimedAudioChunk(
+                            pcm=buf[:cut], timestamps=timed.timestamps,
+                            sample_rate=timed.sample_rate)
+        finally:
+            close = getattr(chunks, 'aclose', None)
+            if close is not None:
+                await close()
         if tail:
             yield tail + b"\x00"
 
@@ -63,6 +69,9 @@ class OpenAITTS(BaseTTS):
         self._key = api_key
         self._base = base_url
         self._client = None
+        import hashlib
+        identity = f'{self._base}|{self.model}|{self.voice}|{self.instructions}'
+        self.cache_voice_id = 'openai:' + hashlib.sha256(identity.encode()).hexdigest()[:20]
 
     def _cli(self):
         if self._client is None:
@@ -74,6 +83,12 @@ class OpenAITTS(BaseTTS):
                 kw["base_url"] = self._base
             self._client = AsyncOpenAI(**kw)
         return self._client
+
+    async def aclose(self):
+        """Release pooled connections before switching loops or shutting down."""
+        client, self._client = self._client, None
+        if client is not None:
+            await client.close()
 
     async def _raw(self, text, instruction=None):
         kw = {"model": self.model, "voice": self.voice,

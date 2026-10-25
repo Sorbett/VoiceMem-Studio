@@ -48,6 +48,21 @@ const en=new Map(pairs),zh=new Map(pairs.map(([a,b])=>[b,a]));
  ['远程服务的模型配置需要在服务器端修改。','Configure models on the remote server.'],
  ['只允许托管的本机后端从 App 重启。','Only an app-managed local backend can be restarted here.'],
  ['拖动组件','Drag component'],['本机','Local'],['本地模型','Local model'],['启动配置','Startup config'],
+ ['流式识别与最终转写','Streaming and final transcription'],['回复与附和共用音色','One voice for replies and acknowledgements'],
+ ['轮次控制','Turn control'],['语音检测、结束判断与思考路由','Speech detection, turn endings and reasoning'],
+ ['流式识别','Streaming recognition'],['最终转写','Final transcription'],['语音检测','Speech detection'],['结束判断','End-of-turn detection'],['思考路由','Reasoning router'],
+ ['待应用','Pending'],['项待应用','pending changes'],['撤销更改','Discard changes'],['应用并重启','Apply and restart'],['正在重启…','Restarting…'],
+ ['接入方式','Provider'],['使用推荐链路','Using the recommended pipeline'],['恢复推荐配置','Restore recommended settings'],['高级','Advanced'],
+ ['自定义适配器','Custom adapter'],['Python 适配器','Python adapter'],['适配器参数','Adapter options'],['音色 ID','Voice ID'],['识别语言','Recognition language'],
+ ['本地模型路径','Local model path'],['模型目录或 Hugging Face ID','Model directory or Hugging Face ID'],['已保存，留空保留','Saved; leave blank to keep'],['请输入 API Key','Enter API key'],
+ ['可选','Optional'],['16 kHz 音频 · 累计转写 · 独立会话','16 kHz audio · Cumulative text · Independent sessions'],['16 kHz 音频 → 完整文本','16 kHz audio → Complete transcript'],
+ ['16 kHz 音频 → 是否说话 · 独立会话','16 kHz audio → Speech detection · Independent sessions'],['16 kHz 音频 → 结束概率','16 kHz audio → End-of-turn probability'],
+ ['思考深度 · 垫话生成 · 可取消','Reasoning depth · Spoken filler · Cancellable'],['流式 PCM16 · 单声道 24 kHz · 可取消','Streaming PCM16 · Mono 24 kHz · Cancellable'],
+ ['结构化记忆提取 · OpenAI Chat 协议','Structured memory extraction · OpenAI Chat protocol'],['流式文本 · 对话历史 · 可取消','Streaming text · Conversation history · Cancellable'],
+ ['首次启用此音色会合成 2 段附和音频。','This voice generates 2 acknowledgement clips on first use.'],
+ ['此服务由外部管理，请在服务器端修改配置。','This service is managed externally. Configure it on the server.'],
+ ['此服务版本不支持组件配置。','This server version does not support component settings.'],['读取失败，请重试。','Could not load. Please retry.'],['重试','Retry'],
+ ['FunASR · 推荐','FunASR · Recommended'],['SenseVoice · 推荐','SenseVoice · Recommended'],['Silero VAD · 推荐','Silero VAD · Recommended'],['Smart Turn · 推荐','Smart Turn · Recommended'],['Qwen3 0.6B · 推荐','Qwen3 0.6B · Recommended'],['Breeze · 推荐','Breeze · Recommended'],['DeepSeek · 推荐','DeepSeek · Recommended'],
  ['外观','Appearance'],['文字','Text'],['对话偏好','Conversation'],['聊天','Chat'],['声音','Voice'],['回答','Answers'],['接话','Turn taking'],['垫话','Backchannels'],
  ['返回组件','Back to components'],['角色设定','Persona prompt'],['角色','Persona'],['选择记忆空间','Choose a Memory Space'],['创建对话','Create conversation'],['当前','Current'],['保存','Save'],['例如：多听我说，别急着给建议。','For example: listen first and do not rush to give advice.'],
  ['选择你喜欢的对话画面。','Choose the conversation view you prefer.'],['调整语言和字号。','Adjust language and text size.'],['查看运行状态或调整布局。','View runtime status or adjust the layout.'],
@@ -191,14 +206,8 @@ function setupHarnessPanel(panel){
 }
 function bindHarness(client){harnessClient=client;if(harnessApi?.requested)harnessApi.activate();else harnessApi?.render();}
 document.addEventListener('self-harness-state',event=>{harnessMessage=event.detail;harnessApi?.render();});
-const COMPONENTS=[
- {id:'input',title:'语音输入',description:'麦克风与流式识别'},
- {id:'memory',title:'记忆系统',description:'记忆检索与整理'},
- {id:'reply',title:'回复模型',description:'流式模型回复'},
- {id:'speech',title:'语音合成',description:'Breeze 本地语音'},
- {id:'pet',title:'桌宠',description:'跟随回复状态'},
-];
 const COMPONENT_ICONS={
+ turn:'<path d="M4 7h10M18 7h2M4 17h2M10 17h10"/><circle cx="16" cy="7" r="2"/><circle cx="8" cy="17" r="2"/>',
  input:'<rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5 11v1a7 7 0 0 0 14 0v-1M12 19v2"/>',
  memory:'<path d="m12 3 9 5-9 5-9-5 9-5ZM3 12l9 5 9-5M3 16l9 5 9-5"/>',
  reply:'<path d="M20 15a3 3 0 0 1-3 3H8l-4 3V6a3 3 0 0 1 3-3h10a3 3 0 0 1 3 3Z"/><path d="M8 9h8M8 13h5"/>',
@@ -207,71 +216,8 @@ const COMPONENT_ICONS={
 };
 const MODEL_DEFAULTS={deepseek:{model:'deepseek-v4-flash',baseUrl:'https://api.deepseek.com'},qwen:{model:'qwen3.6-flash',baseUrl:'https://dashscope-intl.aliyuncs.com/compatible-mode/v1'},openai:{model:'gpt-4o',baseUrl:'https://api.openai.com/v1'},local:{model:'mlx-community/Qwen3.5-4B-4bit',baseUrl:''}};
 function providerName(value){const labels={deepseek:'DeepSeek',qwen:'Qwen',openai:'OpenAI',local:'本地模型',breeze_mlx:'Breeze MLX',breeze_cuda:'Breeze CUDA'};return labels[value]||value||'启动配置';}
-function escapeHtml(value){return String(value??'').replace(/[&<>"']/g,char=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[char]));}
 function setupComponents(container){
- let runtime={},manager={managed:false,services:null},selected='',loaded=false;
- container.innerHTML=`<div class="component-list">${COMPONENTS.map(item=>`<button type="button" class="component-open" data-component="${item.id}"><span class="component-icon"><svg viewBox="0 0 24 24" aria-hidden="true">${COMPONENT_ICONS[item.id]}</svg></span><span class="component-copy"><strong>${item.title}</strong><small>${item.description}</small></span><span class="component-state">本机</span><svg class="component-chevron" viewBox="0 0 24 24" aria-hidden="true"><path d="m9 5 7 7-7 7"/></svg></button>`).join('')}</div>
- <section class="component-editor" aria-labelledby="componentTitle" hidden><header><button type="button" class="component-editor-close" aria-label="返回组件"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m14 6-6 6 6 6"/></svg></button><h3 id="componentTitle"></h3></header><div class="component-editor-body"></div><footer><button type="button" class="component-done">完成</button></footer></section>`;
- const nodes=new Map([...container.querySelectorAll('.component-open')].map(node=>[node.dataset.component,node]));
- const editor=container.querySelector('.component-editor');
- function componentBadge(id){
-  if(id==='input')return runtime.backend?.toUpperCase()||'本机';
-  if(id==='memory')return providerName(runtime.memory?.provider);
-  if(id==='reply')return providerName(runtime.reply?.provider);
-  if(id==='speech')return providerName(runtime.speech?.provider||'breeze_mlx');
-  return 'App';
- }
- function updateBadges(){for(const [id,node] of nodes)node.querySelector('.component-state').textContent=componentBadge(id);}
- function field(label,value,secret=false){return `<div class="component-field"><span>${label}</span><strong class="${secret?'component-secret':''}">${escapeHtml(value)}</strong></div>`;}
- function serviceForm(id){
-  if(!manager.managed)return `<p class="component-reconfigure-note">远程服务的模型配置需要在服务器端修改。</p>`;
-  const service=manager.services?.[id]||runtime[id]||{},local=id==='reply'&&service.provider==='local';
-  const providers=[['deepseek','DeepSeek'],['qwen','Qwen / DashScope'],['openai','OpenAI-compatible'],...(id==='reply'?[['local','本地模型 / MLX']]:[])];
-  return `<form class="component-service-form" data-role="${id}">
-   <label>服务商<select name="provider">${providers.map(([value,label])=>`<option value="${value}"${service.provider===value?' selected':''}>${label}</option>`).join('')}</select></label>
-   <label>模型名称<input name="model" value="${escapeHtml(service.model||'')}" maxlength="300" required${local?' disabled':''}></label>
-   <label>服务地址<input name="baseUrl" type="url" value="${escapeHtml(service.baseUrl||'')}" spellcheck="false"${local?' disabled':' required'}></label>
-   <label>API Key<input name="apiKey" type="password" value="" autocomplete="new-password" placeholder="留空则保留当前 Key"${local?' disabled':''}></label>
-   <p class="component-service-status" role="status" aria-live="polite"></p>
-   <button class="component-service-save" type="submit">保存并重启服务</button>
-  </form>`;
- }
- function bindServiceForm(id){
-  const form=editor.querySelector('.component-service-form');if(!form)return;
-  const provider=form.elements.provider,model=form.elements.model,base=form.elements.baseUrl,key=form.elements.apiKey,status=form.querySelector('.component-service-status'),save=form.querySelector('.component-service-save');
-  provider.onchange=()=>{const value=MODEL_DEFAULTS[provider.value],local=provider.value==='local';model.value=value.model;base.value=value.baseUrl;for(const input of [model,base,key])input.disabled=local;base.required=!local;model.required=!local;};
-  form.onsubmit=async event=>{event.preventDefault();save.disabled=true;status.textContent='正在保存并重启服务…';
-   try{await desktopModels.update(id,{provider:provider.value,model:model.value,baseUrl:base.value,apiKey:key.value});status.textContent='配置已提交，正在等待服务重新就绪。';}
-   catch(error){status.textContent=error.message;save.disabled=false;}
-  };
- }
- function renderEditor(id){
-  selected=id;
-  const item=COMPONENTS.find(value=>value.id===id);if(!item)return;
-  editor.querySelector('h3').textContent=item.title;
-  let rows='';
-  if(id==='input')rows+=field('后端',runtime.backend?.toUpperCase()||'本机')+field('模式','流式输入');
-  if(id==='memory')rows+=field('服务商',providerName(runtime.memory?.provider))+field('API Key',runtime.memory?.configured?'••••••••••••':'未配置',true)+field('模式',runtime.space||'Memory Space');
-  if(id==='reply')rows+=field('服务商',providerName(runtime.reply?.provider))+field('API Key',runtime.reply?.provider==='local'?'不需要':runtime.reply?.configured?'••••••••••••':'未配置',true)+field('模式',runtime.mode||'llm_tts');
-  if(id==='speech')rows+=field('模型',providerName(runtime.speech?.provider||'breeze_mlx'))+field('后端',runtime.backend?.toUpperCase()||'本机');
-  if(id==='pet')rows+=field('管理方式','App 菜单')+field('模式','跟随回复状态');
-  const api=['memory','reply'].includes(id);
-  if(api)rows+=field('模型',runtime[id]?.model||'—');
-  editor.querySelector('.component-editor-body').innerHTML=`${rows}${api?serviceForm(id):''}`;
-  if(api)bindServiceForm(id);
-  editor.hidden=false;container.classList.add('editing');editor.querySelector('.component-editor-close').focus();
- }
- function closeEditor(){const previous=selected;selected='';editor.hidden=true;container.classList.remove('editing');nodes.get(previous)?.focus();}
- for(const [id,node] of nodes)node.onclick=()=>renderEditor(id);
- editor.querySelector('.component-editor-close').onclick=closeEditor;editor.querySelector('.component-done').onclick=closeEditor;
- async function refresh(){
-  if(loaded)return;loaded=true;
-  try{const response=await fetch('/api/components',{cache:'no-store'});if(response.ok)runtime=await response.json();}catch{}
-  if(desktopModels)try{manager=await desktopModels.state();}catch{}
-  updateBadges();if(selected)renderEditor(selected);
- }
- const activate=()=>{void refresh();};
- return{activate};
+ return window.VMComponents.mount(container,{desktop:desktopModels,defaults:MODEL_DEFAULTS,providerName,icons:COMPONENT_ICONS,t,translate});
 }
 function openSettings(){
  opener=document.activeElement;

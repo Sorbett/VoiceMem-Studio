@@ -269,7 +269,8 @@ async function connectManaged(config, { quitOnError = true } = {}) {
     const backend = await runtime.startManagedBackend(
       config.projectDir, config.memoryProvider, config.replyProvider, {
         signal: control.signal,
-        env: runtime.modelServiceEnvironment(process.env, config.services),
+        env: runtime.modelServiceEnvironment({...process.env,
+          STUDIO_VALIDATE_SERVICES: JSON.stringify(config.validationRoles || [])}, config.services),
       },
     );
     ownedBackend = backend;
@@ -453,20 +454,22 @@ else {
       try { assertStudio(event); if (typeof message === 'string') pet?.notifyConversationError(message.slice(0, 300)); }
       catch { /* Ignore messages from stale or unrelated pages. */ }
     });
-    ipcMain.handle('studio-desktop:update-model-service', (event, role, value) => {
+    function updateServices(event, updates) {
       assertStudio(event);
       if (!managedConfiguration) throw new Error('远程服务需要在服务器端修改模型配置。');
       if (reconfiguring) throw new Error('模型服务正在重启，请稍候。');
       const previous = managedConfiguration;
-      const services = runtime.updateModelService(previous.services, role, value);
+      const services = runtime.updateModelServices(previous.services, updates);
       const next = { ...previous, memoryProvider: services.memory.provider,
-        replyProvider: services.reply.provider, services };
+        replyProvider: services.reply.provider, services,
+        validationRoles: Object.keys(updates).filter(role => ['memory','reply'].includes(role)) };
       reconfiguring = true;
       setImmediate(() => { void (async () => {
         try {
           managedConfiguration = next;
           const ready = await connectManaged(next, { quitOnError: false });
           if (ready) {
+            managedConfiguration = { ...next, validationRoles: [] };
             try {
               await runtime.saveModelServices(modelServicesFile, services, protectSecret);
             } catch (error) {
@@ -484,7 +487,9 @@ else {
         }
       })(); });
       return { restarting: true, services: runtime.publicModelServices(services) };
-    });
+    }
+    ipcMain.handle('studio-desktop:update-model-service', (event, role, value) => updateServices(event, { [role]: value }));
+    ipcMain.handle('studio-desktop:apply-model-services', updateServices);
     if (configError && managedMode) {
       dialog.showErrorBox('VoiceMem Studio 启动配置无效', configError);
       app.quit();

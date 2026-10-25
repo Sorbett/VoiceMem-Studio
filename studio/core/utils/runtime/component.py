@@ -71,6 +71,10 @@ def configure(self, args):
     memory_llm = configuration(memory_provider, "memory")
     memory_llm["config"]["api_key"] = memory_key
     tts_provider = "breeze_cuda" if args.backend == "cuda" else "breeze_mlx"
+    from studio.core.utils.component_config.component import selection
+    speech = selection('speech')
+    if speech['provider'] != 'recommended':
+        tts_provider = speech['provider']
     self.CONFIG = {
         "mode": "multi_modal", "memory_root": args.memory_root,
         "space": args.space, "embedding": {"provider": "local"},

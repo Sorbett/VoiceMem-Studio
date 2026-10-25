@@ -126,6 +126,13 @@ def openai_reply(model: str | None = None, api_key: str | None = None,
         finally:
             await stream.close()
 
+    async def close():
+        nonlocal client
+        old, client = client, None
+        if old is not None:
+            await old.close()
+
+    fn.aclose = close
     return fn
 
 

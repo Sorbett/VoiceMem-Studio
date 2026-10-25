@@ -6,7 +6,11 @@ from .component import FAST, MEDIUM, SLOW, THINKING_LEVELS, QwenThinkingRouter, 
 
 @lru_cache(maxsize=1)
 def thinking_router():
-    """Return the process router with fixed local model selection."""
+    """Return the recommended router or an adapter retaining filler generation."""
+    from studio.core.utils.component_config.component import selection, custom
+    value = selection('router')
+    if value['provider'] == 'adapter':
+        return custom('router', value)
     backend = os.environ.get('STUDIO_ROUTER_BACKEND') or (
         'mlx' if os.environ.get('STUDIO_BACKEND') == 'mlx' else 'torch')
     if backend == 'mlx':

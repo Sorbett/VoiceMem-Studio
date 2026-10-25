@@ -74,16 +74,33 @@ body[data-style=technical] .settings-page{background:#0007;color-scheme:dark}
 .component-field strong{max-width:70%;overflow-wrap:anywhere;text-align:right;font-weight:500}
 .component-secret{letter-spacing:.08em}
 .component-reconfigure-note{margin:18px 0;color:var(--setting-muted);font-size:.76em;line-height:1.6}
-.component-editor footer{display:flex;justify-content:flex-end;margin-top:22px}
-.component-done,.component-service-save{padding:9px 15px;border:1px solid var(--setting-edge);border-radius:var(--vm-radius);background:var(--setting-accent-soft);color:var(--vm-accent-ink);font:inherit;font-size:.8em;cursor:pointer}
-.component-done:hover,.component-service-save:hover{background:var(--vm-hover)}
-.component-service-form{display:grid;gap:16px;margin:22px 0 0;padding:20px;border:1px solid var(--setting-edge);border-radius:var(--vm-card-radius);background:var(--setting-card)}
+.component-service-save{padding:9px 15px;border:1px solid var(--setting-edge);border-radius:var(--vm-radius);background:var(--setting-accent-soft);color:var(--vm-accent-ink);font:inherit;font-size:.8em;cursor:pointer}
+.component-service-save:hover{background:var(--vm-hover)}
+.component-service-form{margin:0;padding:0;border:0;background:transparent}
 .component-service-form label{display:grid;gap:7px;color:var(--setting-muted);font-size:.8em}
 .component-service-form input,.component-service-form select{box-sizing:border-box;width:100%;min-width:0;padding:10px 12px;border:1px solid var(--setting-edge);border-radius:var(--vm-radius);background:var(--setting-bg);color:var(--setting-ink);font:inherit}
 .component-service-form input:disabled{opacity:.62}
 .component-service-save:disabled{cursor:wait;opacity:.6}
 .component-service-status{margin:0;color:var(--setting-muted);font-size:.76em;line-height:1.5}
 .component-service-status:empty{display:none}
+.component-load{margin:0 0 16px;color:var(--setting-muted);font-size:.8em}
+.component-state.pending{color:var(--setting-accent)}
+.component-subtabs{display:flex;flex-wrap:wrap;gap:6px;margin:0 0 22px}
+.component-subtabs button{padding:8px 12px;border:1px solid transparent;border-radius:var(--vm-radius);background:transparent;color:var(--setting-muted);font:inherit;font-size:.8em;cursor:pointer}
+.component-subtabs button[aria-pressed=true]{border-color:var(--setting-edge);background:var(--setting-card);color:var(--setting-ink)}
+.component-contract{margin:0 0 16px;color:var(--setting-muted);font-size:.75em;line-height:1.6}
+.component-service-form fieldset{display:grid;gap:18px;min-width:0;margin:0;padding:0;border:0}
+.component-service-form textarea{box-sizing:border-box;width:100%;min-width:0;padding:10px 12px;border:1px solid var(--setting-edge);border-radius:var(--vm-radius);background:var(--setting-bg);color:var(--setting-ink);font:12px/1.6 ui-monospace,monospace;resize:vertical}
+.component-recommended{display:flex;align-items:center;gap:8px;margin:20px 0;color:var(--setting-muted);font-size:.8em}
+.component-recommended>span:first-child{display:grid;place-items:center;width:21px;height:21px;border-radius:50%;background:var(--setting-accent-soft);color:var(--setting-accent)}
+.component-reset{margin:20px 0 0;padding:0;border:0;background:transparent;color:var(--setting-muted);font:inherit;font-size:.75em;cursor:pointer}
+.component-reset:hover{color:var(--setting-ink)}
+.component-reset:disabled{opacity:.5;cursor:wait}
+.component-apply{position:sticky;bottom:-24px;display:flex;flex-wrap:wrap;align-items:center;gap:10px;margin-top:24px;padding:14px 0 2px;border-top:1px solid var(--setting-edge);background:var(--setting-bg)}
+.component-change-count{flex:1;color:var(--setting-muted);font-size:.75em}
+.component-discard{padding:9px 0;border:0;background:transparent;color:var(--setting-muted);font:inherit;font-size:.75em;cursor:pointer}
+.component-global-status{flex-basis:100%;margin:0}
+.component-settings [hidden]{display:none!important}
 
 .harness-controls{display:grid;gap:26px}
 .harness-group h3{margin:0 0 10px;color:var(--setting-muted);font-size:.78em;font-weight:550}
@@ -148,7 +165,6 @@ body[data-style=technical] .settings-page{background:#0007;color-scheme:dark}
   .component-icon svg{width:18px;height:18px}
   .component-copy small{font-size:.7em}
   .component-state{max-width:26%;font-size:.7em}
-  .component-service-form{padding:16px}
   .harness-control{padding:14px 12px;gap:10px}
   .harness-row-value{gap:5px}
   .harness-option{padding:6px 7px;font-size:.72em}

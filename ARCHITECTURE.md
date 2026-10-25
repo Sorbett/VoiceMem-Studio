@@ -283,18 +283,26 @@ integer per-turn targets while preserving their expectation; the shared
 first-six-second cap and the refractory cooldown still apply. Preset Self Harness
 values provide the initial curve, while an explicit user curve is scoped to the
 current conversation and is reflected in subsequent snapshots. The component
-settings tab presents input, memory, reply, speech, and pet as a list with shared
+settings tab presents input, memory, reply, speech, turn control, and pet as a list with shared
 icons and provider labels. Selecting a row opens its configuration; returning
 restores keyboard focus to that row. Components cannot be removed, and this
 panel does not write layout preferences. `/ui` responses use `Cache-Control: no-store`, and the entry pages
 version their settings assets so an Electron reload cannot retain an older
 settings implementation after an update. `/api/components` supplies non-secret provider, model, endpoint, and
 readiness labels. For an App-owned backend, a narrowly scoped isolated preload
-allows the main-frame settings page to update the memory or reply model service
-and request a supervised backend restart. The main process validates endpoints,
+allows the main-frame settings page to stage multiple component changes and
+apply them with one supervised backend restart. Current model selections remain
+the recommended defaults. Memory and reply retain their supported Chat API
+providers; streaming ASR also supports Deepgram Listen v1, and speech supports
+the existing OpenAI-compatible PCM adapter. Advanced component selections use
+explicitly installed Python factories with checked Harness contracts. The main process validates endpoints,
 keeps keys out of command arguments and backend responses, and encrypts persisted
 keys with Electron `safeStorage`. A new configuration is persisted only after its
-backend becomes ready; failure restarts the previous configuration. Existing or
+backend becomes ready; failure restarts the previous configuration. Startup
+exercises the selected components, and changed remote memory/reply services
+receive a disposable streaming connection check without conversation or memory
+context. Draft keys remain only in the settings instance until submitted; public
+manifests never contain keys. Existing or
 remote services remain read-only because their lifecycle belongs to the server.
 Before replacing an App-owned backend, Electron waits for the old child to exit
 so the replacement does not race it for port 8787. Failed replacements also
@@ -657,20 +665,42 @@ one writer and one task-local trace context.
 
 `studio/core/voicemem.py::open_memory` composes the existing ASR, reply and speech
 implementations. Each component's `initialize.py` owns its defaults and construction;
-the bridge passes the resulting reply callable and ASR/TTS factories into VoiceMem.
+the bridge passes the resulting reply callable and ASR/VAD/TTS factories into VoiceMem.
 Replacement implementations use the same contracts:
 
 | Component | Existing boundary | State ownership |
 | --- | --- | --- |
 | Streaming ASR | `feed`, `flush`, `reset`, `text`; `new_stream` for independent decoders | Decoder state per connection; reusable model weights |
 | Final ASR | `transcribe(audio)` | Refinement adapter; VoiceStream owns scheduling and stale-result guards |
+| VAD | `is_speech(samples)`; `new_stream` | Fast synchronous detection; decoder state per connection |
+| EOT | `score(audio)` and `threshold` | Existing background probe and stale-result guards |
+| Thinking router | `classify_async`, `generate_short_text_async`, `warmup` | Shared adapter; Conversation owns route and spoken-filler tasks |
 | Reply LLM | Async callable accepting text, memory context and history, yielding text deltas | Request generation; Conversation owns dialogue state |
 | TTS | `stream(text, instruction)`, yielding PCM or timed audio chunks | Provider synthesis; Conversation owns playback and interruption |
 
-No additional plugin registry or abstract interface is required. Provider credentials,
-model acquisition and warmup belong to the selected implementation's initialization,
-not memory retrieval or turn policy. The built-in startup manifest describes the
-default implementations; replacing one also requires its matching readiness checks.
+`studio/apps/component-catalog.json` describes optional bindings and defaults for
+both the desktop and backend. `studio/core/utils/component_config/` validates
+startup-only `STUDIO_COMPONENTS` selections, imports explicitly selected installed
+factories, and checks their existing contracts. Role-specific API keys use
+separate environment variables; editable JSON options cannot contain credential
+fields. These selections do not mutate active models or conversation state.
+Provider credentials, model acquisition and warmup belong to the selected
+implementation's initialization, not memory retrieval or turn policy. The model
+manifest skips only replaced component weights; memory perception models remain
+independently required. Custom native adapters must retain engine scheduling
+and existing lock boundaries. Adapter contracts are documented beside the loader.
+
+Deepgram sockets belong to connection-owned ASR workers. The adapter combines
+interim and finalized segments into cumulative text, disables provider endpointing,
+and leaves final turn confirmation and independent final-ASR refinement to Harness.
+Reset discards decoder text and closes its socket; worker shutdown closes the
+transport without affecting sibling connections. Network work stays on that
+worker. API speech preserves cancellable mono PCM16 at 24 kHz. Closing a shared
+speech stream also closes its provider stream. API clients used during startup
+are released before the server event loop starts. Speech backchannel caches are
+scoped to endpoint, model and voice/configuration. Recommended speech keeps its
+reviewed cache-only bank; a newly selected speech provider primes two bounded
+backchannel clips, reuses cached clips, and must be ready before startup succeeds.
 
 ## 4. Mode and provider model
 

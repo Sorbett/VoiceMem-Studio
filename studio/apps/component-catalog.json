@@ -1,0 +1,52 @@
+{
+  "asr": {
+    "title": "流式识别",
+    "contract": "16 kHz 音频 · 累计转写 · 独立会话",
+    "providers": {
+      "recommended": {"label": "FunASR · 推荐"},
+      "deepgram": {"label": "Deepgram", "model": "nova-3", "baseUrl": "https://api.deepgram.com/v1", "language": "zh"},
+      "adapter": {"label": "自定义适配器"}
+    }
+  },
+  "asr_final": {
+    "title": "最终转写",
+    "contract": "16 kHz 音频 → 完整文本",
+    "providers": {
+      "recommended": {"label": "SenseVoice · 推荐"},
+      "adapter": {"label": "自定义适配器"}
+    }
+  },
+  "vad": {
+    "title": "语音检测",
+    "contract": "16 kHz 音频 → 是否说话 · 独立会话",
+    "providers": {
+      "recommended": {"label": "Silero VAD · 推荐"},
+      "adapter": {"label": "自定义适配器"}
+    }
+  },
+  "eot": {
+    "title": "结束判断",
+    "contract": "16 kHz 音频 → 结束概率",
+    "providers": {
+      "recommended": {"label": "Smart Turn · 推荐"},
+      "adapter": {"label": "自定义适配器"}
+    }
+  },
+  "router": {
+    "title": "思考路由",
+    "contract": "思考深度 · 垫话生成 · 可取消",
+    "providers": {
+      "recommended": {"label": "Qwen3 0.6B · 推荐"},
+      "adapter": {"label": "自定义适配器"}
+    }
+  },
+  "speech": {
+    "title": "语音合成",
+    "contract": "流式 PCM16 · 单声道 24 kHz · 可取消",
+    "providers": {
+      "recommended": {"label": "Breeze · 推荐"},
+      "openai": {"label": "OpenAI-compatible", "model": "gpt-4o-mini-tts", "baseUrl": "https://api.openai.com/v1", "voice": "alloy"},
+      "adapter": {"label": "自定义适配器"}
+    }
+  }
+}

@@ -18,7 +18,8 @@ def credential(provider, purpose):
     """Resolve a role-specific key before falling back to provider conventions."""
     import os
     role = "VOICEMEM_MEMORY_API_KEY" if purpose == "memory" else "VOICEMEM_STUDIO_API_KEY"
-    return os.environ.get(role) or os.environ.get(credential_name(provider), "")
+    return (os.environ[role] if role in os.environ
+            else os.environ.get(credential_name(provider), ""))
 
 def configuration(provider=PROVIDER, purpose="reply"):
     """Return the selected role's non-secret provider settings."""
@@ -37,9 +38,9 @@ def configuration(provider=PROVIDER, purpose="reply"):
         "system": "",
     }}
 
-def create(system, provider=PROVIDER, api_key=None):
+def create(system, provider=PROVIDER, api_key=None, *, purpose="reply"):
     """Create the selected stream adapter; missing credentials raise immediately."""
-    cfg = configuration(provider, "reply")["config"]
+    cfg = configuration(provider, purpose)["config"]
     if provider == "local":
         from .local import LocalLLM
         from pathlib import Path
@@ -49,7 +50,7 @@ def create(system, provider=PROVIDER, api_key=None):
         return LocalLLM(str(bundled if model == "mlx-community/Qwen3.5-4B-4bit" else Path(model)),
                         system=system, context_as_system=True)
     from voicemem.reply import deepseek_reply, openai_reply
-    cfg["api_key"] = api_key or credential(provider, "reply")
+    cfg["api_key"] = api_key or credential(provider, purpose)
     cfg["context_as_system"] = True
     if provider == "qwen":
         if not cfg["api_key"]:
