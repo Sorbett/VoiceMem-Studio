@@ -44,7 +44,7 @@ class Reply:
 
         def build():
             from voicemem.engine import background_scope
-            with background_scope(None), self._REPLY_DISPLAY_LOCK:
+            with background_scope(None, cancelled=cancelled.is_set), self._REPLY_DISPLAY_LOCK:
                 if cancelled.is_set() or self.ACTIVE_SPACE != space or self.vm is not memory_vm:
                     return None
                 return self.fill_tags(
@@ -132,7 +132,9 @@ class Reply:
             self._note_replay(pending.replay)
             await send({"type": "play_memory", "memory_id": pending.replay})
         await send({"type": "answer_start", "output_id": timeline.output_id,
-                    "sample_rate": timeline.sample_rate})
+                    "sample_rate": timeline.sample_rate,
+                    **({"caption_sync": "playback"}
+                       if getattr(timeline, "context_managed", False) else {})})
 
         _t0 = time.monotonic()
         _lat = {"llm": 0.0, "seg": 0.0, "audio": 0.0, "pre": 0.0}
@@ -151,6 +153,9 @@ class Reply:
         text_queue: asyncio.Queue = asyncio.Queue()
 
         tts = speech_provider if speech_provider is not None else memory_vm.utils.get("tts")
+        from studio.core.utils.tts.buffering import PCMBuffer
+        from studio.web.audio_flow import PlaybackBudget
+        timeline.delivery_budget = PlaybackBudget()
         from voicemem.lang import detect_language
         language = getattr(pending, "language", "") or getattr(self, "SPACE_LANG", "zh")
         control = {"head": True, "buf": ""}
@@ -193,19 +198,22 @@ class Reply:
             except TypeError:
                 return tts.stream(seg)
 
-        synths: list[asyncio.Task] = []
+        synths: set[asyncio.Task] = set()
         streams: asyncio.Queue = asyncio.Queue()
+        # Hold each slot through delivery, not merely through native synthesis.
+        segment_slots = asyncio.Semaphore(2)
 
         _serial = asyncio.Semaphore(1) if getattr(tts, "SERIAL", False) else None
 
         async def synth():
             while (spec := await queue.get()) is not None:
+                await segment_slots.acquire()
                 seg, text_start, text_end = spec
-                chunks: asyncio.Queue = asyncio.Queue()
+                chunks = PCMBuffer(timeline.sample_rate)
                 state = {"complete": False, "queued": time.monotonic(), "first": False}
 
                 async def run(seg=seg, text_start=text_start, chunks=chunks, state=state):
-
+                    failure = None
                     try:
                         if _serial is not None:
                             await _serial.acquire()
@@ -232,11 +240,12 @@ class Reply:
                         print(f"[web] 合成失败：{type(e).__name__}", flush=True)
                         failure = SpeechSynthesisError("TTS segment failed")
                         failure.__cause__ = e
-                        await chunks.put(failure)
                     finally:
-                        await chunks.put(None)
+                        chunks.close(failure)
 
-                synths.append(asyncio.create_task(run()))
+                task = asyncio.create_task(run())
+                synths.add(task)
+                task.add_done_callback(synths.discard)
                 await streams.put((seg, text_start, text_end, chunks, state))
             await streams.put(None)
 
@@ -298,6 +307,8 @@ class Reply:
                 else:
                     timeline.finish_segment(
                         segment_id, complete=state["complete"])
+                finally:
+                    segment_slots.release()
 
         async def segment_text():
             from studio.core.utils.tts.segmentation import SpeechBuffer
@@ -476,6 +487,9 @@ class Reply:
                         await consume_tone("", final=True)
                     if timeline.source_text is not None:
                         emit_speech("", final=True)
+                    if getattr(timeline, "context_managed", False):
+                        await send({"type": "answer_text_done",
+                                    "output_id": timeline.output_id})
                 finally:
                     text_queue.put_nowait(None)
 

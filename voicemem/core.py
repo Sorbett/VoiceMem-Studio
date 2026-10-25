@@ -84,6 +84,16 @@ class VoiceMem:
             kw.setdefault("speaker", "user")
         return self._o.Ingest(text, audio_path=audio, **kw)
 
+    def ingest_ordered(self, text=None, audio=None, *, wait_for_previous, **kw):
+        """Prepare perception now and wait before fact analysis and writes.
+
+        wait_for_previous is a synchronous barrier called outside native locks.
+        With async_facts=True, ingest returns perception metadata while the captured
+        worker waits. Returns the normal ingest result and preserves its completion
+        callback and exception behavior. Preparation errors propagate to the caller.
+        """
+        return self.ingest(text, audio, before_facts=wait_for_previous, **kw)
+
     def transcribe(self, audio) -> str:
         """Transcribe a file with the configured ASR capability, reusing its loaded model."""
         from voicemem.utils.audio.stream_io import transcribe_file

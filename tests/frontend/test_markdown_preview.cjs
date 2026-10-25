@@ -6,32 +6,22 @@ const { test } = require('node:test');
 
 const source = fs.readFileSync(path.join(__dirname, '../../studio/apps/ui/markdown.js'), 'utf8');
 
-function environment({ math = false, mathFails = false } = {}) {
-  class Node {
-    constructor(tag, text = '') {
-      this.tag = tag; this.children = []; this.text = text; this.attributes = {};
-      this.isConnected = true;
-      this.classList = { add() {} };
+function environment({ math = false, mathFails = false, reduced = false } = {}) {
+  const {Node} = require('../helpers/dom.cjs');
+  const frames = new Map(); let next = 0, creations = 0;
+  const mathCalls = [], animations = [];
+  class PreviewNode extends Node {
+    animate(keyframes, options) {
+      const animation = {node:this,keyframes,options,cancelled:false,
+        cancel(){this.cancelled=true;},finish(){this.onfinish?.();}};
+      animations.push(animation); return animation;
     }
-    append(...nodes) {
-      for (const node of nodes) {
-        if (node.tag === '#fragment') this.append(...node.children);
-        else this.children.push(node);
-      }
-    }
-    replaceChildren(...nodes) { this.text = ''; this.children = []; this.append(...nodes); }
-    set textContent(text) { this.text = String(text); this.children = []; }
-    get textContent() { return this.text + this.children.map(child => child.textContent).join(''); }
-    setAttribute(key, value) { this.attributes[key] = value; }
     cloneNode(deep) {
-      const copy = new Node(this.tag, this.text);
-      copy.attributes = { ...this.attributes }; copy.className = this.className;
-      if (deep) copy.children = this.children.map(child => child.cloneNode(true));
+      const copy = new PreviewNode(this.tag); copy.data = this.data; copy.attrs = {...this.attrs};
+      if (deep) copy.append(...this.children.map(child => child.cloneNode(true)));
       return copy;
     }
   }
-  const frames = new Map(); let next = 0;
-  const mathCalls = [];
   const window = {};
   if (math) window.katex = { render(text, node, options) {
     mathCalls.push({ text, options });
@@ -41,16 +31,18 @@ function environment({ math = false, mathFails = false } = {}) {
   const context = vm.createContext({
     URL, location: { href: 'https://fixture.test/' }, window,
     document: {
-      createElement: tag => new Node(tag),
-      createTextNode: text => new Node('#text', text),
-      createDocumentFragment: () => new Node('#fragment'),
+      createElement: tag => { creations++; return new PreviewNode(tag); },
+      createTextNode: text => new PreviewNode('#text', text),
+      createDocumentFragment: () => new PreviewNode('#fragment'),
     },
     requestAnimationFrame: fn => { frames.set(++next, fn); return next; },
     cancelAnimationFrame: id => frames.delete(id),
+    matchMedia: () => ({matches:reduced}),
   });
   vm.runInContext(source, context);
   return {
-    host: new Node('div'), render: context.window.VMMarkdown.render, frames, mathCalls,
+    node: () => new PreviewNode('div'), host: new PreviewNode('div'), render: context.window.VMMarkdown.render, frames, mathCalls, animations,
+    get creations() { return creations; },
     flush() { const jobs = [...frames.values()]; frames.clear(); jobs.forEach(fn => fn()); },
   };
 }
@@ -117,6 +109,88 @@ test('completion/reset cancels stale streaming paints', () => {
   e.render(e.host, '');
   e.flush();
   assert.equal(e.host.textContent, '');
+});
+
+test('reply reveals fade only appended text and restore the original text node', () => {
+  const e=environment(), options={streaming:true,reveal:true};
+  e.render(e.host,'第一句。',options);e.flush();
+  const paragraph=e.host.children[0], prefix=paragraph.children[0];
+  assert.equal(e.animations.length,1);
+  assert.equal(e.animations[0].node,paragraph);
+  assert.equal(e.animations[0].options.duration,180);
+  e.animations[0].finish();
+  e.render(e.host,'第一句。第二句。',options);e.flush();
+  const second=e.animations[1];
+  assert.equal(e.host.children[0],paragraph);
+  assert.equal(paragraph.children[0],prefix);
+  assert.equal(prefix.data,'第一句。');
+  assert.equal(second.node.textContent,'第二句。');
+  assert.notEqual(second.node,paragraph);
+  assert.equal(e.host.textContent,'第一句。第二句。');
+  second.finish();
+  assert.equal(paragraph.children.length,1);
+  assert.equal(paragraph.children[0],prefix);
+  assert.equal(prefix.data,'第一句。第二句。');
+  e.render(e.host,'第一句。第二句。第三句。',options);e.flush();
+  e.render(e.host,'第一句。第二句。第三句。第四句。',options);e.flush();
+  assert.equal(e.animations[2].cancelled,true);
+  assert.equal(e.animations[3].node.textContent,'第四句。');
+  e.render(e.host,'第一句。第二句。第三句。第四句。');
+  assert.equal(e.animations[3].cancelled,true);
+  assert.equal(paragraph.children.length,1);
+  assert.equal(paragraph.textContent,'第一句。第二句。第三句。第四句。');
+});
+
+test('formatted reveals preserve existing nodes and never animate history or interruption corrections', () => {
+  const e=environment(), options={streaming:true,reveal:true};
+  e.render(e.host,'**第一句。**',options);e.flush();
+  const paragraph=e.host.children[0], strong=tags(e.host,'strong')[0];
+  e.render(e.host,'**第一句。** *第二句。*\n\n- 新条目',options);e.flush();
+  assert.equal(e.host.children[0],paragraph);
+  assert.equal(tags(e.host,'strong')[0],strong);
+  assert.equal(tags(e.host,'em')[0].textContent,'第二句。');
+  assert.equal(tags(e.host,'li')[0].textContent,'新条目');
+  assert.ok(e.animations.slice(1).every(animation=>!animation.node.textContent.includes('第一句。')));
+  const count=e.animations.length;
+  e.render(e.host,'**第一句。**',{streaming:true});e.flush();
+  assert.equal(e.animations.length,count);
+  assert.equal(e.host.textContent,'第一句。');
+  assert.ok(e.animations.every(animation=>animation.cancelled));
+  const history=e.node();
+  e.render(history,'**第一句。** *第二句。*',{streaming:true});e.flush();
+  assert.equal(e.animations.length,count);
+  e.render(e.host,'旧回复追加',options);
+  e.render(e.host,'');e.flush();
+  assert.equal(e.host.textContent,'');
+  assert.equal(e.animations.length,count);
+});
+
+test('reduced motion and browsers without element animation render replies immediately', () => {
+  for (const reduced of [false,true]) {
+    const e=environment({reduced});
+    if (!reduced) e.host.animate=undefined;
+    e.render(e.host,'第一句。',{streaming:true,reveal:true});e.flush();
+    e.render(e.host,'第一句。第二句。',{streaming:true,reveal:true});e.flush();
+    assert.equal(e.animations.length,0);
+    assert.equal(e.host.textContent,'第一句。第二句。');
+    assert.equal(tags(e.host,'span').length,0);
+  }
+});
+
+test('coalesced live-caption and history reveals keep independent animation ownership', () => {
+  const e=environment(), second=e.node(), options={streaming:true,reveal:true};
+  e.render(e.host,'第一句',options);
+  e.render(e.host,'第一句。第二句。',options);
+  e.render(e.host,'第一句。第二句。',{streaming:true});
+  e.render(second,'第一句。第二句。',options);e.flush();
+  assert.equal(e.animations.length,2);
+  assert.equal(e.animations[0].node.textContent,'第一句。第二句。');
+  assert.notEqual(e.animations[0].node,e.animations[1].node);
+  e.render(e.host,'');
+  assert.equal(e.animations[0].cancelled,true);
+  assert.equal(e.animations[1].cancelled,false);
+  e.animations[1].finish();
+  assert.equal(second.textContent,'第一句。第二句。');
 });
 
 test('detached chat nodes are not painted and callbacks run after paint', () => {
@@ -224,4 +298,75 @@ test('bundled KaTeX typesets attention and rejects trusted HTML/resource command
     assert(!/style=["'][^"']*position:fixed/.test(rendered));
   }
   assert.throws(() => katex.renderToString(String.raw`\def\a{\a}\a`, options), /expansion/);
+});
+
+test('streamed appends preserve completed blocks and the active paragraph DOM', () => {
+  const e = environment();
+  e.render(e.host,'**Stable** prefix.\n\nGrowing', {streaming:true}); e.flush();
+  const prefix = e.host.children[0], paragraph = e.host.children[1], text = paragraph.children[0];
+  for (let i = 1; i <= 30; i++) {
+    e.render(e.host,'**Stable** prefix.\n\nGrowing' + '.'.repeat(i), {streaming:true}); e.flush();
+    assert.equal(e.host.children[0],prefix);
+    assert.equal(e.host.children[1],paragraph);
+    assert.equal(paragraph.children[0],text);
+  }
+  assert.equal(paragraph.textContent,'Growing'+'.'.repeat(30));
+});
+
+test('the live caption and history reuse parsing with independent DOM ownership', () => {
+  const e = environment(), second = e.node();
+  const value = 'A **formatted** reply.\n\nTail';
+  e.render(e.host,value,{streaming:true}); e.flush();
+  const parsed = e.creations;
+  e.render(second,value,{streaming:true}); e.flush();
+  assert.equal(e.creations,parsed);
+  assert.notEqual(e.host.children[0],second.children[0]);
+  assert.equal(e.host.textContent,second.textContent);
+  const first = e.host.children[0];
+  e.render(e.host,value,{streaming:true});
+  assert.equal(e.frames.size,0);
+  assert.equal(e.host.children[0],first);
+  second.replaceChildren();
+  e.render(second,value,{streaming:true}); e.flush();
+  assert.equal(e.host.children[0],first);
+  assert.equal(second.textContent,e.host.textContent);
+});
+
+test('partial table/list syntax and final open markers match a fresh final parse', () => {
+  const e = environment(), fresh = e.node();
+  const cases = [
+    ['- item\n','- item\n- second'],
+    ['A | B\n','A | B\n--- | ---\n1 | 2'],
+    ['**open','**open'],
+    ['text\n\n','text\n\n> quote\n> next'],
+    ['```js\nx\n','```js\nx\n```\n\nend'],
+  ];
+  const shape = node => [node.tag,node.textContent,node.children.map(shape)];
+  for (const [partial,final] of cases) {
+    e.render(e.host,partial,{streaming:true});e.flush();
+    e.render(e.host,final,{streaming:true});e.flush();
+    e.render(e.host,final);e.render(fresh,final);
+    assert.deepEqual(shape(e.host),shape(fresh));
+  }
+});
+
+test('incremental Markdown prefixes match independent fresh streaming parses', () => {
+  const e=environment(), fresh=environment();
+  const samples=[
+    '# Title\n\nplain **strong** and *open',
+    '- first\n  - nested\n- next\n\nAfter',
+    '| A | B |\n| --- | --- |\n| one | two |\n\nEnd',
+    '> quote\n> next\n\n```js\nx < 1\n```\n\nEnd',
+    'Math $x^2$\n\n\\[x+y\\]\n\n[link](https://example.test/a(b))',
+  ];
+  const shape=node=>[node.tag,{...node.attrs},node.nodeType===3?node.data:'',node.children.map(shape)];
+  for (const sample of samples) {
+    e.render(e.host,'');
+    for (let end=1;end<=sample.length;end++) {
+      const prefix=sample.slice(0,end);
+      e.render(e.host,prefix,{streaming:true});e.flush();
+      fresh.render(fresh.host,'');fresh.render(fresh.host,prefix,{streaming:true});fresh.flush();
+      assert.deepEqual(shape(e.host),shape(fresh.host),prefix);
+    }
+  }
 });

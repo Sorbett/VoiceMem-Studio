@@ -95,6 +95,10 @@ class BreezeMLXTTS:
 
             self._reference_cache = ReferencePromptCache(
                 m, prefix_kv=True)
+            checks = [fn.snapshot() for fn in depth.functions.values()
+                      if hasattr(fn, 'snapshot')]
+            depth_note = (f", verified_depth={sum(item['enabled'] for item in checks)}/{len(checks)}"
+                          if checks else "")
             note = ""
             if self.ref_audio and self._reference_cache.prefix_kv:
                 import time as _t
@@ -105,7 +109,7 @@ class BreezeMLXTTS:
                 note = (f", prefix_kv={self._reference_cache.prefix_len} tok"
                         f" (err {err:.1e}, {(_t.perf_counter()-t0)*1000:.0f}ms)"
                         if ok else f", prefix_kv OFF (mismatch err {err:.1e})")
-            print(f"[tts] Breeze MLX ready: {self.voice}, depth={self.depth_mode}, chunk={self.chunk_frames} frames{note}", flush=True)
+            print(f"[tts] Breeze MLX ready: {self.voice}, depth={self.depth_mode}{depth_note}, chunk={self.chunk_frames} frames{note}", flush=True)
         return self._m
 
     def _segments(self, text, instruction):

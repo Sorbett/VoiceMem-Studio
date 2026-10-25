@@ -126,11 +126,15 @@ class Conversation:
         timeline = self.turn['timeline']
         if timeline is None or data.get('output_id') != timeline.output_id:
             return
-        timeline.update_checkpoint(data.get('rendered_samples', 0), data.get('sample_rate', self.agent.MIC_RATE), data.get('state', 'playing'))
+        accepted = timeline.update_checkpoint(data.get('rendered_samples', 0), data.get('sample_rate', self.agent.MIC_RATE), data.get('state', 'playing'))
         feedback = getattr(timeline, 'inference_feedback', None)
         if feedback is not None and 'buffered_samples' in data:
             feedback.checkpoint(data['buffered_samples'], data.get('sample_rate', self.agent.MIC_RATE),
                                 data.get('state', 'playing'))
+        budget = getattr(timeline, 'delivery_budget', None)
+        if budget is not None and 'buffered_samples' in data:
+            budget.checkpoint(data['buffered_samples'], data.get('sample_rate', self.agent.MIC_RATE),
+                              data.get('state', 'playing'))
         if data.get('event') == 'started' and (not self.turn['play_started']):
             self.turn['play_started'] = True
             if self.turn['speech_end']:
@@ -143,13 +147,28 @@ class Conversation:
             print(f"[engine] os={observer.snapshot()} admission={resources.snapshot()}", flush=True)
         if timeline.playback_done:
             self.turn['until'] = 0.0
+        if accepted and timeline.context_managed and not timeline.interrupted:
+            text_end = len(timeline.heard_text())
+            previous_id, previous_end = getattr(self, '_caption_progress', ('', 0))
+            if text_end > (previous_end if previous_id == timeline.output_id else 0):
+                self._caption_progress = (timeline.output_id, text_end)
+                await self.sock.send_json({"type": "answer_progress",
+                                           "output_id": timeline.output_id,
+                                           "text_end": text_end})
 
     async def send_audio(self, pcm: bytes, timeline=None):
         """Send PCM and update the output duration and first-audio observation."""
         timeline = timeline or self.turn['timeline']
         if timeline is not self.turn['timeline'] or (timeline and timeline.interrupted):
             return
+        budget = getattr(timeline, 'delivery_budget', None)
+        if budget is not None:
+            await budget.wait()
+            if timeline is not self.turn['timeline'] or timeline.interrupted:
+                return
         await self.sock.send_bytes(pcm)
+        if budget is not None:
+            budget.sent(len(pcm) / 2 / timeline.sample_rate)
         if timeline and timeline.track_delivery:
             timeline.mark_sent(len(pcm) // 2)
         self.turn['until'] = max(self.turn['until'], time.monotonic()) + len(pcm) / 2 / self.agent.MIC_RATE

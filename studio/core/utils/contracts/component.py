@@ -57,6 +57,8 @@ class ReplySink:
         self._audio_ready = asyncio.Event()
         self._output_resolved = asyncio.Event()
         self.first_audio_at = 0.0
+        self._buffered_bytes = 0
+        self._committed = asyncio.Event()
 
     async def send(self, msg):
         if isinstance(msg, dict) and msg.get("type") in {"answer_done", "error"}:
@@ -68,6 +70,10 @@ class ReplySink:
                 self._buf.append(("json", msg))
 
     async def send_audio(self, pcm: bytes):
+        # Wait outside the send lock so confirmation can release private audio.
+        # Preserve a whole oversized chunk for non-streaming injected providers.
+        if pcm and not self.live and self._buffered_bytes >= 24000 * 2:
+            await self._committed.wait()
         async with self._lock:
             if pcm:
                 if not self.first_audio_at:
@@ -77,11 +83,11 @@ class ReplySink:
                 await self._send_audio(pcm)
             else:
                 self._buf.append(("pcm", pcm))
+                self._buffered_bytes += len(pcm)
 
     @property
     def buffered_ms(self) -> float:
-        n = sum(len(p) for k, p in self._buf if k == "pcm")
-        return n / 2 / 24000 * 1000
+        return self._buffered_bytes / 2 / 24000 * 1000
 
     async def wait_for_audio(self) -> None:
         await self._audio_ready.wait()
@@ -112,7 +118,9 @@ class ReplySink:
                 else:
                     await self._send_audio(payload)
             self._buf.clear()
+            self._buffered_bytes = 0
             self.live = True
+            self._committed.set()
 
 
 class SpeechSynthesisError(RuntimeError):

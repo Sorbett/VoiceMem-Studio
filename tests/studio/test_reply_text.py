@@ -11,6 +11,91 @@ from studio.core.utils.tts.control import TONES
 
 
 class ShortReplyTextTests(ReplyFixture, unittest.IsolatedAsyncioTestCase):
+    async def test_only_managed_replies_opt_into_playback_captions(self):
+        for managed in (False, True):
+            with self.subTest(managed=managed):
+                self.setUp()
+                self.timeline.context_managed = managed
+                await self.complete(['认真|合成回复。'])
+                start = next(m for m in self.messages if m['type'] == 'answer_start')
+                self.assertEqual(start.get('caption_sync'), 'playback' if managed else None)
+                self.assertEqual(sum(m['type'] == 'answer_text_done' for m in self.messages),
+                                 int(managed))
+
+    async def test_text_completion_does_not_wait_for_speech_or_finish_playback(self):
+        self.timeline.context_managed = True
+        text_done, release_speech = asyncio.Event(), asyncio.Event()
+        original_send = self.send
+
+        async def send(message):
+            await original_send(message)
+            if message['type'] == 'answer_text_done':
+                text_done.set()
+
+        async def speech(*_):
+            await release_speech.wait()
+            yield bytes(480)
+
+        async def model(*_):
+            yield '认真|我们从这件事开始。'
+
+        self.send = send
+        task = asyncio.create_task(self.pipeline(
+            model, speech_provider=types.SimpleNamespace(stream=speech)))
+        try:
+            await asyncio.wait_for(text_done.wait(), 1)
+            self.assertEqual([message['type'] for message in self.messages],
+                             ['answer_start', 'answer_delta', 'answer_text_done'])
+            self.assertEqual(self.messages[-1]['output_id'], self.timeline.output_id)
+            self.assertFalse(self.audio)
+            self.assertFalse(task.done())
+            release_speech.set()
+            await asyncio.wait_for(task, 1)
+            self.assertTrue(self.audio)
+            self.assertEqual(self.messages[-1]['type'], 'answer_done')
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    async def test_text_completion_stays_private_until_speculation_commits(self):
+        self.timeline.context_managed = True
+        sink = ReplySink(self.send, self.send_audio)
+
+        async def model(*_):
+            yield '认真|我们从这件事开始。'
+
+        await asyncio.wait_for(self.pipeline(model, sink), 1)
+        self.assertEqual(self.messages, [])
+        self.assertEqual(self.audio, [])
+        await sink.commit()
+        self.assertEqual([message['type'] for message in self.messages],
+                         ['answer_start', 'answer_delta', 'answer_text_done', 'answer_done'])
+        self.assertTrue(self.audio)
+
+    async def test_failed_or_cancelled_text_has_no_completion_marker(self):
+        for fail in (False, True):
+            with self.subTest(provider_error=fail):
+                self.setUp()
+                self.timeline.context_managed = True
+                entered = asyncio.Event()
+
+                async def model(*_):
+                    yield '认真|尚未生成完整'
+                    entered.set()
+                    if fail:
+                        raise RuntimeError('synthetic provider failure')
+                    await asyncio.Event().wait()
+
+                task = asyncio.create_task(self.pipeline(model))
+                await asyncio.wait_for(entered.wait(), 1)
+                if fail:
+                    with self.assertRaisesRegex(RuntimeError, 'synthetic provider'):
+                        await asyncio.wait_for(task, 1)
+                else:
+                    task.cancel()
+                    await asyncio.wait_for(task, 1)
+                self.assertFalse(any(m['type'] == 'answer_text_done' for m in self.messages))
+
     def assert_body(self, text):
         displayed = ''.join(m['text'] for m in self.messages if m['type'] == 'answer_delta')
         self.assertEqual(displayed, text)

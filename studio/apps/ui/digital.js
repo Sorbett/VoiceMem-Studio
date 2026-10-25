@@ -11,7 +11,7 @@ const el = (t,c,x) => { const n=document.createElement(t); if(c)n.className=c; i
 const conversations = [{id:'c1',title:'新对话',space:'',pinned:false,messages:[]}];
 const firstConversation = conversations[0];
 let current = conversations[0], replyMessage = null;
-const messageBodies = new Map();
+const messageBodies = new Map(), messageNodes = new Map();
 let conversationSwitch = 0;
 const state = {get messages(){return current.messages;},busy:false,listening:false,memory:false};
 let toastTimer, typeTimer, markTimer;
@@ -115,32 +115,41 @@ function renderMarks(host, marks, animate){
 }
 
 /* ── 聊天记录 ── */
+function messageNode(m){
+  const turn = el('article','turn '+(m.role==='me'?'me':'her'));
+  const body = el('div','turn-body');
+  turn.append(el('div','from',m.role==='me'?'你':'Echo'),body);
+  if(m.role==='her'){
+    const actions=el('div','turn-actions');const copy=el('button',null,'复制');copy.onclick=()=>VMUI.copy(m.text);
+    const read=el('button',null,m.replaying?'停止重播':'重播原声');
+    read.setAttribute('aria-pressed',String(!!m.replaying));
+    read.onclick=()=>{
+      if(state.busy){VMUI.notify('请等当前回复完成。');return;}
+      void voiceInput.replay(m.outputId,on=>{m.replaying=on;read.textContent=on?'停止重播':'重播原声';read.setAttribute('aria-pressed',String(on));document.body.classList.toggle('talking',on);});
+    };
+    actions.append(copy,read);turn.append(actions);
+  }
+  return turn;
+}
+
 function renderLog(){
   const host = $('logScroll');
-  messageBodies.clear();
-  host.replaceChildren();
-  if(!state.messages.length){ host.append(el('p','log-empty','还没有记录。说第一句话，它会出现在这里。')); return; }
-  state.messages.forEach((m, idx) => {
-    const turn = el('article','turn '+(m.role==='me'?'me':'her'));
-    turn.style.animationDelay = (idx*0.05)+'s';
-    const body=el('div','turn-body',m.text);
+  VMTranscript.follow(host);
+  host.querySelector('.log-empty')?.remove();
+  VMTranscript.reconcile(host,state.messages,messageNodes,messageNode,(turn,m)=>{
+    const body = turn.querySelector('.turn-body');
     messageBodies.set(m,body);
-    if(m.role==='her') VMMarkdown.render(body,m.text,{streaming:!!m.truncated});
-    turn.append(el('div','from', m.role==='me'?'你':'Echo'),body);
-    if(m.marks){ const mk = el('div','marks'); renderMarks(mk, m.marks, false); turn.append(mk); }
-    if(m.role==='her'){
-      const actions=el('div','turn-actions');const copy=el('button',null,'复制');copy.onclick=()=>VMUI.copy(m.text);
-      const read=el('button',null,m.replaying?'停止重播':'重播原声');
-      read.setAttribute('aria-pressed',String(!!m.replaying));
-      read.onclick=()=>{
-        if(state.busy){VMUI.notify('请等当前回复完成。');return;}
-        void voiceInput.replay(m.outputId,on=>{m.replaying=on;read.textContent=on?'停止重播':'重播原声';read.setAttribute('aria-pressed',String(on));document.body.classList.toggle('talking',on);});
-      };
-      actions.append(copy,read);turn.append(actions);
+    if(m.role==='her') VMMarkdown.render(body,m.text,{streaming:(m===replyMessage&&!m.complete)||!!m.truncated});
+    else if(body.textContent!==m.text) body.textContent=m.text;
+    const signature=JSON.stringify(m.marks||[]);
+    if(turn.marksSignature!==signature){
+      turn.querySelector('.marks')?.remove();
+      if(m.marks?.length){const marks=el('div','marks');renderMarks(marks,m.marks,false);turn.append(marks);}
+      turn.marksSignature=signature;
     }
-    host.append(turn);
   });
-  requestAnimationFrame(()=>host.scrollTop = host.scrollHeight);
+  for(const m of messageBodies.keys()) if(!messageNodes.has(m)) messageBodies.delete(m);
+  if(!state.messages.length) host.append(el('p','log-empty','还没有记录。说第一句话，它会出现在这里。'));
 }
 
 /* ── 她说话 ── */
@@ -167,12 +176,12 @@ function handleStudio(message) {
   }
   if (message.type === 'partial_transcript') {
     if (!VMStudio.acceptsPartial(current.messages, message)) return;
-    $('said').textContent = message.text; $('said').classList.add('on');
+    VMTranscript.text($('said'),message.text); $('said').classList.add('on');
   } else if (message.type === 'user_transcript' || message.type === 'user_backchannel') {
     if (!VMStudio.acceptsPartial(current.messages, message)) return;
     if(message.type === 'user_transcript') {memoryList('retrievedMemories',[],'检索中…');void watchStoredMemories();}
     VMStudio.applyUser(current.messages, message, 'me');
-    $('said').textContent = message.text; $('said').classList.add('on');
+    VMTranscript.text($('said'),message.text,{final:true}); $('said').classList.add('on');
     if (current.title === '新对话') current.title = message.text.slice(0, 26);
     if (message.type === 'user_transcript') $('marks').replaceChildren();
     renderRail(); renderLog();
@@ -181,11 +190,14 @@ function handleStudio(message) {
     replyMessage = {role:'her',text:'',outputId:message.output_id}; current.messages.push(replyMessage);
     VMMarkdown.render($('voice'),''); renderLog(); syncSend();
   } else if (message.type === 'answer_delta' && replyMessage) {
-    replyMessage.text += message.text || ''; VMMarkdown.render($('voice'),replyMessage.text,{streaming:true});
+    replyMessage.text += message.text || ''; VMMarkdown.render($('voice'),replyMessage.text,{streaming:true,reveal:true});
+    VMTranscript.follow($('voice'));
     const body = messageBodies.get(replyMessage);
-    if (body) VMMarkdown.render(body,replyMessage.text,{streaming:true,onRender:()=>{$('logScroll').scrollTop=$('logScroll').scrollHeight;}});
+    if (body) VMMarkdown.render(body,replyMessage.text,{streaming:true,reveal:true});
     else renderLog();
+    VMTranscript.follow($('logScroll'));
   } else if (message.type === 'answer_done' && replyMessage) {
+    replyMessage.complete = true;
     VMMarkdown.render($('voice'),replyMessage.text);
     const body = messageBodies.get(replyMessage);
     if (body) VMMarkdown.render(body,replyMessage.text);

@@ -27,7 +27,7 @@ class BackgroundSchedulingTests(unittest.IsolatedAsyncioTestCase):
         agent.ACOUSTIC_TRUST = {"开心"}
         return agent
 
-    async def test_durable_completion_bounds_ingest_and_acoustic_concurrency(self):
+    async def test_legacy_ingest_remains_serial_and_stale_acoustic_is_rejected(self):
         agent = self.owner()
         callbacks, seen = [], []
         entered = asyncio.Event()

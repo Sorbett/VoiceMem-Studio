@@ -38,7 +38,7 @@
       const dialog = document.createElement('dialog');
       dialog.className = 'space-picker';
       const heading = document.createElement('h2');
-      heading.textContent = '为新对话选择 Memory Space';
+      heading.textContent = '选择记忆空间';
       const hint = document.createElement('p');
       hint.textContent = fixed ? '启动时指定了单个记忆库，当前对话固定使用此空间。' : '同一空间的对话共享长期记忆。';
       const list = document.createElement('div');
@@ -49,7 +49,7 @@
       const add = document.createElement('button'); add.type = 'button'; add.textContent = '创建空间';
       const cancel = document.createElement('button'); cancel.type = 'button'; cancel.textContent = '取消';
       const confirm = document.createElement('button'); confirm.type = 'button';
-      confirm.className = 'space-picker__confirm'; confirm.textContent = '确认并创建对话';
+      confirm.className = 'space-picker__confirm'; confirm.textContent = '创建对话';
       const createRow = document.createElement('div'); createRow.className = 'space-picker-actions';
       createRow.append(name, add);
       createRow.hidden = fixed;

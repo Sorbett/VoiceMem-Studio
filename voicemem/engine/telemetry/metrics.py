@@ -9,6 +9,7 @@ import time
 from ..scheduling.admission import resources
 from ..scheduling.capacity import CapacityLease, background_capacity
 from ..scheduling.context import Service, _service, inference_scope
+from ..scheduling.cancellation import check_cancelled, cancellable_wait
 from ..backends.devices import device_key
 from ..backends.torch import owns_device_lock
 
@@ -19,7 +20,7 @@ _metrics = {}
 
 
 def record(model, backend, run_s, *, lock_s=0.0, admission_s=0.0, queue_s=0.0, capacity_s=0.0, forced=False, error=False,
-           device=None):
+           device=None, cadence_s=None):
     """Aggregate static adapter labels only; never pass prompts or identifiers."""
     key = (model, backend, _service.get().name.lower(), device_key(device))
     with _mutex:
@@ -36,8 +37,10 @@ def record(model, backend, run_s, *, lock_s=0.0, admission_s=0.0, queue_s=0.0, c
         row["capacity_ms"] += capacity_s * 1000
         row["forced"] += bool(forced)
         row["errors"] += bool(error)
-    if _service.get() == Service.BACKGROUND:
+    if _service.get() == Service.BACKGROUND and backend != "cache":
         resources.observe(model, run_s, device=device)
+    elif _service.get() == Service.AUDIO and cadence_s is not None and not error:
+        resources.realtime(model, run_s, cadence_s, device=device)
 
 
 def model_metrics(*, reset=False):
@@ -51,15 +54,18 @@ def model_metrics(*, reset=False):
 
 
 @contextmanager
-def inference_call(model, backend, *, lock=None, service=None, device=None, queue_s=0.):
+def inference_call(model, backend, *, lock=None, service=None, device=None, queue_s=0., cadence_s=None):
     """Time a native call, waiting for admission before acquiring its model lock.
 
     Call from existing native workers only. Device-asynchronous adapters must
     include their existing materialization boundary inside this scope. A tuple
     of locks acquires model ownership before device admission; later entries
     may be zero-argument factories resolving mutable placement under ownership.
+    Periodic audio adapters may supply their input cadence in seconds to pace
+    background work from successful native runtime, excluding final tails.
     """
     with inference_scope(_service.get() if service is None else service):
+        check_cancelled()
         locks = lock if isinstance(lock, tuple) else (() if lock is None else (lock,))
         device = device_key(device if device is not None else getattr(lock, "device", None))
         owned = any(getattr(item, "_is_owned", lambda: False)() for item in locks)
@@ -70,10 +76,10 @@ def inference_call(model, backend, *, lock=None, service=None, device=None, queu
                     else nullcontext(CapacityLease()))
         with capacity as lease:
             yield from _admitted_call(model, backend, locks, device, owned or lease.reentrant,
-                                     queue_s, lease.wait_s)
+                                     queue_s, lease.wait_s, cadence_s)
 
 
-def _admitted_call(model, backend, locks, device, owned, queue_s, capacity_s):
+def _admitted_call(model, backend, locks, device, owned, queue_s, capacity_s, cadence_s):
     """Retain native capacity through model unlock and completed timing capture."""
     admission, forced = ((resources.wait(model, device=device) if device else resources.wait(model))
                          if _service.get() == Service.BACKGROUND and not owned
@@ -84,8 +90,16 @@ def _admitted_call(model, backend, locks, device, owned, queue_s, capacity_s):
     try:
         for item in locks:
             native_lock = item() if not hasattr(item, "acquire") else item
-            native_lock.acquire()
+            interval = cancellable_wait()
+            if interval is None:
+                native_lock.acquire()
+            else:
+                while True:
+                    check_cancelled()
+                    if native_lock.acquire(timeout=interval):
+                        break
             acquired.append(native_lock)
+        check_cancelled()
         if device is None:
             device = next((getattr(item, "device", None) for item in reversed(acquired)
                            if getattr(item, "device", None) is not None), None)
@@ -100,7 +114,7 @@ def _admitted_call(model, backend, locks, device, owned, queue_s, capacity_s):
             elapsed = time.perf_counter() - started
             record(model, backend, elapsed, lock_s=started-waiting,
                    admission_s=admission, forced=forced, error=failed, device=device,
-                   queue_s=queue_s, capacity_s=capacity_s)
+                   queue_s=queue_s, capacity_s=capacity_s, cadence_s=cadence_s)
     finally:
         for native_lock in reversed(acquired):
             native_lock.release()

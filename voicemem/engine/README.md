@@ -13,7 +13,8 @@ engine/
 ├── backends/
 │   ├── mlx/
 │   │   ├── scheduler.py     # One MLX owner thread and bounded delivery
-│   │   └── prefill.py       # Cooperative prompt-cache materialization
+│   │   ├── prefill.py       # Cooperative prompt-cache materialization
+│   │   └── compilation.py   # Decode output and RNG validation before compilation
 │   ├── cuda.py             # CUDA speech worker and native cleanup
 │   ├── torch.py            # Per-device locks and graph initialization
 │   ├── cpu.py              # CPU runtime thread budgets
@@ -22,6 +23,8 @@ engine/
 │   ├── context.py          # Audio, interactive and background priority
 │   ├── admission.py        # Speech inventory, stage cost and resource pressure
 │   ├── capacity.py         # Optional cross-provider background native capacity
+│   ├── probes.py           # Nonblocking latest-snapshot CPU inference
+│   ├── reuse.py            # Bounded exact-request reuse within a captured job
 │   └── background.py       # Captured admission and native task lifetime
 └── telemetry/
     ├── metrics.py          # Native execution, lock, admission and queue time
@@ -54,6 +57,23 @@ Studio depth routing uses this helper for both static and request prefixes;
 synchronous warmup also yields through `run_steps`. Providers own tokenization,
 cache validity, decoding and prompt semantics.
 
+`VerifiedDecode` in `backends/mlx/compilation.py` accepts an array-valued step
+whose only captured mutable state is `mx.random.state`. On the MLX owner it
+replays eager and compiled results and RNG transitions from the same seed during
+explicit startup verification, resetting that seed afterward. Live generation
+does not run verification or consume extra sampling draws.
+Mismatch or compilation failure logs a metadata-only warning and keeps eager
+execution. Later runtime failures still propagate. Changed input shapes or dtypes
+and unverified profiles use eager execution without additional traces. The
+supplied sample is a startup acceptance check, not proof of numerical identity
+for all inputs. `snapshot()` reports actual compiled/eager invocation counts
+without inputs or RNG keys.
+Studio warms this wrapper for Breeze depth decoding before serving; CUDA's
+existing graph path and the shared provider's cached default remain independent.
+Warmup uses isolated prompt-prefilled KV and actual decode activations rather
+than quantized head-weight dtype. Studio startup reports `verified_depth` profile
+counts, while failed checks emit a reason without model inputs or private data.
+
 `scheduling/context.py` carries audio, interactive and background priority through explicitly
 captured workers. `scheduling/admission.py` uses output-owned audio inventory, observed native
 cost and fresh resource pressure to delay background stages before model locks.
@@ -61,6 +81,12 @@ It preserves bounded persistence progress and does not preempt native inference.
 Known work on another CUDA GPU can proceed independently; unknown placement is
 treated conservatively. Browser inventory is accepted only after output ownership
 validation and is never evidence that the user heard audio.
+
+`background_scope(wait, cancelled=predicate)` optionally captures a thread-safe
+predicate for disposable work. Native capacity, resource admission and model
+lock waits raise `InferenceCancelled` before executing obsolete work and release
+all acquired reservations. A model call already executing retains its ownership
+until completion. Confirmed memory leaves this option unset.
 
 `scheduling/capacity.py` provides background native capacity before speech
 admission and model locks. Studio enables it during startup through
@@ -85,6 +111,17 @@ retains four. `VOICEMEM_ENGINE_CPU_THREADS` overrides the positive integer.
 Streaming ASR, SenseVoice and emotion2vec receive the same budget, preserving
 their model and decoding settings while avoiding competing thread-pool defaults.
 
+`scheduling/probes.py` supplies the serial CPU EOT executor and `LatestProbe`.
+Each input connection owns at most one queued or running snapshot; the input
+owner polls results without awaiting inference and retains current audio while
+busy. Native work above its 40 ms budget gets an equal recovery gap, excluding
+executor queue wait. Reset cancels unstarted work and rejects started results
+without freeing an active native slot. The input owner validates turn, detector,
+speech coverage and silence before confirmation. All ASR frames remain intact.
+This CPU path is shared by MLX and CUDA deployments and starts no thread at
+import. `snapshot()` reports counts, execution, queue and recovery timings
+without audio or text.
+
 One `background_scope` shares accumulated admission wait across captured child
 workers. After sustained waiting, a stage can use a smaller safe inventory
 reserve that covers its own cost and the next observed synthesis step, once per
@@ -93,6 +130,32 @@ unsustainable production, the stage-cost estimate, or fresh memory pressure.
 The existing per-stage forced-progress limit remains the fallback; accumulated
 waiting is not an end-to-end persistence deadline. Snapshot `aged` counts these
 headroom-checked admissions separately from forced progress.
+
+`BackgroundPipeline` bounds deferred operations through their actual completion.
+It prepares jobs FIFO and supplies a thread-safe predecessor barrier for ordered
+side effects, allowing preparation to overlap earlier remote waits. Started work
+keeps its capacity and ordering ownership after caller cancellation; failed
+preparation still settles its started native work and preceding barriers. Studio
+uses two slots for memory and a separate `BackgroundLane` for acoustic UI. Native
+model calls in both paths retain the same process-wide admission and capacity.
+
+`scheduling/reuse.py` supplies an operation-local pool through `reuse_scope` and
+`reuse_call`. `background_scope` captures it with the job's existing worker
+context. Adapters opt in only for pure inference with immutable model state,
+using exact request keys and immutable CPU `ReusableResult` payloads. The pool
+holds at most 64 completed entries and two MiB of payloads, coalesces identical
+concurrent misses outside device/model locks, and returns independent copies.
+Failures and unsupported/oversized results are not retained. Cancellation of a
+waiting consumer does not abandon started native work. Separate jobs do not
+share results; `reuse_scope(enabled=False)` disables reuse in captured children.
+
+The built-in local encoder reuses only matching NumPy batches, including input
+order, options, prompt configuration and model parameter versions/device/dtype.
+Input text is represented by a digest in the key. Training models, explicit
+placement, token/tensor output, custom options and device-lock owners bypass it.
+Mutable tokenizer/model configuration requires the opt-out. Injected providers
+and database reads retain their existing paths. Reuse emits `backend=cache`
+timings without resetting native cost or background recovery estimates.
 
 CUDA adapters must resolve placement before crossing threads and materialize
 their host results before releasing native admission. `CudaWorker` performs
@@ -121,6 +184,26 @@ thread without subprocesses or model imports. Five-second system summaries
 continue while idle so cooling remains observable. Unsupported platforms and
 failed or unknown reads remain explicit; a category is neither a temperature
 nor a measured clock rate and does not alter model quality or system power.
+Fresh fair/serious/critical categories space background calls by half/one/two
+times the last conflicting background native duration, capped at two seconds.
+Escalation is immediate; five seconds of fresh lower-state readings permit
+recovery to that state's budget. Unknown, unavailable or stale readings disable
+thermal pacing. Foreground inference bypasses the gap; the existing bounded
+background deferral remains in force.
+
+Periodic audio adapters can declare `cadence_s` through `inference_call`.
+Successful streaming ASR chunks use their unchanged 600 ms input cadence;
+final tails, failures and lock/queue waits do not contribute. Three consecutive
+native calls consuming at least half their cadence, with 0.25 EWMA load also
+at least half, enable background gaps equal to the last conflicting native
+duration, capped at two seconds. Recovery requires load below 40%; stale
+feedback expires after three seconds. A single startup spike does not activate
+this budget. It works on both MLX and CUDA hosts without OS thermal support;
+known distinct CUDA devices retain independent load and background histories.
+It changes no recognition, synthesis or persistence settings. Thermal and
+periodic-load pacing combine by maximum. Snapshots expose `pacing_level`, fresh
+`realtime_pressure` count and conservative aggregate `cooling_ms`; these are
+scheduling signals, not predicted device cooling times.
 
 Deterministic checks run without NVIDIA hardware:
 

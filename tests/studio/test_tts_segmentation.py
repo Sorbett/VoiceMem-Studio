@@ -267,6 +267,94 @@ class ReplySegmentationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.requests, [])
         self.assertFalse(asyncio.all_tasks() - baseline)
 
+    async def test_slow_delivery_bounds_scheduler_production_and_preserves_pcm(self):
+        from studio.core.utils.tts.component import BreezeMLXTTS
+        from tests.helpers.gpu import cpu_gpu_loop
+        produced = []
+        release, blocked = asyncio.Event(), asyncio.Event()
+        tts = BreezeMLXTTS(model='synthetic')
+
+        def segments(*args):
+            for i in range(100):
+                produced.append(i)
+                yield bytes([i, 0]) * 3840
+
+        async def stream(*args):
+            yield '温和|A complete synthetic sentence.'
+
+        async def send_audio(pcm):
+            blocked.set()
+            await release.wait()
+            self.audio.append(pcm)
+
+        tts._segments = segments
+        self.send_audio = send_audio
+        with cpu_gpu_loop() as gpu, patch('voicemem.engine.gpu_loop', return_value=gpu), \
+                patch('voicemem.utils.common.prompt_trace.record_request'):
+            task = self.start(stream, tts.stream)
+            try:
+                await asyncio.wait_for(blocked.wait(), 1)
+                await asyncio.sleep(.05)
+                self.assertLessEqual(len(produced), 12)
+                self.assertFalse(task.done())
+                release.set()
+                await asyncio.wait_for(task, 2)
+            finally:
+                release.set()
+                if not task.done():
+                    task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+        self.assertEqual(self.audio, [bytes([i, 0]) * 3840 for i in range(100)])
+        self.assertFalse(tts._lock.locked())
+
+    async def test_full_pcm_buffer_can_cancel_without_waiting_for_eof_capacity(self):
+        baseline = asyncio.all_tasks()
+        blocked, closed = asyncio.Event(), asyncio.Event()
+
+        async def stream(*args):
+            yield '温和|First complete sentence. Second complete sentence.'
+
+        async def speech(*args):
+            try:
+                for _ in range(100):
+                    yield b'\x01\x00' * 3840
+            finally:
+                closed.set()
+
+        async def send_audio(pcm):
+            blocked.set()
+            await asyncio.Event().wait()
+
+        self.send_audio = send_audio
+        task = self.start(stream, speech)
+        await asyncio.wait_for(blocked.wait(), 1)
+        await asyncio.sleep(0)
+        task.cancel()
+        await asyncio.wait_for(task, 1)
+        self.assertTrue(closed.is_set())
+        self.assertFalse(asyncio.all_tasks() - baseline)
+
+    async def test_completed_segments_cannot_accumulate_behind_blocked_delivery(self):
+        blocked, release = asyncio.Event(), asyncio.Event()
+
+        async def stream(*args):
+            yield '温和|' + '完整的一句话。' * 30
+
+        async def send_audio(pcm):
+            blocked.set()
+            await release.wait()
+            self.audio.append(pcm)
+
+        self.send_audio = send_audio
+        task = self.start(stream)
+        await asyncio.wait_for(blocked.wait(), 1)
+        await asyncio.sleep(.02)
+        self.assertEqual(len(self.requests), 2)
+        release.set()
+        await asyncio.wait_for(task, 2)
+        self.assertEqual(len(self.requests), 30)
+        self.assertEqual(len(self.audio), 30)
+
 
 if __name__ == '__main__':
     unittest.main()

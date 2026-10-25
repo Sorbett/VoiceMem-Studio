@@ -33,7 +33,7 @@ test('conversations select one of the backend Memory Spaces and retain its ident
   assert.equal(list.children.length, spaces.length);
   const footer = dialog.children.at(-1);
   assert.equal(footer.className, 'space-picker__footer');
-  assert.equal(footer.children[1].textContent, '确认并创建对话');
+  assert.equal(footer.children[1].textContent, '创建对话');
   footer.children[1].onclick();
   assert.equal(await choice, 'project');
   assert.equal(await api.use('project'), 'project');

@@ -155,15 +155,16 @@ test('API key input is masked and returns the entered value', async () => {
 
 test('connection page uses the same compact visual shell as style selection', async () => {
   const html = await fs.readFile(path.join(__dirname, '../../studio/apps/launcher.html'), 'utf8');
-  const css = await fs.readFile(path.join(__dirname, '../../studio/apps/launcher.css'), 'utf8');
+  const manifest = JSON.parse(await fs.readFile(path.join(__dirname, '../../studio/apps/package.json'), 'utf8'));
   assert.match(html, /class="launcher-card"/);
   assert.match(html, /class="orb"/);
   assert.match(html, /连接 Studio/);
   assert.match(html, /连接并选择风格/);
   assert.doesNotMatch(html, /value="http:\/\/127\.0\.0\.1:8787"/);
   assert.doesNotMatch(html, /class="nav-item"|class="sidebar"/);
-  assert.match(css, /--soft:#f7f8fa/);
-  assert.match(css, /\.launcher-card\{[^}]*border-radius:24px/);
+  assert.match(html, /href="ui\/design\.css(?:\?[^"]*)?"/);
+  assert.ok(manifest.build.files.includes('ui/design.css'));
+  await fs.access(path.join(__dirname, '../../studio/apps/ui/design.css'));
   const main = await fs.readFile(path.join(__dirname, '../../studio/apps/main.cjs'), 'utf8');
   assert.match(main, /width: 680, height: 430/);
   assert.match(main, /label: '连接设置'/);

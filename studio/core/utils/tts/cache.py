@@ -158,8 +158,8 @@ class FastDepth:
 
     This leaves the text encoder, backbone generation, EOS, and streaming audio
     codec in the release implementation. Sampling uses the release's sampler.
-    Optional compilation captures random state explicitly. Cached is the default:
-    compiled full-frame graphs may take time to compile on a particular Mac.
+    Optional compilation verifies sampled codes and random state before use.
+    Each configuration falls back to the cached path if verification fails.
     """
     def __init__(self, model, mode="cached"):
         self.model, self.mode = model, mode
@@ -222,8 +222,11 @@ class FastDepth:
                     x = self.advance(token, head + 1, caches, hidden.shape[0])
             return mx.concatenate(tokens)
 
-        fn = (mx.compile(frame, inputs=mx.random.state, outputs=mx.random.state)
-              if self.mode == "compiled" else frame)
+        if self.mode == "compiled":
+            from voicemem.engine import VerifiedDecode
+            fn = VerifiedDecode(frame, label="breeze_depth")
+        else:
+            fn = frame
         self.functions[key] = fn
         return fn
 
@@ -269,12 +272,22 @@ class FastDepth:
 
     def warmup(self, frames, cfg_scale, instruct):
         import mlx.core as mx
-        m = self.model.depth_decoder.model
         try:
-            # Shape/dtype match the projected backbone output. This warms depth
-            # only; it is NOT a full text/codec warmup and is reported separately.
-            hidden = mx.zeros((1, m.backbone_hidden_size),
-                              dtype=self.model.depth_decoder.codebooks_head.weight.dtype)
+            # Prompt-prefilled KV can promote decode activations beyond the
+            # quantized weight dtype. Use isolated prefill and decode state.
+            backbone = self.model.backbone_model
+            prompt = self.model._prompt_embeddings(
+                "Warmup.", voice=None, instruct=instruct, ref_audio=None, ref_text=None)
+            cache = backbone.make_cache()
+            backbone(input_embeddings=prompt, cache=cache)
+            codes = mx.zeros((1, 1, self.model.num_codebooks), dtype=mx.int32)
+            hidden = backbone(input_ids=codes, cache=cache)[:, -1, :]
+            mx.eval(hidden)
+            if self.mode == "compiled":
+                use_cfg = bool(instruct and cfg_scale != 1)
+                fn = self._function(0.9, 1.0, 50, cfg_scale, use_cfg)
+                sample = mx.concatenate((hidden, hidden), axis=0) if use_cfg else hidden
+                fn.verify(mx.array([1], dtype=mx.int32), sample, seed=0)
             for _ in range(frames):
                 self.model._depth_tokens(
                     1, hidden, unconditional_hidden=hidden if instruct and cfg_scale != 1 else None,

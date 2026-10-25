@@ -35,6 +35,7 @@ class ThermalTelemetryTests(unittest.TestCase):
                 patch('voicemem.engine.telemetry.system.thermal_state', return_value='serious'), \
                 patch('voicemem.engine.telemetry.system.time.monotonic', side_effect=[0, 6]), \
                 patch('voicemem.engine.telemetry.system.resources.paging') as paging, \
+                patch('voicemem.engine.telemetry.system.resources.thermal') as thermal, \
                 patch('voicemem.engine.telemetry.system.model_metrics', return_value=[]), \
                 patch.object(observer._stop, 'wait', side_effect=lambda _: observer._stop.set()), \
                 redirect_stdout(output):
@@ -42,3 +43,4 @@ class ThermalTelemetryTests(unittest.TestCase):
         self.assertEqual(observer.snapshot()['thermal_state'], 'serious')
         self.assertIn('thermal_state=serious', output.getvalue())
         paging.assert_called_once_with(0)
+        thermal.assert_called_once_with('serious')

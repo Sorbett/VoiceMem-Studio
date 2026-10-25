@@ -12,13 +12,18 @@ class EngineImportTests(unittest.TestCase):
                       'voicemem.utils.background',
                       'voicemem.engine.backends.mlx.scheduler',
                       'voicemem.engine.backends.cuda',
+                      'voicemem.engine.backends.mlx.compilation',
                       'voicemem.engine.scheduling.admission',
+                      'voicemem.engine.scheduling.probes',
+                      'voicemem.engine.scheduling.reuse',
                       'voicemem.engine.telemetry.system'):
             with self.subTest(first=first):
                 script = f'''
 import importlib
 import sys
+import threading
 
+threads = set(threading.enumerate())
 importlib.import_module({first!r})
 engine = importlib.import_module('voicemem.engine')
 legacy = importlib.import_module('voicemem.utils.engine')
@@ -42,6 +47,8 @@ assert importlib.import_module('voicemem.engine.backends.mlx.scheduler').GpuLoop
 assert importlib.import_module('voicemem.engine.backends.cuda').CudaWorker is engine.CudaWorker
 assert importlib.import_module('voicemem.engine.scheduling.admission').resources is engine.resources
 assert importlib.import_module('voicemem.engine.telemetry.system').observer is engine.observer
+assert importlib.import_module('voicemem.engine.scheduling.probes').LatestProbe is engine.LatestProbe
+assert set(threading.enumerate()) == threads
 calls = []
 with background.background_scope(lambda: calls.append('admitted')):
     engine.background_checkpoint()

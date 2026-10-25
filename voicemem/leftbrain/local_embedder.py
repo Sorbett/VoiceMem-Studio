@@ -26,6 +26,8 @@ from __future__ import annotations
 import os
 import sys
 import threading
+import hashlib
+import json
 from dataclasses import dataclass
 from functools import lru_cache
 
@@ -149,12 +151,67 @@ class _LockedEncoder:
     def __init__(self, m):
         self._m = m
         self._lock = threading.RLock()
+        self._reuse_owner = object()
+
+    def _reuse_key(self, args, kwargs):
+        """Identify an exact NumPy batch without retaining its input strings.
+
+        Only the inference-only SentenceTransformer path participates. Explicit
+        placement, token outputs and custom execution options retain native calls.
+        Parameter versions distinguish normal in-place model updates within a job.
+        """
+        if self._lock._is_owned() or getattr(self._m, "training", True):
+            return None
+        allowed = {"normalize_embeddings", "show_progress_bar", "batch_size",
+                   "convert_to_numpy", "convert_to_tensor", "output_value",
+                   "precision", "prompt_name", "prompt", "truncate_dim"}
+        if (len(args) != 1 or not isinstance(args[0], (str, list, tuple))
+                or not set(kwargs) <= allowed or kwargs.get("convert_to_tensor", False)
+                or not kwargs.get("convert_to_numpy", True)
+                or kwargs.get("output_value", "sentence_embedding") != "sentence_embedding"):
+            return None
+        texts = [args[0]] if isinstance(args[0], str) else args[0]
+        if not texts or not all(isinstance(text, str) for text in texts):
+            return None
+        if any(type(value) not in (str, int, float, bool, type(None)) for value in kwargs.values()):
+            return None
+        try:
+            parameters = tuple((id(p), p._version, str(p.device), str(p.dtype))
+                               for p in self._m.parameters())
+            config = (args[0], kwargs, getattr(self._m, "prompts", {}),
+                      getattr(self._m, "default_prompt_name", None),
+                      getattr(self._m, "max_seq_length", None),
+                      getattr(self._m, "truncate_dim", None))
+            digest = hashlib.sha256(json.dumps(config, sort_keys=True, ensure_ascii=False,
+                                              allow_nan=False).encode()).digest()
+        except (AttributeError, RuntimeError, TypeError, ValueError):
+            return None
+        return self._reuse_owner, parameters, digest
+
+    @staticmethod
+    def _freeze(value, limit):
+        from voicemem.engine import ReusableResult
+        if (type(value) is not np.ndarray or value.dtype.kind not in "biufc"
+                or value.nbytes > limit):
+            return None
+        return ReusableResult((value.dtype.str, value.shape, value.tobytes()), value.nbytes)
+
+    @staticmethod
+    def _thaw(payload):
+        dtype, shape, data = payload
+        return np.frombuffer(data, dtype=dtype).reshape(shape).copy()
 
     def encode(self, *a, **k):
-        from voicemem.engine import device_lock, inference_call
-        locks = (self._lock, lambda: device_lock(k.get("device") or getattr(self._m, "device", None)))
-        with inference_call("embedding", "torch", lock=locks):
-            return self._m.encode(*a, **k)
+        from voicemem.engine import device_lock, inference_call, reuse_call
+
+        def native():
+            locks = (self._lock, lambda: device_lock(k.get("device") or getattr(self._m, "device", None)))
+            with inference_call("embedding", "torch", lock=locks):
+                return self._m.encode(*a, **k)
+
+        value, _ = reuse_call(lambda: self._reuse_key(a, k), native,
+                              freeze=self._freeze, thaw=self._thaw, label="embedding")
+        return value
 
     def __getattr__(self, name):
         return getattr(self._m, name)

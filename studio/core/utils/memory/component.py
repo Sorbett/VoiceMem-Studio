@@ -3,7 +3,7 @@ import asyncio
 import re
 import time
 import uuid
-from .background import background_lane
+from .background import background_lane, memory_pipeline
 
 class Memory:
     BACKGROUND_DEFER_S = 0.5
@@ -24,16 +24,8 @@ class Memory:
             return ""
 
     def remember_turn(self, pending, reply: str, owner: dict, history_turn_id: str = "",
-                      memory_vm=None, on_complete=None) -> None:
+                      memory_vm=None, on_complete=None, *, wait_for_previous=None) -> None:
         """Persist the captured turn and heard reply to the originating memory instance."""
-
-        text = pending.text
-        meaningful = re.sub(r"[^\w\u4e00-\u9fff]", "", text or "")
-        cjk = len(re.findall(r"[\u4e00-\u9fff]", meaningful))
-        if pending.audio_path and cjk < 2 and len(meaningful) < 3:
-            from voicemem.stream import SOUND_ONLY_TEXT
-            text = SOUND_ONLY_TEXT
-
         writes = getattr(self, '_MEMORY_WRITES', None)
         if writes is None:
             writes = self._MEMORY_WRITES = set()
@@ -51,12 +43,20 @@ class Memory:
                     on_complete(result)
 
         try:
+            text = pending.text
+            meaningful = re.sub(r"[^\w\u4e00-\u9fff]", "", text or "")
+            cjk = len(re.findall(r"[\u4e00-\u9fff]", meaningful))
+            if pending.audio_path and cjk < 2 and len(meaningful) < 3:
+                from voicemem.stream import SOUND_ONLY_TEXT
+                text = SOUND_ONLY_TEXT
             target_vm = memory_vm or self.vm
-            r = target_vm.ingest(
+            ingest = target_vm.ingest if wait_for_previous is None else target_vm.ingest_ordered
+            options = {} if wait_for_previous is None else {"wait_for_previous": wait_for_previous}
+            r = ingest(
                 text, agent_reply=reply, async_facts=True,
                 audio=pending.audio_path,
                 language=pending.language or getattr(target_vm, "memory_language", "en"),
-                on_complete=complete,
+                on_complete=complete, **options,
             ) or {}
         except Exception as e:
             complete({"error": True, "persistent_memory_created": False})
@@ -133,39 +133,59 @@ class Memory:
     async def _remember_background(self, pending, reply: str, owner: dict,
                                    history_turn_id: str, memory_vm, on_complete=None) -> None:
         queued_at = time.monotonic()
-        async def persist():
+        started = None
+        loop = asyncio.get_running_loop()
+        completed = loop.create_future()
+        ordered = callable(getattr(memory_vm, "ingest_ordered", None))
+
+        def complete(result):
+            try:
+                if on_complete is not None:
+                    on_complete(result)
+            finally:
+                def resolve():
+                    if not completed.done():
+                        completed.set_result(None)
+                try:
+                    loop.call_soon_threadsafe(resolve)
+                except RuntimeError:
+                    pass
+
+        async def prepare(predecessor):
+            nonlocal started
             waited = time.monotonic() - queued_at
             if waited > 0.05 and self.BARGE_DEBUG:
                 print(f"[memory] 入库排队 {waited:.2f}s", flush=True)
             started = time.monotonic()
-            loop = asyncio.get_running_loop()
-            completed = loop.create_future()
 
-            def complete(result):
-                try:
-                    if on_complete is not None:
-                        on_complete(result)
-                finally:
-                    def resolve():
-                        if not completed.done():
-                            completed.set_result(None)
-                    try:
-                        loop.call_soon_threadsafe(resolve)
-                    except RuntimeError:
-                        pass
+            def wait_for_previous():
+                before = time.monotonic()
+                predecessor.wait()
+                if self.BARGE_DEBUG:
+                    print(f"[memory-stage] predecessor_ms={(time.monotonic()-before)*1000:.0f}",
+                          flush=True)
 
             from voicemem.engine import background_scope
             try:
                 with background_scope(None):
                     await asyncio.to_thread(
                         self.remember_turn, pending, reply, owner, history_turn_id, memory_vm,
-                        on_complete=complete)
+                        on_complete=complete,
+                        **({"wait_for_previous": wait_for_previous} if ordered else {}))
             finally:
-                # Metadata failures cannot release the lane ahead of native writes.
-                await completed
+                if self.BARGE_DEBUG:
+                    print(f"[memory-stage] perception_ms={(time.monotonic()-started)*1000:.0f}",
+                          flush=True)
+                # Adapters without the ordered extension retain serial completion.
+                if not ordered:
+                    await completed
+
+        async def settle():
+            await completed
             if self.BARGE_DEBUG:
                 print(f"[memory] 入库完成 {time.monotonic()-started:.2f}s", flush=True)
-        await background_lane(self).run(lambda: self.wait_idle("入库"), persist)
+
+        await memory_pipeline(self).run(lambda: self.wait_idle("入库"), prepare, settle)
 
     def queue_remember_turn(self, pending, reply: str, owner: dict,
                             history_turn_id: str = "", memory_vm=None, on_complete=None) -> None:
@@ -197,6 +217,6 @@ class Memory:
         self._IDLE.set()
         while self._REMEMBER_TASKS:
             await asyncio.gather(*tuple(self._REMEMBER_TASKS), return_exceptions=True)
-        lane = background_lane(self)
-        if lane.tasks:
-            await asyncio.gather(*tuple(lane.tasks), return_exceptions=True)
+        for owner in (memory_pipeline(self), background_lane(self)):
+            if owner.tasks:
+                await asyncio.gather(*tuple(owner.tasks), return_exceptions=True)

@@ -8,6 +8,7 @@ import threading
 import time
 
 from ..backends.devices import device_key
+from .cancellation import check_cancelled, cancellable_wait
 
 
 @dataclass(frozen=True)
@@ -59,6 +60,7 @@ class BackgroundCapacity:
         is unsupported, as with native model/device ownership.
         """
         ident, domain = threading.get_ident(), _domain(device)
+        check_cancelled()
         acquired = False
         lease = CapacityLease()
         with self._condition:
@@ -76,7 +78,9 @@ class BackgroundCapacity:
                         while (any(_conflicts(domain, other) for other in self._active.values())
                                or any(_conflicts(domain, other) for _, other in
                                       self._waiting[:self._waiting.index(ticket)])):
-                            self._condition.wait()
+                            check_cancelled()
+                            self._condition.wait(cancellable_wait())
+                        check_cancelled()
                         self._active[ident] = domain
                         acquired = True
                         lease = CapacityLease(time.perf_counter()-started)

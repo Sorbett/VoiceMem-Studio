@@ -8,6 +8,9 @@ Host temperature, paging by other applications and phase order still matter.
 Capacity crossover retains speech admission in both arms: A is the baseline;
 B adds process-wide background capacity. Use multiple background workers to
 exercise overlap. This probe does not traverse Studio reply playback pacing.
+Reuse crossover keeps admission and capacity enabled in both arms and repeats
+one synthetic embedding batch within each background job. It measures exact
+duplicate work, not the duplicate rate or API latency of real memory ingestion.
 """
 from __future__ import annotations
 
@@ -44,7 +47,7 @@ async def main(args):
     from studio.core.utils.startup.audio import warmup_audio
     from studio.core.utils.tts.component import BreezeMLXTTS
     from voicemem.engine import (SpeechFeedback, background_capacity, background_scope, cpu_thread_budget, model_metrics,
-                                observer, resources, speech_scope)
+                                observer, resources, reuse_scope, speech_scope)
     from voicemem.stream import _EOT_EXECUTOR
     from voicemem.utils.audio.eot import EndOfTurn
     if args.studio_voice:
@@ -90,6 +93,8 @@ async def main(args):
                                             background_jobs=args.background_jobs,
                                             background_workers=args.background_workers,
                                             capacity_crossover=args.capacity_crossover,
+                                            reuse_crossover=args.reuse_crossover,
+                                            embedding_repeats=args.embedding_repeats,
                                             cpu_threads=cpu_thread_budget(),
                                             studio_voice=args.studio_voice,
                                             threads_a=args.threads_a, threads_b=args.threads_b,
@@ -98,6 +103,14 @@ async def main(args):
         observer.start()
         stop, done = threading.Event(), asyncio.Event()
         asr_times, loop_lags = [], []
+        native_embedding_calls = 0
+        original_encode = models[3]._m.encode
+
+        def count_encode(*a, **k):
+            nonlocal native_embedding_calls
+            native_embedding_calls += 1
+            return original_encode(*a, **k)
+        models[3]._m.encode = count_encode
 
         def listen():
             count = 0
@@ -130,18 +143,26 @@ async def main(args):
 
         def background():
             begin = time.perf_counter()
-            with background_scope(None):
+            with background_scope(None), reuse_scope(enabled=not args.reuse_crossover or policy == "B"):
                 models[1].detect_full(path)
                 models[5].embed(path)
                 models[2].detect(path)
-                models[3].encode(["synthetic persistence fixture"])
+                digest = hashlib.sha256()
+                for _ in range(args.embedding_repeats):
+                    encoded = models[3].encode(["synthetic persistence fixture"])
+                    digest.update(encoded.tobytes())
                 models[6]._acoustic_emotion(str(path))
+            if args.reuse_crossover:
+                print("BACKGROUND", json.dumps(dict(phase=phase, policy=policy,
+                      embedding_repeats=args.embedding_repeats, embedding_sha256=digest.hexdigest())), flush=True)
             return time.perf_counter()-begin
 
         workers = []
         initial_capacity = background_capacity.snapshot()["enabled"]
         try:
             for phase, policy in enumerate(args.order):
+                if args.reuse_crossover:
+                    background_capacity.configure(True)
                 if args.capacity_crossover:
                     background_capacity.configure(policy == "B")
                 depth = args.depth_a if policy == "A" else args.depth_b
@@ -165,8 +186,9 @@ async def main(args):
                 stop, done = threading.Event(), asyncio.Event()
                 workers = [asyncio.create_task(asyncio.to_thread(listen)),
                            asyncio.create_task(heartbeat()), asyncio.create_task(scores())]
-                resources.enabled = args.capacity_crossover or (args.fixed_policy or policy) == "B"
+                resources.enabled = args.capacity_crossover or args.reuse_crossover or (args.fixed_policy or policy) == "B"
                 model_metrics(reset=True)
+                embedding_calls_at = native_embedding_calls
                 first, gaps, utterances = [], [], []
                 asr_start, lag_start = len(asr_times), len(loop_lags)
 
@@ -199,6 +221,8 @@ async def main(args):
                     print("PHASE", json.dumps(dict(phase=phase, policy=policy, first=summary(first),
                                                   threads=threads, admission_enabled=resources.enabled,
                                                   capacity=background_capacity.snapshot(),
+                                                  reuse_enabled=not args.reuse_crossover or policy == "B",
+                                                  native_embedding_calls=native_embedding_calls-embedding_calls_at,
                                                   depth=depth,
                                                   gaps=summary(gaps), utterances=utterances,
                                                   asr=asr_result, event_loop=loop_result,
@@ -216,6 +240,7 @@ async def main(args):
             stop.set(); done.set()
             resources.enabled = True
             resources.wake()
+            models[3]._m.encode = original_encode
             await asyncio.gather(*workers, return_exceptions=True)
             background_capacity.configure(initial_capacity)
             observer.stop()
@@ -235,6 +260,10 @@ if __name__ == "__main__":
                         help="Independent background pipelines sharing the loaded models")
     parser.add_argument("--capacity-crossover", action="store_true",
                         help="Keep baseline speech admission; A disables capacity, B enables it")
+    parser.add_argument("--reuse-crossover", action="store_true",
+                        help="Hold admission fixed; A recomputes exact batches, B reuses within each job")
+    parser.add_argument("--embedding-repeats", type=int, default=1,
+                        help="Exact requests for one synthetic batch per background job")
     parser.add_argument("--reference-audio", help="Optional explicit reference; generated PCM is never saved")
     parser.add_argument("--studio-voice", action="store_true", help="Read the configured bundled Studio reference")
     parser.add_argument("--threads-a", type=int, help="Optional CPU thread-budget crossover, phase A")
@@ -243,6 +272,13 @@ if __name__ == "__main__":
     parser.add_argument("--depth-a", choices=("cached", "compiled"), help="Optional depth-decoder crossover, phase A")
     parser.add_argument("--depth-b", choices=("cached", "compiled"), help="Optional depth-decoder crossover, phase B")
     args = parser.parse_args()
+    if args.embedding_repeats < 1:
+        parser.error("embedding repeats must be positive")
+    if args.reuse_crossover and args.capacity_crossover:
+        parser.error("reuse and capacity crossovers must be measured separately")
+    if args.reuse_crossover and (args.fixed_policy == "A"
+            or args.threads_a != args.threads_b or args.depth_a != args.depth_b):
+        parser.error("reuse crossover holds speech, CPU and decoder settings fixed")
     if min(args.utterances, args.background_jobs, args.background_workers) < 1 or not args.order or set(args.order)-set("AB"):
         parser.error("use a nonempty A/B order and at least one utterance")
     if any(value is not None and value < 1 for value in (args.threads_a, args.threads_b)):

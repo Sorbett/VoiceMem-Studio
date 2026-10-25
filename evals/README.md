@@ -6,6 +6,7 @@
 | --- | --- |
 | 对话和语音延迟 | `latency.py`、`deepseek_latency.py`、`breeze_cuda_latency.py` |
 | 本机推理调度竞争 | `engine_contention.py`（Apple Silicon，离线 ABBA 对照） |
+| MLX 深度解码编译 | `mlx_tts_decode.py`（Apple Silicon，缓存/校验编译 ABBA 对照） |
 | 分块预填充 | `mlx_prefill.py`（Apple Silicon，合成小模型，原生调度和缓存数值对照） |
 | 稳定输入的 EOT 计算复用 | `eot_stable_input.py`（CPU，校验追加静音前后分数逐值一致） |
 | 回合结束与打断 | `eot_turn_end.py`、`echo_barge.py` |
@@ -32,6 +33,22 @@ ASR 耗时、事件循环延迟、后台完成时间和真实换页速率。模�
 每句输出 PCM 的 SHA-256 用于校验样本一致性，不保存音频；`capacity_ms` 单独记录
 容量排队时间。运行时应暂停其他评测和单测。结果只能说明原生竞争下的生产表现，
 不能据此认定浏览器断音、端到端回复延迟或持续发热已经改善。
+
+`python -m evals.engine_contention --reuse-crossover --embedding-repeats 4 --order ABBAABBA --utterances 2 --depth-a compiled --depth-b compiled`
+对照单个后台任务内的精确 embedding 复用：两组使用相同语音准入、后台容量和解码配置，
+A 重算同一合成批次，B 在任务内复用。报告实际 encoder 调用数、向量摘要、TTS 音频摘要、
+ASR 耗时及后台完成时间。重复次数是显式测试条件，不能据此推断真实入库的命中率，
+也不能替代长时间真人播放、实际记忆队列或发热测试。
+
+`python -m evals.mlx_tts_decode --with-asr --order ABBAABBA --utterances 3`
+单独对照 Breeze 深度解码：A 使用缓存路径，B 使用启动时校验过输出和随机状态的
+整帧编译路径。两组保留相同模型、采样、音频批次及同一个 MLX 执行线程。
+可选流式识别使用内存中生成的同一条语音，默认在 MPS 上按 600 ms 节奏输入；
+`--asr-device cpu` 可独立测 CPU 场景。输出包含实际编译校验状态、PCM 与识别结果
+摘要、实际编译调用数、首帧、生产间隔、RTF、CPU 累计时间、原生耗时、
+MLX 活跃/缓存/峰值内存和系统热状态分类。
+该脚本不读取个人录音或音色参考，不保存合成音频，也不打开记忆库；
+语音样本的一致性不等于所有输入的数值证明，短时生产测试也不能证明持续降温。
 
 环境记录包含 FunASR 的 `cpu_threads`；`--fixed-policy B --threads-a 4 --threads-b 2`
 可保持语音准入不变，单独对照线程预算。每组的 `process_cpu_s` 是主进程及其线程

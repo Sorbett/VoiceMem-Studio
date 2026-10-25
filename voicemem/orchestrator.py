@@ -910,6 +910,7 @@ class Orchestrator:
         on_complete=None,
         *,
         language: str | None = None,
+        before_facts=None,
     ) -> dict:
         """Ingest an utterance using the existing perception and persistence pipeline.
 
@@ -918,7 +919,9 @@ class Orchestrator:
         reply supplies reaction context. async_facts=True schedules persistent writes
         in a captured worker context and returns acoustic metadata immediately.
         on_complete receives the durable result or error result on the worker thread;
-        synchronous ingestion invokes it before returning. Callback errors are logged."""
+        synchronous ingestion invokes it before returning. Callback errors are logged.
+        before_facts optionally waits for preceding writes after perception and before
+        fact processing; it must run without holding model or storage locks."""
         import time
 
         ts = observed_at or time.strftime("%H:%M:%S")
@@ -986,6 +989,8 @@ class Orchestrator:
                 try:
                     from voicemem.engine import background_checkpoint
                     background_checkpoint()
+                    if before_facts is not None:
+                        before_facts()
                     _notify_complete(self._finish_ingest(ctx))
                 except Exception as e:
                     import traceback
@@ -1019,6 +1024,8 @@ class Orchestrator:
                 "new_routine":         None,
             }
 
+        if before_facts is not None:
+            before_facts()
         result = self._finish_ingest(ctx)
         _notify_complete(result)
         return result

@@ -264,22 +264,29 @@ Docker backend.
 Windows source `npm start` uses the Docker route: it validates the local named-pipe context and Linux engine, fills missing memory/reply credentials in the ignored project `.env`, builds the Studio image only when absent, starts Compose, and waits up to 30 minutes with terminal logs before handing the discovered loopback URL to Electron. Existing settings and comments are preserved; Docker credentials are plaintext deployment configuration, distinct from native safeStorage. Docker containers and named volumes remain independently owned and are not stopped when the App quits. The existing WSL Python adapter remains available internally but is no longer the Windows source default.
 Explicit `start:remote` bypasses Docker and ignores any inherited automatic server URL. macOS uses native MLX or a remote service. Both clients share
 the same Web UI and observer contracts. The backend root serves the shared
-frontend from `studio/apps/ui/`, with assets under `/ui/`. Its first page reuses the original mode-selection homepage, with labeled
-image cards linking to the technical or digital-human visual style. A centered
+frontend from `studio/apps/ui/`, with assets under `/ui/`. Its first page is a style-selection homepage, with labeled
+image cards linking to the technical or digital-human visual style. Shared
+`design.css` tokens own the light and dark control palette, typography stack,
+corner radii, and style-preview cards used by the homepage, settings, and desktop
+connection page. Settings, Space pickers, and memory dialogs inherit the active
+page theme while each conversation view retains its own scene and layout. On
+narrow screens, the technical view stacks perception above the conversation or
+memory panel and presents its conversation list as an overlay. A centered
 settings shell lives inside each style, with an icon sidebar for appearance,
 text, conversation preferences, and components. The conversation panel mirrors
-Self Harness snapshots and uses a Persona text area, a fixed-choice tone control,
-and discrete sliders only for ordered fields. Backchannel frequency uses a
+Self Harness snapshots. Persona text is edited in a collapsible section;
+speech rate, tone, and waiting feedback use fixed-choice selects, while reply
+length and reasoning depth use segmented choices from the same bounded schema. Backchannel frequency uses a
 four-node curve editor whose nodes are the expected acknowledgement quotas for
 the 0–3s, 3–6s, 6–10s, and 10s+ speech phases. Fractional values are sampled to
 integer per-turn targets while preserving their expectation; the shared
 first-six-second cap and the refractory cooldown still apply. Preset Self Harness
 values provide the initial curve, while an explicit user curve is scoped to the
 current conversation and is reflected in subsequent snapshots. The component
-settings tab presents the fixed
-input, memory, reply, speech, and pet components as a draggable canvas. Only
-normalized card positions are stored in browser local storage; components cannot
-be removed. `/ui` responses use `Cache-Control: no-store`, and the entry pages
+settings tab presents input, memory, reply, speech, and pet as a list with shared
+icons and provider labels. Selecting a row opens its configuration; returning
+restores keyboard focus to that row. Components cannot be removed, and this
+panel does not write layout preferences. `/ui` responses use `Cache-Control: no-store`, and the entry pages
 version their settings assets so an Electron reload cannot retain an older
 settings implementation after an update. `/api/components` supplies non-secret provider, model, endpoint, and
 readiness labels. For an App-owned backend, a narrowly scoped isolated preload
@@ -324,6 +331,11 @@ checkpoints and the cache is discarded on page refresh. UI replies and
 perception come from backend events. Confirmed input IDs deduplicate transcripts
 and merge continuations; interruption uses the backend's heard prefix. Streaming
 reply deltas update the active text node without rebuilding prior chat turns.
+Both styles use `transcript.js` to reconcile message objects with stable bubble
+nodes, retain the unchanged ASR prefix while updating its tentative tail, and
+coalesce scroll following while respecting readers who have scrolled upward.
+Only newly inserted bubbles enter with an animation; transcript and perception
+updates do not replay animations on existing turns.
 Changing style, conversation, or leaving the page closes its connection. UI
 language changes retain the connection and do not reopen or rewrite memory. Chat
 lists are page-local and reset on refresh; opening a previous list item starts a
@@ -353,7 +365,15 @@ mobile block inflation; user zoom and content-size settings remain available.
 Heading weight distinguishes sections without enlarging subtitle text.
 Raw HTML remains text, images display their alt text, and only HTTP, HTTPS or
 mailto links are clickable. Streaming paints coalesce per animation frame;
-completion/reset cancels stale paints. User transcripts remain plain text, and
+completed blocks separated by a terminated blank line retain their parse and
+DOM nodes. The active block patches its existing DOM, and the live caption and
+history share the latest immutable parse plan with independent DOM ownership.
+Live reply appends fade in only the newly visible text over a short opacity
+transition. Existing text stays opaque, temporary inline wrappers are removed
+before reconciliation, and completion or interruption cancels stale reveals.
+History restoration and reduced-motion views render without this transition.
+Unchanged history bodies skip parsing; completion/reset cancels stale paints.
+User transcripts remain plain text, and
 copy/history retain source Markdown. Interrupted previews render the heard
 prefix without requiring closing formatting markers.
 The brain backdrop remains an illustration, while graph nodes are rebuilt from
@@ -585,7 +605,8 @@ Owned by provider modules and shared schedulers:
   `backends/` owns the MLX execution thread and cooperative prefill, CUDA speech
   workers, Torch per-device locks and CPU thread budgets; `scheduling/` owns
   priority contexts, speech-aware cross-backend admission and background native
-  task lifetime; `telemetry/` owns adapter timings and OS/device observations.
+  task lifetime and replaceable CPU probes; `telemetry/` owns adapter timings and
+  OS/device observations.
   Provider consumers use the public `voicemem.engine` facade;
 - `voicemem/utils/engine.py`, `gpu_loop.py`, `torch_lock.py`, `background.py`:
   compatibility imports exposing the same engine-owned objects;
@@ -771,13 +792,20 @@ Streaming ASR runs in a dedicated serial worker so chunk inference does not
 block WebSocket input. At turn end, full-audio ASR refinement may run in a
 separate final-ASR executor. Epoch checks prevent obsolete worker results from
 overwriting a newer turn.
-Audio EOT scoring also runs off the WebSocket loop, on one dedicated serial
-executor independent of background ingestion and final ASR. Each stream awaits
-its score before applying the existing confirmation policy, retaining one pending
-probe per serial feed rather than spawning probes for every arriving frame.
-Reset, close and provider replacement invalidate pending results and failures;
-cancelled queued probes never enter the provider. An active native call may finish
-after cancellation without updating the stream.
+Audio EOT scoring runs on the engine-owned serial CPU executor in
+`engine/scheduling/probes.py`, independent of background ingestion and final ASR.
+`VoiceStream.feed` polls completed scores without awaiting native EOT work, so
+capture can continue receiving and forwarding every frame to streaming ASR.
+Each connection owns at most one queued or running probe. Busy input updates
+the existing turn buffer; the next admitted probe copies its latest snapshot
+instead of queuing old waveform copies. Reset and close cancel unstarted probes;
+running native work retains its slot until completion and cannot update a newer
+turn. Provider replacement and speech resumption also invalidate obsolete scores.
+A newly consumed score may confirm a turn only if its snapshot includes the
+latest voiced frame and some silence, and the existing silence floor and
+application pause policy both permit confirmation. Cached and speech-only
+scores remain private speculation signals. ASR input coverage, model settings
+and silence fallback are unchanged.
 The recognizer remains serial. Confirmed decodes precede queued speculative
 snapshots, and a stream cancels its unstarted snapshots at finalization.
 Already-running native calls finish normally; different audio snapshots are
@@ -1408,6 +1436,14 @@ reply text permits sixteen tokens. A slow consumer pauses only that producer,
 leaving the MLX worker available for other jobs. Cancellation wakes paused jobs
 and closes their generators on the owning thread. Closing their async streams cancels
 their GPU jobs while preserving the existing single-thread codec cleanup order.
+Studio also bounds the downstream reply pipeline: at most two segments retain
+synthesis/delivery slots, each PCM queue holds at most one second or eight
+chunks, and completed synthesis tasks are released immediately. One oversized
+provider chunk is accepted intact when the queue is empty. Provider-side pending
+chunks and the chunk currently being delivered are additional bounded inventory.
+Terminal errors and EOF do not consume queue capacity, so cancellation cannot
+deadlock behind a full audio buffer. Segment text, PCM bytes, timestamps and
+provider serialization remain unchanged.
 Breeze diagnostics pair `[tts-gpu]` and `[tts-delivery]` using a request ID. They
 record queue time, first PCM, accumulated generation time, longest generation
 step, audio duration, delivery gaps and producer-to-consumer handoff delay without
@@ -1451,6 +1487,29 @@ conversation pipeline. CUDA startup validates the selected devices, code checkou
 and CUDA checkpoint including its bundled codec, and never acquires MLX weights.
 DeepSeek-only deployments require only DeepSeek credentials.
 
+### MLX decode compilation
+
+`engine/backends/mlx/compilation.py` supplies `VerifiedDecode` for pure,
+array-valued decode steps on the existing `GpuLoop` thread. Model weights and
+external caches remain provider-owned. Explicit startup verification replays
+eager and compiled execution from the same supplied seed, checking exact sampled
+output and the resulting random state, then resets that seed. Verification runs
+only during warmup; it never consumes draws from a live generation.
+Compilation errors or mismatches disable that wrapper with a metadata-only
+warning; eager failures and later native failures remain visible. Later input
+shape or dtype changes and unverified profiles use eager execution rather than
+creating unverified traces.
+This sample check does not establish numerical equivalence for every input.
+
+Studio selects this path for Breeze's cached depth decoder, warming it before
+serving audio. Warmup obtains activation shape and dtype from an isolated
+prompt prefill followed by backbone decode, including promotion from prefilled
+KV, instead of assuming they match quantized output-head weights.
+Each parameter profile owns its wrapper; the remaining model,
+reference-prefix cache, sampling settings, codec batches and cancellation
+boundaries retain their existing implementations. The reusable Breeze constructor
+keeps its cached default. CUDA retains its independent graph-backed depth path.
+
 ### Torch device admission
 
 Torch-backed embedding and related MPS operations use the process-level lock in
@@ -1481,6 +1540,29 @@ owning model/device locks retain their existing no-wait reentrant path.
 Remote API and persistence waits acquire no capacity reservation. Cancellation
 of an awaiting task cannot release capacity ahead of its already-started native
 thread; existing background-lane ownership still drains that work.
+
+`engine/scheduling/reuse.py` provides opt-in exact-request reuse within one
+captured background operation. The pool retains at most 64 completed entries
+and two MiB of immutable CPU result payloads; it retains no GPU tensors.
+Concurrent identical requests share one computation outside provider and
+device locks. Failed calls are not cached, waiting cancellation cannot release
+the producer's native ownership, and oversized or unsupported results retain
+their native path. Nested scopes and captured workers share the operation's
+pool; independent jobs do not. `reuse_scope(enabled=False)` disables reuse for
+the captured scope and its children.
+
+The built-in local embedding adapter opts in for exact NumPy batches with stable
+inference model state. Its keys distinguish encoder ownership, ordered inputs,
+encoding options, prompt configuration and parameter versions/placement/dtype.
+The local adapter hashes text inputs rather than retaining them in cache keys.
+Each reused result is an independent CPU array. Explicit device overrides,
+custom execution options, tensor/token outputs, training state and callers
+already owning device locks bypass reuse. Model/tokenizer configuration must
+remain immutable within an opted-in operation. Database queries and memory
+results are never memoized; provider injection and persistence ordering remain
+unchanged. `[engine-model] backend=cache` reports reuse lookup/copy or coalesced
+wait time separately from native inference. Such records do not update native
+cost estimates or background recovery timestamps.
 
 `device_lock` gives each explicit CUDA device a process-owned priority lock;
 equivalent device aliases resolve to the same lock. Different CUDA devices can
@@ -1519,9 +1601,14 @@ input coverage, decoder caches, thresholds and generated-output contracts.
 
 The engine supplies bounded ONNX session options without importing ONNX Runtime
 at module import. EOT uses two intra-op threads and one inter-op thread, sequential
-execution and no idle worker spinning. Its model, input preparation, score
-threshold, scoring cadence and dedicated executor remain unchanged. Independent
-CPU perception retains its model-specific serialization.
+execution and no idle worker spinning. Its model, input preparation and score
+threshold remain unchanged. The engine's `LatestProbe` retains the minimum
+40 ms audio interval between EOT submissions. A native probe exceeding that
+budget gets an equal wall-time recovery gap before another snapshot is admitted;
+queue wait is excluded from this cost. Scores are consumed on subsequent input
+frames without stopping capture. This bounds repeated EOT work under contention
+on both MLX and CUDA deployments; it does not claim to control hardware clocks
+or temperature. Independent CPU perception retains its model-specific serialization.
 EOT retains one digest/score pair for identical canonical eight-second input.
 Extra silence beyond the existing tail crop can reuse that result without
 feature extraction or ONNX execution. Changed canonical samples, sample rate or
@@ -1539,18 +1626,24 @@ rejected input, inactive capture and disconnect release it. Reply scheduling
 reserves a token before its child task can start, then releases it after the
 generation pipeline or on cancellation, including cancellation before the
 child's first execution. This bridges the input and generation scopes.
-Each Studio agent owns one background lane shared by memory ingestion and
-acoustic UI inference. The generic lane and cancellation ownership live in the
-engine; Studio binds them to one agent. Admission prefers an idle window with
-bounded deferral, so continuous foreground leases cannot starve confirmed memory.
-Pending confirmed turns remain queued in order; this bounds active jobs, not
-queued dialogue. The lane remains occupied until durable ingestion completes,
-including the native fact worker started by `async_facts=True`.
+Each Studio agent owns a bounded memory pipeline and a separate acoustic UI lane.
+Their generic task and cancellation ownership live in the engine. Admission
+prefers an idle window with bounded deferral, so continuous foreground leases
+cannot starve confirmed memory. The memory pipeline admits at most two turns
+through durable completion. Perception preparation remains FIFO; a prepared
+turn's fact worker waits for its predecessor's completion outside model and
+storage locks. This overlaps the next turn's perception with an earlier turn's
+fact processing while keeping fact extraction, conflict resolution, writes and
+completion callbacks in order. Adapters without `ingest_ordered` retain serial
+durable completion. Pending confirmed turns remain queued in order; the bound
+applies to active jobs, not queued dialogue.
 Cancellation removes unstarted jobs. A cancelled caller detaches from started
-native work while the lane retains ownership until that work finishes, so the
-next job cannot overlap it. Existing session and output guards reject stale UI
-results. This lane is agent-owned; it does not impose a new process-wide account
-or session admission limit.
+native work while the pipeline retains its slot and ordering barrier until that
+work finishes. Failed preparation cannot let a later write overtake a preceding
+native job. Acoustic UI work has independent lifecycle admission and continues to
+share the process-level speech and native-capacity budgets. Existing session and
+output guards reject stale UI results. These queues are agent-owned and impose
+no new process-wide account or session limit.
 
 `voicemem.engine.scheduling.background` supplies an opt-in captured idle waiter without
 depending on Studio. Studio captures background inference priority after the
@@ -1629,11 +1722,44 @@ observable. The categories are OS thermal assessments, not temperature or
 clock-frequency measurements. Unsupported platforms, failed reads and unknown
 future values are explicit, never interpreted as a cool device. Sampling does
 not change model quality, system power settings or foreground scheduling.
+Fresh fair/serious/critical samples add a background-only gap after native work,
+equal to half, one or two times the previous conflicting background call's
+duration, respectively, capped at two seconds. Heating escalates immediately;
+five seconds of fresh lower-state samples permit recovery to that state's
+budget. Missing, unknown or three-second-old samples disable thermal pacing.
+
+Periodic audio adapters may supply `cadence_s` to `inference_call`. Successful
+streaming FunASR calls declare their existing 600 ms chunk cadence; final tails
+and failures do not contribute. Native runtime excludes model-lock and queue
+waits. Three consecutive calls using at least half the cadence, with smoothed
+load also at least half, activate the same background-only gap at one times
+background native duration. The load uses a 0.25 EWMA and recovers below 40%;
+three-second-old feedback expires. This works without OS thermal support and
+reserves time for the other foreground stages without delaying ASR admission,
+changing chunk sizes, dropping input or rewriting decoder caches. Isolated
+startup spikes cannot establish sustained pressure. CPU and MPS conflict
+conservatively; known work on distinct CUDA devices keeps independent load and
+background recovery histories. Thermal and periodic-load budgets combine by
+their maximum rather than adding delays.
+
+The existing six-second per-stage deferral bound still guarantees admission
+progress; model inputs, results and persistence ordering are unchanged.
+`pacing_level` reports the process-wide conservative pacing factor,
+`realtime_pressure` counts fresh overloaded periodic sources, and `cooling_ms`
+reports the remaining conservative background gap. This is a cooperative
+reduction in background duty, not a device power or temperature cap. Running
+native work cannot be preempted; end-to-end heat and latency still require
+sustained native playback measurements.
 
 Acoustic-emotion tasks belong to the conversation or realtime session and capture
 their output ID, Memory Space and VoiceMem instance. Ownership is checked before
 and after inference. A new output cancels old tasks, and session closure cancels
-and awaits them. Native inference already running in a thread may finish, but its
+and awaits them. Disposable acoustic and display work opt into a captured
+thread-safe cancellation predicate. Native capacity, speech/thermal admission
+and model-lock waits check it, then recheck before executing a model. Obsolete
+queued calls release reservations without running; confirmed memory jobs omit
+this opt-in and retain durable completion. Native inference already running in a
+thread may finish, but its
 stale result cannot update the client. Accepted tag updates carry the output ID;
 reply audio never awaits this background result.
 
@@ -1654,6 +1780,19 @@ flowchart LR
 The canonical Web media format is 24 kHz mono PCM16. Each assistant output has
 an output ID. Late audio, subtitle, checkpoint, and cancellation events resolve
 against that ID.
+
+For chained replies, `studio/web/audio_flow.py` owns a per-output transport
+budget. Validated browser inventory above two seconds pauses further sends
+until one second remains. Newly sent audio is added to the estimate; only
+playing feedback permits estimated drain. Missing or two-second-old feedback
+falls back to legacy delivery, preserving clients without playback reports.
+Output ownership is checked again after every pacing wait. This budget is
+independent of heard-prefix accounting and does not apply to realtime providers.
+`ReplySink` also pauses private PCM after one second (plus at most the chunk
+crossing the threshold); confirmation wakes the producer outside its send lock.
+It preserves original event order and accepts oversized provider chunks intact.
+First audio is never held to fill these budgets. Rejected speculation and
+disconnect cancel waiters through the existing reply task lifecycle.
 
 The local Breeze adapter emits an initial acoustic batch sized to satisfy the
 browser's admission buffer in one delivery. This avoids a redundant one-frame
@@ -1705,15 +1844,33 @@ Interruption separates reversible detection from cancellation:
 Confirmed capture interruptions bypass reply-start grace in both chained and
 Realtime sessions. Pause, resume and reply deltas carry the owning output ID.
 The shared desktop/browser client holds reply text until the main output starts
-playing, and holds further deltas and completion events during a candidate
-pause. Rejection resumes the same ordered text and audio; confirmation discards
+playing. Managed chained replies opt into `caption_sync: "playback"` on
+`answer_start`. For these outputs, the conversation checkpoint owner emits
+deduplicated `answer_progress` events with an output ID and a `text_end` boundary
+in Unicode code points. Boundaries reuse `AudioTimeline.heard_text()`, including
+its source-Markdown mapping and provider alignment or speech-rate fallback;
+they do not introduce a new word-alignment model. After playback starts, the
+browser previews one complete short phrase ahead of the reported heard prefix,
+using punctuation and a bounded, word-aware fallback for unpunctuated text.
+Incomplete phrases wait for a boundary rather than appearing character by
+character. Managed replies emit `answer_text_done` on normal text-generation EOF,
+independently of TTS completion. This event follows the same speculative sink and
+output ownership as text deltas, and lets completed short replies appear in full
+as soon as playback starts. Playback progress advances
+the next phrase; stalled playback does not advance it. This display preview does
+not change the heard prefix used by interruption, session context, or memory.
+Successful drain releases any remaining source formatting and then completion.
+Direct callers and Realtime
+retain first-playback gating when the opt-in field is absent.
+Both paths hold further deltas and completion events during a candidate pause.
+Rejection resumes the same ordered text and audio; confirmation discards
 the pending text and retains only the server-confirmed heard prefix. Replacement
 outputs, failures and disconnects discard pending display events. A successful
 text-only drain releases its ordered completion without requiring an audio start.
 Both visual styles remove an interrupted reply bubble when nothing was heard,
 without removing the confirmed user input.
-Each renderer binds message objects to their current body nodes, rebuilding those
-bindings with the visible transcript. Reply deltas and completion update the
+Each renderer retains bindings from message objects to their bubble and body
+nodes while those messages remain visible. Reply deltas and completion update the
 owning assistant message even if a user acknowledgement has appended a later row.
 These display rules apply equally to both Studio visual styles and do not defer
 model generation or TTS work.
@@ -1779,13 +1936,19 @@ An agent tracks unfinished native writes separately from its asyncio task set.
 Returning from `ingest(async_facts=True)` does not complete a native write; its
 durable completion callback or a failed ingest releases that pending write. Browser completion messages contain status and IDs, never backend error
 details.
-The Studio background lane waits for this completion callback before admitting
-another ingest or acoustic UI job. The original Space, language, pending-write
-tracking and history completion callback remain attached even if its caller is
-cancelled or the active UI Space changes. Application shutdown releases idle
-waiters and drains accepted memory tasks and detached native work on the original
-event loop, before provider cleanup. This queue is process memory, not a durable
-retry journal; forced process termination can still interrupt pending writes.
+`VoiceMem.ingest_ordered` adds an optional synchronous predecessor barrier before
+fact processing; its perception metadata and durable callback keep the existing
+ingestion contract. The barrier runs on the captured fact worker with no model
+or storage lock held. Studio can prepare one following turn while an earlier
+write is pending, and releases pipeline capacity only after durable completion.
+The original Space, language, pending-write tracking and history completion
+callback remain attached even if its caller is cancelled or the active UI Space
+changes. Application shutdown releases idle waiters and drains accepted memory
+tasks, detached native work and the acoustic lane on the original event loop,
+before provider cleanup. These queues are process memory, not durable retry
+journals; forced process termination can still interrupt pending writes.
+`[memory-stage]` records perception preparation and predecessor-barrier wait
+separately; `[memory]` completion continues to include actual durable work.
 
 ## 13. State ownership
 
@@ -1813,7 +1976,7 @@ retry journal; forced process termination can still interrupt pending writes.
 | Text/media alignment | `AudioTimeline` | Assistant output ID |
 | PCM queue and echo reference | Browser worklets | Assistant output ID/session |
 | Background ingest | Captured turn and `VoiceMem` | Until completion |
-| Background native admission | Studio agent background lane and idle events | Agent / native job lifetime |
+| Background job admission | Studio agent memory pipeline, acoustic lane and idle events | Agent / native job lifetime |
 | Background acoustic emotion | Conversation or realtime session, captured output and Space | Until completion or cancellation |
 
 Turn-specific state is explicit. Process globals are reserved for configuration,

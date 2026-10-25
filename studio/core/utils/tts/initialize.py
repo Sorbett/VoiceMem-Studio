@@ -21,4 +21,4 @@ def _create():
     from .component import BreezeMLXTTS
     return BreezeMLXTTS(model=str(MODEL), ref_audio=str(REFERENCE),
                         cfg_scale=1.0, seed=42, chunk_frames=2,
-                        first_frames=2, max_tokens=750, depth_mode="cached")
+                        first_frames=2, max_tokens=750, depth_mode="compiled")

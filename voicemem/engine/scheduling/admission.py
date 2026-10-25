@@ -8,6 +8,7 @@ import threading
 import time
 
 from ..backends.devices import device_key
+from .cancellation import check_cancelled
 
 
 _speech = ContextVar("voicemem_speech_feedback", default=None)
@@ -123,6 +124,80 @@ class ResourceAdmission:
         self.enabled = True
         self.deferred = self.forced = 0
         self.aged = 0
+        self._thermal_state = "unavailable"
+        self._thermal_sampled = float("-inf")
+        self._thermal_level = 0
+        self._cool_since = None
+        self._last_background = {}
+        self._realtime = {}
+
+    def thermal(self, state):
+        """Use fresh OS assessments with five seconds of cool recovery hysteresis."""
+        with self._condition:
+            now = self.clock()
+            if now - self._thermal_sampled >= 3:
+                self._cool_since = None
+                self._thermal_level = 0
+            self._thermal_state, self._thermal_sampled = state, now
+            level = {"nominal": 0, "fair": .5, "serious": 1, "critical": 2}.get(state)
+            if level is None:
+                self._thermal_level = 0
+                self._cool_since = None
+            elif level >= self._thermal_level:
+                self._thermal_level = level
+                self._cool_since = None
+            else:
+                if self._cool_since is None:
+                    self._cool_since = now
+                if now - self._cool_since >= 5:
+                    self._thermal_level = level
+                    self._cool_since = None
+            self._condition.notify_all()
+
+    @staticmethod
+    def _independent(first, second):
+        return (first is not None and second is not None
+                and first.startswith("cuda:") and second.startswith("cuda:")
+                and first != second)
+
+    def realtime(self, model, elapsed, cadence_s, *, device=None):
+        """Observe successful periodic native work, excluding queues and final tails.
+
+        Three consecutive heavy calls establish load. Half a cadence reserves time for
+        other foreground stages; recovery below 40% avoids threshold chatter.
+        This feedback only paces background work and never delays audio input.
+        """
+        if (not math.isfinite(elapsed) or not math.isfinite(cadence_s)
+                or elapsed < 0 or cadence_s <= 0):
+            return
+        with self._condition:
+            now = self.clock()
+            key = (model, device_key(device))
+            previous = self._realtime.get(key)
+            if previous is None and len(self._realtime) >= 128:
+                return
+            ratio = elapsed / cadence_s
+            if previous is None or now - previous[3] >= 3:
+                load, streak, hot = ratio, 0, False
+            else:
+                old, streak, hot, _ = previous
+                load = .25 * ratio + .75 * old
+            streak = streak + 1 if ratio >= .5 else 0
+            hot = load >= .4 if hot else streak >= 3 and load >= .5
+            self._realtime[key] = (load, streak, hot, now)
+            self._condition.notify_all()
+
+    def _pacing_level(self, now, device=None):
+        thermal = self._thermal_level if now - self._thermal_sampled < 3 else 0
+        busy = any(hot and now - sampled < 3 and not self._independent(device, placement)
+                   for (_, placement), (_, _, hot, sampled) in self._realtime.items())
+        return max(thermal, int(busy))
+
+    def _cooling_delay(self, now, device=None):
+        level = self._pacing_level(now, device)
+        return max((max(0.0, finished + min(2.0, cost * level) - now)
+                    for placement, (cost, finished) in self._last_background.items()
+                    if not self._independent(device, placement)), default=0.0)
 
     @contextmanager
     def bind(self, feedback):
@@ -186,9 +261,12 @@ class ResourceAdmission:
             key = (model, device_key(device))
             old = self._cost.get(key, elapsed)
             self._cost[key] = max(elapsed, .8 * old + .2 * elapsed)
+            self._last_background[device_key(device)] = (max(0.0, elapsed), self.clock())
 
     def _blocked(self, model, now, device=None, *, aged=False):
         device = device_key(device)
+        if self._cooling_delay(now, device):
+            return True
         cost = self._cost.get((model, device), .35)
         paging, sampled = self._paging
         constrained, measured = self._pressure.get(device, (False, 0.))
@@ -200,8 +278,7 @@ class ResourceAdmission:
             reserve *= 2
         for feedback in self._active:
             placements = self._devices.get(feedback, {None})
-            if device and device.startswith("cuda:") and all(
-                    d and d.startswith("cuda:") and d != device for d in placements):
+            if all(self._independent(device, placement) for placement in placements):
                 continue
             state = feedback.snapshot()
             if state["state"] == "paused":
@@ -220,11 +297,13 @@ class ResourceAdmission:
     def wait(self, model, *, device=None):
         """Wait outside model/storage locks; return wait seconds and aging flag."""
         started = self.clock()
+        check_cancelled()
         waited = False
         budget = _budget.get()
         try:
             with self._condition:
                 while self.enabled and self._blocked(model, self.clock(), device):
+                    check_cancelled()
                     elapsed = self.clock() - started
                     if (budget is not None and budget.spent() + elapsed >= self.max_defer_s
                             and not self._blocked(model, self.clock(), device, aged=True)):
@@ -242,6 +321,7 @@ class ResourceAdmission:
                         self.deferred += 1
                         waited = True
                     self._condition.wait(min(.05, remaining))
+            check_cancelled()
             return self.clock() - started, False
         finally:
             if budget is not None and waited:
@@ -249,8 +329,14 @@ class ResourceAdmission:
 
     def snapshot(self):
         with self._condition:
+            now = self.clock()
             return {"speech_jobs": len(self._active), "deferred": self.deferred,
-                    "forced": self.forced, "aged": self.aged}
+                    "forced": self.forced, "aged": self.aged,
+                    "thermal_state": self._thermal_state,
+                    "pacing_level": self._pacing_level(now),
+                    "realtime_pressure": sum(hot and now - sampled < 3
+                                             for _, _, hot, sampled in self._realtime.values()),
+                    "cooling_ms": self._cooling_delay(now) * 1000}
 
 
 resources = ResourceAdmission()

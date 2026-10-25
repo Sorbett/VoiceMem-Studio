@@ -2,6 +2,7 @@
 import asyncio
 import re
 import time
+import threading
 from studio.core.voicemem import shared_embed_model
 from studio.paths import MODELS
 from studio.core.utils.memory.background import background_lane
@@ -78,13 +79,17 @@ class Perception:
         """Return an owner-managed task; obsolete results never reach the browser."""
         if not audio_path:
             return
+        cancelled = threading.Event()
 
         def infer():
-            from voicemem.engine import background_scope
+            from voicemem.engine import InferenceCancelled, background_scope
             if not is_current():
                 return None
-            with background_scope(None):
-                return self._acoustic_emotion(audio_path)
+            try:
+                with background_scope(None, cancelled=lambda: cancelled.is_set() or not is_current()):
+                    return self._acoustic_emotion(audio_path)
+            except InferenceCancelled:
+                return None
 
         async def run():
             try:
@@ -107,6 +112,8 @@ class Perception:
                                 "emotion": emo, "emotion_from": "acoustic"})
             except Exception as e:
                 print(f"[web] 后台声学情绪跳过：{type(e).__name__}: {e}", flush=True)
+            finally:
+                cancelled.set()
 
         return asyncio.create_task(run())
 

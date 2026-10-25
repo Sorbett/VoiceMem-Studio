@@ -20,7 +20,7 @@ const MEMORIES = {facts: [], traits: []};
 const CONVERSATIONS = [{id:'c1',title:'New conversation',space:'',messages:[]}];
 const firstConversation = CONVERSATIONS[0];
 let activeConv = 'c1', activeDomain = null, replyMessage = null;
-const messageBodies = new Map();
+const messageBodies = new Map(), messageNodes = new Map();
 let conversationSwitch = 0;
 let voiceActive = false;
 let perception = {};
@@ -82,7 +82,6 @@ function messageNode(m) {
     </div>`;
   const body = wrap.querySelector('.msg-body');
   messageBodies.set(m, body);
-  if(m.role==='ai') VMMarkdown.render(body,m.text,{streaming:!!m.truncated});
   const buttons=wrap.querySelectorAll('.msg-foot button');
   if(buttons[0]) {buttons[0].setAttribute('aria-label','复制回复');buttons[0].onclick=()=>VMUI.copy(m.text);}
   if(buttons[1]) {
@@ -105,19 +104,21 @@ function messageNode(m) {
 function renderThread() {
   const conv = CONVERSATIONS.find(c => c.id === activeConv);
   const t = $('thread');
-  messageBodies.clear();
-  t.innerHTML = '';
-  const card = document.createElement('div');
-  card.className = 'thread-card';
-  if (!conv.messages.length) {
-    const empty = document.createElement('div');
-    empty.className = 'thread-empty';
-    empty.textContent = '说点什么，VoiceMem 会先去记忆里找相关的内容，再回答。';
-    card.appendChild(empty);
+  let card = t.querySelector('.thread-card');
+  if(!card){card=document.createElement('div');card.className='thread-card';t.appendChild(card);}
+  card.querySelector('.thread-empty')?.remove();
+  VMTranscript.follow(t);
+  VMTranscript.reconcile(card,conv.messages,messageNodes,messageNode,(node,m)=>{
+    const body=node.querySelector('.msg-body');
+    messageBodies.set(m,body);
+    if(m.role==='ai') VMMarkdown.render(body,m.text,{streaming:(m===replyMessage&&!m.complete)||!!m.truncated});
+    else if(body.textContent!==m.text) body.textContent=m.text;
+  });
+  for(const m of messageBodies.keys()) if(!messageNodes.has(m)) messageBodies.delete(m);
+  if(!conv.messages.length){
+    const empty=document.createElement('div');empty.className='thread-empty';
+    empty.textContent='说点什么，VoiceMem 会先去记忆里找相关的内容，再回答。';card.appendChild(empty);
   }
-  conv.messages.forEach(m => card.appendChild(messageNode(m)));
-  t.appendChild(card);
-  t.scrollTop = t.scrollHeight;
 }
 
 function renderPerception() {
@@ -215,11 +216,11 @@ function handleStudio(message) {
   const conv = CONVERSATIONS.find(c => c.id === activeConv);
   if (message.type === 'partial_transcript') {
     if (!VMStudio.acceptsPartial(conv.messages, message)) return;
-    $('liveEcho').textContent = message.text; $('liveEcho').classList.remove('empty');
+    VMTranscript.text($('liveEcho'),message.text); $('liveEcho').classList.remove('empty');
   } else if (message.type === 'user_transcript' || message.type === 'user_backchannel') {
     if (!VMStudio.acceptsPartial(conv.messages, message)) return;
     VMStudio.applyUser(conv.messages, message, 'user');
-    $('liveEcho').textContent = message.text; $('liveEcho').classList.remove('empty');
+    VMTranscript.text($('liveEcho'),message.text,{final:true}); $('liveEcho').classList.remove('empty');
     if (conv.title.startsWith('New conversation')) conv.title = message.text.slice(0, 34);
     if (message.type === 'user_transcript') perception = {};
     renderPerception(); renderThread(); renderConvList();
@@ -228,12 +229,15 @@ function handleStudio(message) {
     replyMessage = {role:'ai',text:'',time:now(),outputId:message.output_id};
     conv.messages.push(replyMessage); VMMarkdown.render($('aiEcho'),''); renderThread();
   } else if (message.type === 'answer_delta' && replyMessage) {
-    replyMessage.text += message.text || ''; VMMarkdown.render($('aiEcho'),replyMessage.text,{streaming:true});
+    replyMessage.text += message.text || ''; VMMarkdown.render($('aiEcho'),replyMessage.text,{streaming:true,reveal:true});
+    VMTranscript.follow($('aiEcho'));
     $('aiEcho').classList.remove('empty');
     const body = messageBodies.get(replyMessage);
-    if (body) VMMarkdown.render(body,replyMessage.text,{streaming:true,onRender:()=>{$('thread').scrollTop=$('thread').scrollHeight;}});
+    if (body) VMMarkdown.render(body,replyMessage.text,{streaming:true,reveal:true});
     else renderThread();
+    VMTranscript.follow($('thread'));
   } else if (message.type === 'answer_done' && replyMessage) {
+    replyMessage.complete = true;
     VMMarkdown.render($('aiEcho'),replyMessage.text);
     const body = messageBodies.get(replyMessage);
     if (body) VMMarkdown.render(body,replyMessage.text);

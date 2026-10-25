@@ -242,7 +242,8 @@ class FunASRStreamingASR:
     def _run(self, samples, is_final: bool) -> str:
         from voicemem.engine import Service, device_lock, inference_call
         with inference_call("streaming_asr", "torch", lock=device_lock(getattr(self, "device", None)),
-                            service=Service.AUDIO):
+                            service=Service.AUDIO, device=getattr(self, "device", None),
+                            cadence_s=self.STRIDE / SAMPLE_RATE if not is_final else None):
             res = self.model.generate(input=samples, cache=self._cache, is_final=is_final,
                                       chunk_size=self.CHUNK_SIZE, **self.LOOK_BACK)
         if res and res[0].get("text"):

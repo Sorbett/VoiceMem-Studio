@@ -5,43 +5,15 @@ const fs = require('node:fs');
 const path = require('node:path');
 const vm = require('node:vm');
 
-class Element {
-  constructor() { this.children = []; this.style = {}; this.classList = {add(){},remove(){}}; this._text = ''; }
-  append(...children) { for (const child of children) {child.parent = this; this.children.push(child);} }
-  appendChild(child) { this.append(child); }
-  replaceChildren(...children) { this.children = []; this._text = ''; this.append(...children); }
-  set textContent(text) { this.replaceChildren(); this._text = text; }
-  get textContent() { return this._text + this.children.map(child => child.textContent).join(''); }
+const {Node} = require('../helpers/dom.cjs');
+class Element extends Node {
   set innerHTML(html) {
     this.replaceChildren();
-    // Only the message-body portion of the technical template is needed here.
     const body = html.match(/<div class="msg-body">([^]*?)<\/div>/);
     if (body) {
       const node = new Element(); node.className = 'msg-body'; node.textContent = body[1]; this.append(node);
     }
   }
-  querySelector(selector) {
-    const parts = selector.split(' ');
-    const matches = (node, part) => {
-      const [name, pseudo] = part.split(':');
-      return name.startsWith('.') && (node.className || '').split(' ').includes(name.slice(1)) &&
-        (!pseudo || (pseudo === 'last-child' && node.parent?.children.at(-1) === node));
-    };
-    const candidates = this.children.flatMap(child => [child, ...child.descendants()]);
-    return candidates.find(node => {
-      if (!matches(node, parts.at(-1))) return false;
-      let parent = node.parent;
-      for (let i = parts.length - 2; i >= 0; i--) {
-        while (parent && !matches(parent, parts[i])) parent = parent.parent;
-        if (!parent) return false;
-        parent = parent.parent;
-      }
-      return true;
-    }) || null;
-  }
-  descendants() { return this.children.flatMap(child => [child, ...child.descendants()]); }
-  querySelectorAll() { return []; }
-  setAttribute() {}
 }
 
 function fixture(style) {
@@ -64,7 +36,7 @@ function fixture(style) {
   const context = {
     window:{}, current:conversation, CONVERSATIONS:[conversation], activeConv:conversation.id,
     state:{get messages(){return conversation.messages;}}, replyMessage:null, now:()=>'', clearTimeout(){}, typeTimer:null,
-    messageBodies, document:{createElement:()=>new Element()}, requestAnimationFrame:callback=>callback(),
+    messageBodies, messageNodes:new Map(), document:{createElement:()=>new Element(),createTextNode:text=>new Node('#text',text)}, requestAnimationFrame:callback=>{callback();return 0;}, matchMedia:()=>({matches:true}),
     VMMarkdown:{render(element, text){element.textContent = text; rendered.push(text);}}, $,
     el(_tag, className, text){const node = new Element(); node.className = className; node.textContent = text || ''; return node;},
     renderMarks(){}, syncSend(){},
@@ -72,7 +44,9 @@ function fixture(style) {
   };
   vm.runInNewContext(fs.readFileSync(path.join(__dirname, '../../studio/apps/ui/studio-client.js'), 'utf8'),context);
   context.VMStudio = context.window.VMStudio;
-  if (style === 'digital') vm.runInNewContext(implementation('renderLog'),context);
+  vm.runInNewContext(fs.readFileSync(path.join(__dirname, '../../studio/apps/ui/transcript.js'), 'utf8'),context);
+  context.VMTranscript=context.window.VMTranscript;
+  if (style === 'digital') vm.runInNewContext(`${implementation('messageNode')}\n${implementation('renderLog')}`,context);
   else vm.runInNewContext(`${implementation('esc')}\n${implementation('messageNode')}\n${implementation('renderThread')}`,context);
   vm.runInNewContext(implementation('handleStudio'),context);
   const body = index => style === 'digital'
@@ -176,5 +150,24 @@ for (const style of ['technical','digital']) {
     assert.equal(f.conversation.messages[1].text,'heard prefix');
     assert.equal(f.conversation.messages[1].truncated,true);
     assert.equal(f.rendered.at(-1),'heard prefix');
+  });
+}
+
+for (const style of ['digital','technical']) {
+  test(`${style} keeps existing bubble nodes across acknowledgements and continuation updates`, () => {
+    const f = fixture(style);
+    f.handle({type:'answer_start',output_id:'one'});
+    const user = f.body(0), answer = f.body(1);
+    f.handle({type:'answer_delta',output_id:'one',text:'Streaming answer'});
+    f.handle({type:'user_backchannel',input_turn_id:'ack',text:'嗯'});
+    assert.equal(f.body(0),user);
+    assert.equal(f.body(1),answer);
+    f.handle({type:'answer_interrupt',output_id:'one',heard_text:'Streaming'});
+    assert.equal(f.body(0),user);
+    assert.equal(f.body(1),answer);
+    f.handle({type:'user_transcript',input_turn_id:'ack-next',replace_input_turn_id:'ack',text:'嗯，继续'});
+    assert.equal(f.body(0),user);
+    assert.equal(f.body(1),answer);
+    assert.equal(f.body(2).textContent,'嗯，继续');
   });
 }

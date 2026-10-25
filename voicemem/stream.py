@@ -12,7 +12,6 @@ import queue
 import re
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import numpy as np
@@ -221,8 +220,8 @@ from voicemem.engine import TORCH_LOCK as _EMBED_LOCK  # Process-wide Torch seri
 # Separate from the default executor so ingestion cannot queue ahead of final ASR.
 from voicemem.utils.audio.final_asr_executor import FinalASRExecutor
 _FINAL_ASR_EXECUTOR = FinalASRExecutor()
-# EOT remains serial and cannot queue behind background work in the default pool.
-_EOT_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="voicemem-eot")
+# Keep the historical executor alias for consumers of this module.
+from voicemem.engine.scheduling.probes import LatestProbe, eot_executor as _EOT_EXECUTOR
 
 
 class _AsrWorker:
@@ -382,6 +381,14 @@ EOT_HOT_S = float(os.environ.get("VOICEMEM_EOT_HOT_S", "0.15"))
 _UNSET = object()
 
 
+@dataclass(frozen=True)
+class _EotContext:
+    detector: object
+    epoch: int
+    speech_end: float
+    silence: float
+
+
 class VoiceStream:
     """Input session for typed text, external-ASR partials or PCM16 audio.
 
@@ -446,6 +453,8 @@ class VoiceStream:
         self._raw_text = ""  # Streaming transcript before final decoding.
         self._eot_hot = 0.0  # Duration of sustained high EOT scores.
         self._eot_epoch = 0
+        self._eot_probe = LatestProbe(_EOT_EXECUTOR)
+        self._eot_result = None
         self._final_asr = _UNSET  # Lazy final-ASR provider.
         self._route = _gate_mod.DEEP  # Current route.
         self._last_memory = None  # Latest completed speculative result.
@@ -496,6 +505,7 @@ class VoiceStream:
             return
         self._closed = True
         self._eot_epoch += 1
+        self._eot_probe.close()
         tasks = {task for task in (self._spec, self._gate_pre, *self._snapshot_tasks)
                  if task is not None}
         for task in tasks:
@@ -814,6 +824,8 @@ class VoiceStream:
 
     def _reset_turn(self):
         self._eot_epoch += 1
+        self._eot_probe.invalidate()
+        self._eot_result = None
         if getattr(self, "_asr_w", None) is not None:
             self._asr_w.reset()
         elif self._asr is not None:
@@ -833,6 +845,52 @@ class VoiceStream:
         self._eot_hot = 0.0
         self._pcm, self._pcm_len = [], 0
         self._preroll = []
+
+    def _poll_eot(self):
+        """Apply current probe results and offer the latest audio without awaiting inference."""
+        semantic_done = False
+        if self._eot_result is not None and self._eot_result[1].detector is not self.eot:
+            self._eot_result = None
+            self._eot_score = self._eot_hot = 0.0
+        result = self._eot_probe.poll()
+        if result is not None:
+            context = result.context
+            if (not self._closed and context.epoch == self._eot_epoch
+                    and context.detector is self.eot):
+                if result.error is not None:
+                    print(f"[eot] 判定失败（{type(result.error).__name__}: {result.error}）→ 退回掐表",
+                          flush=True)
+                    self.eot = None
+                    self._eot_score = self._eot_hot = 0.0
+                    self._eot_result = None
+                else:
+                    score = result.value
+                    self._eot_hot = (self._eot_hot + .04) if score >= EOT_HOT_LEVEL else 0.0
+                    self._eot_score = score if (self._eot_hot >= EOT_HOT_S
+                        or (_TEXT_DONE.search(self._text or "") and score >= EOT_TEXT_MIN)) else 0.0
+                    self._eot_result = (score, context)
+                    # Only a newly consumed silence score can confirm a turn;
+                    # cached scores remain private speculation signals.
+                    semantic_done = bool(
+                        context.speech_end == self._speech_end and context.silence > 0
+                        and self.eot_ends_turn and score >= self.eot.threshold
+                        and self._silence > 0 and self._silence >= self.eot_min_s)
+                    if EOT_DEBUG and context.silence > 0:
+                        print(f"[eot] silence={context.silence*1000:.0f}ms score={score:.2f} "
+                              f"run={result.run_s*1000:.0f}ms queue={result.queue_s*1000:.0f}ms",
+                              flush=True)
+
+        if (not semantic_done and self.eot is not None
+                and self._spoke and self._text.strip() and self._pcm):
+            if self._eot_wait >= .04 and self._eot_probe.ready:
+                detector = self.eot
+                context = _EotContext(detector, self._eot_epoch, self._speech_end, self._silence)
+                pcm = np.concatenate(self._pcm)
+                self._eot_probe.submit(lambda: detector.score(pcm),
+                                       context=context)
+                self._eot_wait = 0.0
+
+        return semantic_done
 
     async def feed_text(self, text) -> Turn:
         """Confirm typed input and retrieve memory only when its final gate permits."""
@@ -869,6 +927,10 @@ class VoiceStream:
                          src=self.src_rate)
         self._text = self._streaming_text(self.asr_worker.push(frame))
         speaking = self.vad.is_speech(frame)
+        if speaking and self._silence > 0:
+            self._eot_probe.invalidate()
+            self._eot_score = self._eot_hot = 0.0
+            self._eot_result = None
         if speaking:
             self._held_final_text = ""
         elif self._held_final_text:
@@ -926,38 +988,8 @@ class VoiceStream:
         # Sound-only recordings use their own silence threshold.
         need_silence = self.confirm_s if self._text.strip() else SOUND_ONLY_SILENCE_S
         # EOT may confirm before the timeout once minimum silence and pause-policy checks pass.
-        semantic_done = False
-        # Scores during speech inform speculation; only silence scores participate in turn confirmation.
-        if self.eot is not None and self._spoke and self._text.strip() and self._pcm:
-            self._eot_wait += len(frame) / 16000.0
-            if self._eot_wait >= 0.04:  # Limit EOT probe frequency.
-                self._eot_wait = 0.0
-                try:
-                    detector, epoch = self.eot, self._eot_epoch
-                    _p = await asyncio.get_running_loop().run_in_executor(
-                        _EOT_EXECUTOR, detector.score, np.concatenate(self._pcm))
-                    if self._closed or epoch != self._eot_epoch or detector is not self.eot:
-                        return StreamState("<silence>", self._text, None, None, self.vm)
-                    # Sustained high scores reject isolated mid-utterance spikes.
-                    self._eot_hot = (self._eot_hot + 0.04) if _p >= EOT_HOT_LEVEL else 0.0
-                    # Accept sustained acoustic completion or a text ending with sufficient acoustic support.
-                    _text_done = bool(_TEXT_DONE.search(self._text or ""))
-                    self._eot_score = _p if (
-                        self._eot_hot >= EOT_HOT_S
-                        or (_text_done and _p >= EOT_TEXT_MIN)) else 0.0
-                    # Confirmation requires observed silence. A high score during speech is insufficient.
-                    semantic_done = (self.eot_ends_turn and _p >= self.eot.threshold
-                                     and self._silence > 0
-                                     and self._silence >= self.eot_min_s)
-                    if EOT_DEBUG and self._silence > 0:
-                        print(f"[eot] 静音 {self._silence*1000:3.0f}ms  分数 {_p:.2f}"
-                              f"  {'→ 结束' if semantic_done else ''}", flush=True)
-                except Exception as e:
-                    if self._closed or epoch != self._eot_epoch or detector is not self.eot:
-                        return StreamState("<silence>", self._text, None, None, self.vm)
-                    print(f"[eot] 判定失败（{type(e).__name__}: {e}）→ 退回掐表",
-                          flush=True)
-                    self.eot = None
+        self._eot_wait += len(frame) / 16000.0
+        semantic_done = self._poll_eot()
         # "ok" often has no streaming hypothesis at all. Do not classify that
         # as music and wait for 5s of audio + 3s silence. Use VAD silence (not
         # residual speaker energy) for one offline probe per voiced burst.

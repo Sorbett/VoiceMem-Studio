@@ -4,6 +4,41 @@
   const RATE = 24000;
   const MAX_REPLAY_RECORDS = 32;
   const MAX_REPLAY_SAMPLES = RATE * 60 * 20;
+  const SHORT_CAPTION_LENGTH = 80;
+  const MAX_CAPTION_PHRASE = 64;
+  function captionEnd(caption) {
+    const {text, shown, limit, textDone, drained} = caption;
+    if (drained || (textDone && text.length <= SHORT_CAPTION_LENGTH)) return text.length;
+    let end = shown;
+    // Preview one complete phrase; heard progress remains owned by the server.
+    while (end <= limit && end < text.length) {
+      const start = end;
+      let next = start, space = start;
+      for (let i = start; i < text.length; i++) {
+        const char = text[i], count = i - start + 1;
+        if (/\s/u.test(char)) space = i + 1;
+        const following = text[i + 1] || '';
+        const numeric = /\d/u.test(text[i - 1] || '')
+          && (/\d/u.test(following) || (!following && !textDone));
+        const sentence = /[。！？!?；;\n]/u.test(char)
+          || (char === '.' && !numeric && (!following || /[\s"'”’)]/u.test(following)));
+        const clause = /[，,：:]/u.test(char) && !numeric && count >= 8;
+        if (sentence || clause) {
+          next = i + 1;
+          while (next < text.length && /[\s。！？!?；;”’」』）》)\]]/u.test(text[next])) next++;
+          break;
+        }
+        if (count >= MAX_CAPTION_PHRASE) {
+          next = space > start + MAX_CAPTION_PHRASE / 2 ? space : i + 1;
+          break;
+        }
+      }
+      if (next === start) next = textDone ? text.length : start;
+      if (next === start) break;
+      end = next;
+    }
+    return end;
+  }
   function resample(input, from, to) {
     if (from === to) return input;
     const ratio = from / to;
@@ -154,7 +189,7 @@
       if (!owner) return;
       if (recordings.get(owner.output)?.state === 'recording') deleteRecording(owner.output);
       stopMic(owner);
-      owner.replyEvents = []; owner.replyStarted = false;
+      owner.replyEvents = []; owner.replyStarted = false; owner.caption = null;
       owner.closed = true;
       run = null;
       clearTimeout(owner.timeout);
@@ -185,7 +220,22 @@
     }
     function flushReply(owner) {
       if (!owner.replyStarted || owner.paused) return;
-      const output = owner.output, events = owner.replyEvents;
+      const output = owner.output, caption = owner.caption;
+      if (caption) {
+        const end = captionEnd(caption);
+        if (end > caption.shown) {
+          const text = caption.text.slice(caption.shown,end).join('');
+          caption.shown = end;
+          emit(owner,{type:'answer_delta',output_id:output,text});
+          if (!active(owner) || owner.output !== output) return;
+        }
+        if (caption.drained && caption.done) {
+          const done = caption.done; caption.done = null;
+          emit(owner,done);
+          if (!active(owner) || owner.output !== output) return;
+        }
+      }
+      const events = owner.replyEvents;
       owner.replyEvents = [];
       for (const event of events) {
         if (!active(owner) || owner.output !== output) return;
@@ -238,6 +288,8 @@
           owner.output = message.output_id || '';
           owner.replyStarted = false;
           owner.replyEvents = [];
+          owner.caption = message.caption_sync === 'playback'
+            ? {text:[],shown:0,limit:0,textDone:false,done:null,drained:false} : null;
           owner.rate = Number(message.sample_rate) || RATE;
           beginRecording(owner.output, owner.rate);
           owner.paused = false;
@@ -246,10 +298,26 @@
           phase(owner, 'short-thinking'); break;
         case 'answer_delta':
           if (!owner.output) return;
+          if (owner.caption) {
+            for (const char of String(message.text || '')) owner.caption.text.push(char);
+            flushReply(owner); return;
+          }
           if (!owner.replyStarted || owner.paused) {
             owner.replyEvents.push(message); return;
           }
           break;
+        case 'answer_progress':
+          if (owner.caption && Number.isSafeInteger(message.text_end) && message.text_end >= 0) {
+            owner.caption.limit = Math.max(owner.caption.limit,message.text_end);
+            flushReply(owner);
+          }
+          return;
+        case 'answer_text_done':
+          if (owner.caption) {
+            owner.caption.textDone = true;
+            flushReply(owner);
+          }
+          return;
         case 'answer_pause':
           owner.paused = true; owner.player.port.postMessage({ type: 'pause' }); phase(owner, 'listening'); break;
         case 'answer_resume':
@@ -258,19 +326,22 @@
           flushReply(owner);
           break;
         case 'answer_done':
+          if (!owner.output) return;
+          if (owner.caption) { owner.caption.textDone = true; owner.caption.done = message; }
           owner.player.port.postMessage({ type: 'drain' });
+          if (owner.caption) { flushReply(owner); return; }
           if (!owner.replyStarted || owner.paused) {
             owner.replyEvents.push(message); return;
           }
           break;
         case 'answer_interrupt':
-          owner.replyEvents = []; owner.replyStarted = false; owner.paused = false;
+          owner.replyEvents = []; owner.replyStarted = false; owner.caption = null; owner.paused = false;
           owner.player.port.postMessage({ type: 'clear', reason: 'interrupted' });
           owner.output = ''; phase(owner, owner.mic ? 'listening' : 'idle'); break;
         case 'backchannel':
           backchannel(owner, message); break;
         case 'error':
-          owner.replyEvents = []; owner.replyStarted = false; owner.paused = false;
+          owner.replyEvents = []; owner.replyStarted = false; owner.caption = null; owner.paused = false;
           owner.player.port.postMessage({ type: 'clear', reason: 'interrupted' });
           owner.output = ''; phase(owner, owner.mic ? 'listening' : 'idle');
           VMUI.notify(message.message || '服务返回错误，请重试。'); break;
@@ -316,6 +387,7 @@
           if (data.type === 'drained') {
             // A text-only completion has no started checkpoint; keep its events ordered.
             owner.replyStarted = true;
+            if (owner.caption) owner.caption.drained = true;
             owner.replyEvents.push({ type: 'playback_done', output_id: owner.output });
             flushReply(owner);
             if (!owner.paused) phase(owner, owner.mic ? 'listening' : 'idle');

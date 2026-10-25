@@ -344,3 +344,164 @@ test('the new home page passes the unchanged desktop readiness probe', async () 
     },
   });
 });
+
+test('a completed short caption appears in full at first playback, with completion held until drain', async () => {
+  const f=fixture();await f.connected();const socket=f.sockets[0], player=f.nodes[0];
+  const text='好呀😀，我们就从这件事开始。你慢慢说，我在听。';
+  socket.receive({type:'answer_start',output_id:'short',caption_sync:'playback'});
+  for (const char of text) socket.receive({type:'answer_delta',output_id:'short',text:char});
+  socket.receive({type:'answer_text_done',output_id:'short'});
+  assert.equal(f.events.some(event=>event.type==='answer_delta'),false);
+  player.port.onmessage({data:{type:'resumed',outputId:'short'}});
+  assert.equal(f.events.some(event=>event.type==='answer_delta'),false);
+  player.port.onmessage({data:{type:'started',outputId:'short'}});
+  assert.deepEqual(f.events.filter(event=>event.type==='answer_delta').map(event=>event.text),[text]);
+  assert.equal(f.events.some(event=>event.type==='answer_done'),false);
+  assert.equal(player.messages.some(message=>message.type==='drain'),false);
+  socket.receive({type:'answer_done',output_id:'short'});
+  player.port.onmessage({data:{type:'drained',outputId:'short'}});
+  assert.deepEqual(f.events.slice(-2).map(event=>event.type),['answer_done','playback_done']);
+  f.client.cancel();
+});
+
+test('long captions preview whole phrases and use heard code-point offsets to advance', async () => {
+  const f=fixture();await f.connected();const socket=f.sockets[0], player=f.nodes[0];
+  const deltaText=()=>f.events.filter(event=>event.type==='answer_delta').map(event=>event.text).join('');
+  const first='先把今天最想完成的一件事写下来😀。';
+  const second='然后把它拆成几个容易开始的小步骤，';
+  const tail='每一步只安排一个明确的动作，不用一开始就把整天塞得很满。做完第一步以后再看看实际花了多少时间，最后根据精力调整后面的安排。';
+  const text=first+second+tail, firstEnd=Array.from(first).length;
+  assert.ok(Array.from(text).length>80);
+  socket.receive({type:'answer_start',output_id:'sync',caption_sync:'playback'});
+  socket.receive({type:'answer_delta',output_id:'sync',text});
+  socket.receive({type:'answer_done',output_id:'sync'});
+  socket.receive({type:'answer_progress',output_id:'sync',text_end:3});
+  assert.equal(deltaText(),'');
+  player.port.onmessage({data:{type:'started',outputId:'sync'}});
+  assert.equal(deltaText(),first);
+  socket.receive({type:'answer_progress',output_id:'old',text_end:100});
+  socket.receive({type:'answer_progress',output_id:'sync',text_end:NaN});
+  socket.receive({type:'answer_progress',output_id:'sync',text_end:-1});
+  socket.receive({type:'answer_progress',output_id:'sync',text_end:firstEnd-1});
+  player.port.onmessage({data:{type:'underflow',outputId:'sync'}});
+  assert.equal(deltaText(),first);
+  socket.receive({type:'answer_pause',output_id:'sync'});
+  socket.receive({type:'answer_progress',output_id:'sync',text_end:firstEnd});
+  assert.equal(deltaText(),first);
+  assert.equal(f.events.filter(event=>event.type==='answer_done').length,0);
+  socket.receive({type:'answer_resume',output_id:'sync'});
+  assert.equal(deltaText(),first+second);
+  socket.receive({type:'answer_progress',output_id:'sync',text_end:4});
+  assert.equal(deltaText(),first+second);
+  player.port.onmessage({data:{type:'drained',outputId:'sync'}});
+  assert.equal(deltaText(),text);
+  assert.deepEqual(f.events.slice(-3).map(event=>event.type),['answer_delta','answer_done','playback_done']);
+  f.client.cancel();
+});
+
+test('streaming captions wait for a phrase rather than revealing individual tokens', async () => {
+  const f=fixture();await f.connected();const socket=f.sockets[0], player=f.nodes[0];
+  const deltas=()=>f.events.filter(event=>event.type==='answer_delta').map(event=>event.text);
+  socket.receive({type:'answer_start',output_id:'stream',caption_sync:'playback'});
+  player.port.onmessage({data:{type:'started',outputId:'stream'}});
+  const first='我们先从一个简单的步骤开始。', second='接下来再根据实际情况调整。';
+  for (const char of first.slice(0,-1)) {
+    socket.receive({type:'answer_delta',output_id:'stream',text:char});
+    assert.equal(deltas().length,0);
+  }
+  socket.receive({type:'answer_delta',output_id:'stream',text:'。'});
+  assert.deepEqual(deltas(),[first]);
+  for (const char of second) socket.receive({type:'answer_delta',output_id:'stream',text:char});
+  assert.deepEqual(deltas(),[first]);
+  socket.receive({type:'answer_progress',output_id:'stream',text_end:Array.from(first).length});
+  assert.deepEqual(deltas(),[first,second]);
+  socket.receive({type:'answer_delta',output_id:'stream',text:'最后这句没有标点'});
+  assert.deepEqual(deltas(),[first,second]);
+  socket.receive({type:'answer_text_done',output_id:'stream'});
+  assert.deepEqual(deltas(),[first,second,'最后这句没有标点']);
+  f.client.cancel();
+});
+
+test('short text completion during a candidate pause waits for resume', async () => {
+  const f=fixture();await f.connected();const socket=f.sockets[0], player=f.nodes[0];
+  const first='我们先从这一件事开始。', tail='之后再一起看看下一步怎么走。';
+  socket.receive({type:'answer_start',output_id:'paused',caption_sync:'playback'});
+  socket.receive({type:'answer_delta',output_id:'paused',text:first});
+  socket.receive({type:'answer_pause',output_id:'paused'});
+  player.port.onmessage({data:{type:'started',outputId:'paused'}});
+  socket.receive({type:'answer_delta',output_id:'paused',text:tail});
+  socket.receive({type:'answer_text_done',output_id:'paused'});
+  assert.equal(f.events.some(event=>event.type==='answer_delta'),false);
+  socket.receive({type:'answer_resume',output_id:'paused'});
+  assert.deepEqual(f.events.filter(event=>event.type==='answer_delta').map(event=>event.text),[first+tail]);
+  assert.equal(f.events.some(event=>event.type==='answer_done'),false);
+  socket.receive({type:'answer_interrupt',output_id:'paused',heard_text:'我们先'});
+  socket.receive({type:'answer_text_done',output_id:'paused'});
+  socket.receive({type:'answer_delta',output_id:'paused',text:'late text'});
+  assert.equal(f.events.filter(event=>event.type==='answer_delta').length,1);
+  assert.equal(f.events.find(event=>event.type==='answer_interrupt').heard_text,'我们先');
+  f.client.cancel();
+});
+
+test('unpunctuated captions use bounded blocks and keep Unicode and English words intact', async () => {
+  for (const text of ['😀'.repeat(70), 'A long explanation without punctuation should still arrive in readable groups of complete words']) {
+    const f=fixture();await f.connected();const socket=f.sockets[0], player=f.nodes[0];
+    socket.receive({type:'answer_start',output_id:'block',caption_sync:'playback'});
+    player.port.onmessage({data:{type:'started',outputId:'block'}});
+    socket.receive({type:'answer_delta',output_id:'block',text});
+    const prefix=f.events.find(event=>event.type==='answer_delta').text;
+    assert.ok(Array.from(prefix).length<=64);
+    if (text.startsWith('😀')) assert.equal(prefix,'😀'.repeat(64));
+    else assert.ok(prefix.endsWith(' '));
+    assert.ok(text.startsWith(prefix));
+    socket.receive({type:'answer_done',output_id:'block'});
+    player.port.onmessage({data:{type:'drained',outputId:'block'}});
+    assert.equal(f.events.filter(event=>event.type==='answer_delta').map(event=>event.text).join(''),text);
+    f.client.cancel();
+  }
+});
+
+test('caption boundaries do not split streamed decimals or grouped numbers', async () => {
+  const f=fixture();await f.connected();const socket=f.sockets[0], player=f.nodes[0];
+  socket.receive({type:'answer_start',output_id:'numbers',caption_sync:'playback'});
+  player.port.onmessage({data:{type:'started',outputId:'numbers'}});
+  for (const text of ['The value is 3.','14 and the count is 1,','024']) {
+    socket.receive({type:'answer_delta',output_id:'numbers',text});
+    assert.equal(f.events.some(event=>event.type==='answer_delta'),false);
+  }
+  socket.receive({type:'answer_delta',output_id:'numbers',text:'. '});
+  assert.deepEqual(f.events.filter(event=>event.type==='answer_delta').map(event=>event.text),
+    ['The value is 3.14 and the count is 1,024. ']);
+  f.client.cancel();
+});
+
+test('synced caption interruption, output replacement and disconnect discard unseen text', async () => {
+  for (const terminal of ['answer_interrupt','error','disconnect','replacement']) {
+    const f=fixture();await f.connected();const socket=f.sockets[0], player=f.nodes[0];
+    socket.receive({type:'answer_start',output_id:'one',caption_sync:'playback'});
+    socket.receive({type:'answer_delta',output_id:'one',text:'unheard text'});
+    if (terminal==='disconnect') f.client.cancel();
+    else if (terminal==='replacement') socket.receive({type:'answer_start',output_id:'two',caption_sync:'playback'});
+    else socket.receive({type:terminal,output_id:'one',heard_text:'heard'});
+    socket.receive({type:'answer_progress',output_id:'one',text_end:100});
+    socket.receive({type:'answer_text_done',output_id:'one'});
+    player.port.onmessage?.({data:{type:'started',outputId:'one'}});
+    assert.equal(f.events.filter(event=>event.type==='answer_delta').length,0);
+    if (terminal==='answer_interrupt') assert.equal(f.events.find(event=>event.type===terminal).heard_text,'heard');
+    f.client.cancel();
+  }
+});
+
+test('synced text-only drain and paused completion preserve event order', async () => {
+  const f=fixture();await f.connected();const socket=f.sockets[0], player=f.nodes[0];
+  socket.receive({type:'answer_start',output_id:'one',caption_sync:'playback'});
+  socket.receive({type:'answer_delta',output_id:'one',text:'text only'});
+  socket.receive({type:'answer_pause',output_id:'one'});
+  socket.receive({type:'answer_done',output_id:'one'});
+  player.port.onmessage({data:{type:'drained',outputId:'one'}});
+  assert.equal(f.events.filter(event=>event.type==='answer_delta').length,0);
+  socket.receive({type:'answer_resume',output_id:'one'});
+  assert.deepEqual(f.events.filter(event=>['answer_delta','answer_done','playback_done'].includes(event.type)).map(event=>event.type),
+    ['answer_delta','answer_done','playback_done']);
+  f.client.cancel();
+});

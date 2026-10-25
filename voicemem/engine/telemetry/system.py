@@ -88,6 +88,7 @@ class EngineObserver:
                     rates["process_cpu_cores"] = max(0, current_cpu-cpu_time) / (now-cpu_at)
                 cpu_at, cpu_time = now, current_cpu
                 gauges["thermal_state"] = thermal_state()
+                resources.thermal(gauges["thermal_state"])
                 with self._lock:
                     self._latest = dict(sampled_at=now, **rates, **gauges)
                 if now-reported >= 5:

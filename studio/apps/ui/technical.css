@@ -63,10 +63,7 @@ body{
   -webkit-backdrop-filter:blur(20px);backdrop-filter:blur(20px);
 }
 .user-chip:hover{color:var(--text)}
-.user-avatar{
-  width:22px;height:22px;border-radius:6px;display:grid;place-items:center;flex:none;
-  background:rgba(255,255,255,.1);color:var(--text);font-size:calc(11px * var(--font-scale,1));
-}
+
 .user-chip svg{width:13px;height:13px;margin-left:auto}
 
 
@@ -295,16 +292,6 @@ html,body{background:#000}body{isolation:isolate}
  .topk-col h3{font-size:calc(11px * var(--font-scale,1))}.col-stage{padding-left:16px!important;padding-right:16px!important}
  .scene-controls{font-size:calc(11px * var(--font-scale,1))}
 }
-@media(max-width:700px){
-
- .grid{grid-template-columns:var(--sidebar-width) var(--perception-width) minmax(320px,1fr)}
- .grid.side-hidden{grid-template-columns:0 var(--perception-width) minmax(320px,1fr)}
- .perception-glass,.airesp{padding-left:5px;padding-right:5px}.topk-cols{overflow-x:auto}
- .topk-col{min-width:0}.topk-col h3{overflow:hidden;text-overflow:ellipsis}
- .perception-tag{display:flex;flex-direction:column;gap:2px}.label-row{flex-wrap:wrap}
- .live-badge{font-size:calc(10px * var(--font-scale,1))}.airesp{min-height:150px}.switch button{padding:9px 16px}
- .hint{display:none}
-}
 @media(prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
 
 
@@ -336,3 +323,23 @@ html,body{background:#000}body{isolation:isolate}
 @media(min-width:2000px){#viewChat{margin-inline:calc(1cm - 40px)}}
 @media(max-width:900px){#viewChat{margin-inline:calc(1cm - 16px)}}
 .msg>div{min-width:0}.msg-head{flex-wrap:wrap}.perception-tags{flex-wrap:wrap}
+
+@media(max-width:700px){
+ .shell{overflow-x:hidden;overflow-y:auto}
+ .grid,.grid.side-hidden{display:flex;flex-direction:column;height:auto;min-height:100%;transition:none}
+ .col-side{position:fixed;inset:0 auto 0 0;z-index:10;width:min(286px,86vw);height:100dvh;padding:70px 18px 18px;background:var(--vm-surface);border-right:1px solid var(--vm-border);box-shadow:var(--vm-shadow)}
+ .col-side>*{width:100%}
+ .col-retrieval{flex:none;overflow:visible;padding:48px 18px 18px;border-right:0}
+ .orb-slot{min-height:0;padding:12px 0 22px}
+ .orb-visual{width:min(180px,24dvh)}
+ .perception-glass,.airesp{padding:16px}
+ .input-wrap input{padding:12px 70px 12px 12px}
+ .send,.mic{bottom:10px}
+ .topk-col:first-child{padding-right:10px}
+ .topk-col:last-child{padding-left:10px}
+ .airesp{flex:none;min-height:112px}
+ .col-stage{flex:none;height:80dvh;min-height:520px;padding:18px!important;border-top:1px solid var(--vm-border)}
+ #viewChat{margin-inline:0}
+ .switch button{padding:9px 16px}
+ .hint{display:none}
+}
