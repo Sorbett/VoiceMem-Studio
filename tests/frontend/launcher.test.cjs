@@ -9,12 +9,23 @@ const { PassThrough, Readable } = require('node:stream');
 const { execFile } = require('node:child_process');
 const { promisify } = require('node:util');
 const launch = require('../../studio/apps/launch.cjs');
+const runtime = require('../../studio/apps/runtime.cjs');
 const { shouldShowPet } = require('../../studio/apps/desktop-visibility.cjs');
+
+function launchEnvironment(options) {
+  return launch.launchEnvironment({ readEnvironment: (_project, env) => ({ ...env }), ...options });
+}
+
+async function temporaryProject(t) {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'studio-launch-test-'));
+  t.after(() => fs.rm(directory, { recursive: true, force: true }));
+  return directory;
+}
 
 test('npm start prepares VoiceMem memory before choosing the Studio Agent dialogue API', async () => {
   let printed = ''; const events = [], choices = ['qwen', 'openai'], secrets = ['memory-secret', 'reply-secret'];
   const output = { write(value) { printed += value; } };
-  const env = await launch.launchEnvironment({
+  const env = await launchEnvironment({
     platform: 'darwin', env: {}, input: Readable.from([]), output,
     savedProviders: null,
     askChoice: async role => { events.push(role); return choices.shift(); },
@@ -55,17 +66,20 @@ test('remote source mode skips managed backend state and forwards other Electron
     VOICEMEM_DESKTOP_MEMORY_PROVIDER: 'deepseek',
     VOICEMEM_DESKTOP_REPLY_PROVIDER: 'deepseek',
     VOICEMEM_DESKTOP_MANAGED_PROVIDER: 'deepseek',
+    STUDIO_ASR_API_KEY: 'asr-fixture', STUDIO_SPEECH_API_KEY: 'speech-fixture',
   });
   assert.equal(env.KEEP, 'yes');
   assert.equal(env.VOICEMEM_DESKTOP_CONFIGURE, '1');
   assert.equal(env.VOICEMEM_DESKTOP_REQUIRE_ADDRESS, '1');
   assert.equal(env.VOICEMEM_DESKTOP_PROJECT_ROOT, undefined);
   assert.equal(env.VOICEMEM_DESKTOP_MANAGED_PROVIDER, undefined);
+  assert.equal(env.STUDIO_ASR_API_KEY, undefined);
+  assert.equal(env.STUDIO_SPEECH_API_KEY, undefined);
 });
 
 test('local Studio replies ask once for the VoiceMem memory key', async () => {
   const choices = ['deepseek', 'local'], prompts = [];
-  const env = await launch.launchEnvironment({
+  const env = await launchEnvironment({
     platform: 'darwin', env: {}, input: Readable.from([]), output: { write() {} },
     savedProviders: null,
     askChoice: async () => choices.shift(), askSecret: async prompt => { prompts.push(prompt); return 'memory-key'; },
@@ -80,14 +94,14 @@ test('local Studio replies ask once for the VoiceMem memory key', async () => {
 
 test('same provider reuses the memory credential and failed preparation does not ask for Studio', async () => {
   const prompts = [];
-  const env = await launch.launchEnvironment({
+  const env = await launchEnvironment({
     platform: 'darwin', env: {}, output: { write() {} }, savedProviders: null,
     askChoice: async () => 'qwen', askSecret: async prompt => { prompts.push(prompt); return 'same-key'; },
   });
   assert.equal(prompts.length, 1);
   assert.equal(env.VOICEMEM_STUDIO_API_KEY, 'same-key');
   const choices = [];
-  await assert.rejects(launch.launchEnvironment({
+  await assert.rejects(launchEnvironment({
     platform: 'darwin', env: {}, input: Readable.from([]), output: { write() {} },
     savedProviders: null,
     askChoice: async purpose => { choices.push(purpose); return 'deepseek'; },
@@ -99,7 +113,7 @@ test('same provider reuses the memory credential and failed preparation does not
 
 test('UI-only choice clears local backend and API keys after VoiceMem preparation', async () => {
   const events = [];
-  const env = await launch.launchEnvironment({
+  const env = await launchEnvironment({
     platform: 'darwin', env: {}, output: { write() {} }, savedProviders: null,
     askChoice: async role => { events.push(role); return role === 'memory' ? 'deepseek' : 'remote'; },
     askSecret: async () => 'only-memory', prepareMemory: async () => events.push('prepared'),
@@ -113,7 +127,7 @@ test('UI-only choice clears local backend and API keys after VoiceMem preparatio
 
 test('saved App model services skip the terminal provider prompt', async () => {
   const choices = [], stages = [];
-  const env = await launch.launchEnvironment({
+  const env = await launchEnvironment({
     platform: 'darwin', env: {}, output: { write() {} },
     savedProviders: { memoryProvider: 'qwen', replyProvider: 'openai' },
     askChoice: async purpose => { choices.push(purpose); return 'deepseek'; },
@@ -138,6 +152,208 @@ test('source launcher discovers saved model providers without reading their secr
   assert.deepEqual(launch.savedModelProviders('darwin', {
     VOICEMEM_DESKTOP_USER_DATA: directory,
   }), { memoryProvider: 'deepseek', replyProvider: 'local' });
+});
+
+test('first launch carries project keys and model configuration through Electron into the backend', async t => {
+  const projectDir = await temporaryProject(t);
+  await fs.writeFile(path.join(projectDir, '.env'), [
+    'DEEPSEEK_API_KEY="fixture-memory"',
+    'VOICEMEM_MEMORY_MODEL=fixture-extractor',
+    'VOICEMEM_STUDIO_API_KEY=fixture-reply',
+    'VOICEMEM_STUDIO_MODEL=fixture-responder',
+    'VOICEMEM_STUDIO_BASE_URL=https://chat.example.com/v1',
+  ].join('\n'));
+  const choices = ['deepseek', 'openai'], stages = [], prompts = [];
+  let printed = '';
+  const env = await launch.launchEnvironment({
+    projectDir, platform: 'darwin', env: {}, savedProviders: null,
+    output: { write(value) { printed += value; } },
+    askChoice: async role => { stages.push(role); return choices.shift(); },
+    askSecret: async prompt => { prompts.push(prompt); return ''; },
+    prepareEnvironment: async ({ env }) => {
+      stages.push('setup'); assert.equal(env.VOICEMEM_MEMORY_API_KEY, 'fixture-memory');
+    },
+    prepareMemory: async ({ env }) => {
+      stages.push('prepare'); assert.equal(env.VOICEMEM_MEMORY_API_KEY, 'fixture-memory');
+    },
+  });
+  const services = runtime.modelServicesFromLaunch(runtime.managedLaunch(env), env);
+  const backend = runtime.modelServiceEnvironment(env, services);
+  assert.equal(backend.VOICEMEM_MEMORY_API_KEY, 'fixture-memory');
+  assert.equal(backend.VOICEMEM_STUDIO_API_KEY, 'fixture-reply');
+  assert.equal(backend.VOICEMEM_MEMORY_MODEL, 'fixture-extractor');
+  assert.equal(backend.VOICEMEM_STUDIO_MODEL, 'fixture-responder');
+  assert.equal(backend.VOICEMEM_STUDIO_BASE_URL, 'https://chat.example.com/v1');
+  assert.deepEqual(stages, ['memory', 'setup', 'prepare', 'reply']);
+  assert.equal(prompts.length, 2);
+  assert.ok(prompts.every(prompt => prompt.includes('回车沿用已配置的 Key')));
+  assert.doesNotMatch(printed + prompts.join(''), /fixture-memory|fixture-reply/);
+});
+
+test('project environment preserves exported values and the Python dotenv source order', async t => {
+  const projectDir = await temporaryProject(t);
+  await fs.writeFile(path.join(projectDir, '.env'), [
+    'DEEPSEEK_API_KEY=file-key',
+    'VOICEMEM_MEMORY_API_KEY=${DEEPSEEK_API_KEY}',
+    'DASHSCOPE_API_KEY=primary-key',
+    'STUDIO_ASR_DEVICE=${DEVICE:-cpu}',
+  ].join('\n'));
+  await fs.writeFile(path.join(projectDir, '.env.qwen'), 'DASHSCOPE_API_KEY=secondary-key\nOPENAI_API_KEY=fallback-key');
+  const exported = { DEEPSEEK_API_KEY: 'exported-key', VOICEMEM_STUDIO_API_KEY: '' };
+  const env = launch.projectEnvironment(projectDir, exported);
+  assert.deepEqual(env, { ...exported, VOICEMEM_MEMORY_API_KEY: 'exported-key',
+    DASHSCOPE_API_KEY: 'primary-key', STUDIO_ASR_DEVICE: 'cpu', OPENAI_API_KEY: 'fallback-key' });
+  assert.deepEqual(exported, { DEEPSEEK_API_KEY: 'exported-key', VOICEMEM_STUDIO_API_KEY: '' });
+});
+
+test('missing dotenv files leave the launch environment unchanged', async t => {
+  assert.deepEqual(launch.projectEnvironment(await temporaryProject(t), { FIXTURE: 'value' }), { FIXTURE: 'value' });
+});
+
+test('unreadable project environment fails before credentials or model preparation', async t => {
+  const projectDir = await temporaryProject(t);
+  await fs.mkdir(path.join(projectDir, '.env'));
+  await assert.rejects(launch.launchEnvironment({
+    projectDir, env: {}, savedProviders: null, output: { write() {} },
+    askChoice: async () => assert.fail('must not ask provider'),
+    prepareEnvironment: async () => assert.fail('must not prepare environment'),
+  }), /无法读取项目 \.env 配置/);
+});
+
+test('empty first-launch keys retry before preparation and different providers ask separately', async () => {
+  const choices = ['deepseek', 'openai'], keys = ['', 'memory-key', '', 'reply-key'], events = [];
+  let printed = '';
+  const env = await launchEnvironment({
+    env: {}, savedProviders: null, output: { write(value) { printed += value; } },
+    askChoice: async () => choices.shift(),
+    askSecret: async () => { const key = keys.shift(); events.push(key ? 'key' : 'empty'); return key; },
+    prepareEnvironment: async () => events.push('setup'),
+    prepareMemory: async () => events.push('prepare'),
+  });
+  assert.deepEqual(events, ['empty', 'key', 'setup', 'prepare', 'empty', 'key']);
+  assert.equal(env.VOICEMEM_MEMORY_API_KEY, 'memory-key');
+  assert.equal(env.VOICEMEM_STUDIO_API_KEY, 'reply-key');
+  assert.equal((printed.match(/重新输入/g) || []).length, 2);
+});
+
+test('explicit empty role keys do not silently inherit a conventional provider key', async () => {
+  const keys = ['', 'new-key'];
+  const env = await launchEnvironment({
+    env: { VOICEMEM_MEMORY_API_KEY: '', DEEPSEEK_API_KEY: 'unrelated-key' }, savedProviders: null,
+    output: { write() {} }, askChoice: async () => 'deepseek', askSecret: async () => keys.shift(),
+  });
+  assert.equal(keys.length, 0);
+  assert.equal(env.VOICEMEM_MEMORY_API_KEY, 'new-key');
+});
+
+test('same-provider launches preserve a separately configured reply key', async () => {
+  const env = await launchEnvironment({
+    env: { VOICEMEM_MEMORY_API_KEY: 'memory-key', VOICEMEM_STUDIO_API_KEY: 'reply-key' },
+    savedProviders: null, output: { write() {} }, askChoice: async () => 'deepseek', askSecret: async () => '',
+  });
+  assert.equal(env.VOICEMEM_MEMORY_API_KEY, 'memory-key');
+  assert.equal(env.VOICEMEM_STUDIO_API_KEY, 'reply-key');
+});
+
+test('an explicit empty reply key is collected instead of implicitly reusing memory credentials', async () => {
+  const keys = ['', 'reply-key'];
+  const env = await launchEnvironment({
+    env: { VOICEMEM_MEMORY_API_KEY: 'memory-key', VOICEMEM_STUDIO_API_KEY: '' },
+    savedProviders: null, output: { write() {} }, askChoice: async () => 'deepseek', askSecret: async () => keys.shift(),
+  });
+  assert.equal(keys.length, 0);
+  assert.equal(env.VOICEMEM_MEMORY_API_KEY, 'memory-key');
+  assert.equal(env.VOICEMEM_STUDIO_API_KEY, 'reply-key');
+});
+
+test('the memory key is not implicitly reused for a different reply endpoint', async () => {
+  const prompts = [], keys = ['memory-key', 'reply-key'];
+  const env = await launchEnvironment({
+    env: { VOICEMEM_STUDIO_BASE_URL: 'https://chat.example.com/v1' }, savedProviders: null,
+    output: { write() {} }, askChoice: async () => 'deepseek',
+    askSecret: async prompt => { prompts.push(prompt); return keys.shift(); },
+  });
+  assert.equal(prompts.length, 2);
+  assert.equal(env.VOICEMEM_MEMORY_API_KEY, 'memory-key');
+  assert.equal(env.VOICEMEM_STUDIO_API_KEY, 'reply-key');
+});
+
+test('cancelling a required-key retry never prepares models', async () => {
+  let count = 0;
+  await assert.rejects(launchEnvironment({
+    env: {}, savedProviders: null, output: { write() {} }, askChoice: async () => 'deepseek',
+    askSecret: async () => {
+      if (count++ === 0) return '';
+      throw Object.assign(new Error('cancelled'), { code: 'CANCELLED' });
+    },
+    prepareEnvironment: async () => assert.fail('must not prepare environment'),
+    prepareMemory: async () => assert.fail('must not prepare models'),
+  }), { code: 'CANCELLED' });
+});
+
+test('saved missing keys are prompted without changing models or decrypting existing keys', async t => {
+  const projectDir = await temporaryProject(t), file = path.join(projectDir, 'model-services.json');
+  const stored = { schema: 1,
+    memory: { provider: 'deepseek', model: 'custom-extractor', baseUrl: 'https://memory.example.com/v1', secret: '' },
+    reply: { provider: 'openai', secret: 'encrypted-fixture' },
+  };
+  const contents = JSON.stringify(stored);
+  await fs.writeFile(file, contents);
+  const savedProviders = launch.savedModelProviders('darwin', { VOICEMEM_DESKTOP_USER_DATA: projectDir });
+  assert.deepEqual(Object.keys(savedProviders.missingCredentials), ['memory']);
+  const prompts = [];
+  const env = await launchEnvironment({
+    projectDir, env: { DEEPSEEK_API_KEY: 'unrelated-provider-key' }, savedProviders, output: { write() {} },
+    askChoice: async () => assert.fail('must not ask provider'),
+    askSecret: async prompt => { prompts.push(prompt); return 'repaired-key'; },
+    prepareMemory: async () => assert.fail('must not repeat memory preparation'),
+  });
+  const services = await runtime.loadModelServices(file, secret => {
+    assert.equal(secret, 'encrypted-fixture'); return 'existing-reply-key';
+  });
+  const recovered = runtime.recoverModelServiceCredentials(services, env);
+  assert.equal(prompts.length, 1);
+  assert.equal(recovered.memory.apiKey, 'repaired-key');
+  assert.equal(recovered.memory.model, 'custom-extractor');
+  assert.equal(recovered.memory.baseUrl, 'https://memory.example.com/v1');
+  assert.equal(recovered.reply.apiKey, 'existing-reply-key');
+  assert.equal(await fs.readFile(file, 'utf8'), contents);
+});
+
+test('saved unauthenticated loopback endpoints do not prompt for keys', async t => {
+  const projectDir = await temporaryProject(t);
+  await fs.writeFile(path.join(projectDir, 'model-services.json'), JSON.stringify({ schema: 1,
+    memory: { provider: 'openai', baseUrl: 'http://localhost:11434/v1', secret: '' },
+    reply: { provider: 'local', secret: '' },
+  }));
+  assert.deepEqual(launch.savedModelProviders('darwin', { VOICEMEM_DESKTOP_USER_DATA: projectDir }), {
+    memoryProvider: 'openai', replyProvider: 'local',
+  });
+});
+
+test('cancelling saved-key recovery leaves the configuration and environment untouched', async t => {
+  const projectDir = await temporaryProject(t), file = path.join(projectDir, 'model-services.json');
+  const contents = JSON.stringify({ schema: 1, memory: { provider: 'deepseek', secret: 'encrypted-fixture' },
+    reply: { provider: 'qwen', secret: '' } });
+  await fs.writeFile(file, contents);
+  const env = { VOICEMEM_DESKTOP_USER_DATA: projectDir };
+  let attempts = 0;
+  await assert.rejects(launchEnvironment({
+    projectDir, platform: 'darwin', env, output: { write() {} },
+    askChoice: async () => assert.fail('must not ask provider'),
+    askSecret: async () => {
+      if (attempts++ === 0) return '';
+      throw Object.assign(new Error('cancelled'), { code: 'CANCELLED' });
+    },
+    prepareEnvironment: async () => assert.fail('must not prepare environment'),
+  }), { code: 'CANCELLED' });
+  assert.equal(attempts, 2);
+  assert.deepEqual(env, { VOICEMEM_DESKTOP_USER_DATA: projectDir });
+  assert.equal(await fs.readFile(file, 'utf8'), contents);
+});
+
+test('secret input rejects non-interactive use instead of returning a missing key', async () => {
+  await assert.rejects(launch.readSecret('Key: ', { input: Readable.from([]), output: { write() {} } }), /交互终端/);
 });
 
 test('API key input is masked and returns the entered value', async () => {

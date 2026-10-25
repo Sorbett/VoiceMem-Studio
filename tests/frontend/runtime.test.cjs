@@ -118,6 +118,48 @@ test('model service persistence protects keys and restores process environment',
   assert.equal(env.VOICEMEM_STUDIO_BASE_URL, 'http://localhost:11434/v1');
 });
 
+test('credential recovery preserves saved services and requires an explicit matching binding', () => {
+  const services = r.modelServices({
+    memory: { provider: 'deepseek', model: 'custom-memory', baseUrl: 'https://memory.example.com/v1' },
+    reply: { provider: 'openai', apiKey: 'existing-reply' },
+    speech: { provider: 'openai', apiKey: 'existing-speech', voice: 'fixture-voice' },
+  });
+  const bound = { VOICEMEM_MEMORY_PROVIDER: 'deepseek',
+    VOICEMEM_MEMORY_BASE_URL: 'https://memory.example.com/v1/', VOICEMEM_MEMORY_API_KEY: 'new-memory' };
+  for (const env of [
+    { DEEPSEEK_API_KEY: 'unrelated-key' },
+    { VOICEMEM_MEMORY_API_KEY: 'unbound-key' },
+    { ...bound, VOICEMEM_MEMORY_PROVIDER: 'openai' },
+    { ...bound, VOICEMEM_MEMORY_BASE_URL: 'https://different.example.com/v1' },
+    { ...bound, VOICEMEM_MEMORY_API_KEY: '' },
+  ]) assert.equal(r.recoverModelServiceCredentials(services, env), services);
+  const recovered = r.recoverModelServiceCredentials(services, {
+    ...bound, VOICEMEM_STUDIO_PROVIDER: 'openai', VOICEMEM_STUDIO_BASE_URL: 'https://api.openai.com/v1',
+    VOICEMEM_STUDIO_API_KEY: 'must-not-overwrite',
+  });
+  assert.equal(services.memory.apiKey, '');
+  assert.equal(recovered.memory.apiKey, 'new-memory');
+  assert.equal(recovered.memory.model, 'custom-memory');
+  assert.equal(recovered.memory.baseUrl, 'https://memory.example.com/v1');
+  assert.equal(recovered.reply, services.reply);
+  assert.equal(recovered.speech, services.speech);
+  assert.equal(r.modelServiceEnvironment({}, recovered).VOICEMEM_MEMORY_API_KEY, 'new-memory');
+});
+
+test('recovered credentials retain encrypted persistence without affecting other services', async t => {
+  const directory = await temporary(t), file = path.join(directory, 'model-services.json');
+  const services = r.modelServices({ memory: { provider: 'deepseek', apiKey: 'existing-memory' },
+    reply: { provider: 'openai', model: 'custom-reply' } });
+  const recovered = r.recoverModelServiceCredentials(services, {
+    VOICEMEM_STUDIO_PROVIDER: 'openai', VOICEMEM_STUDIO_BASE_URL: 'https://api.openai.com/v1',
+    VOICEMEM_STUDIO_API_KEY: 'recovered-reply',
+  });
+  await r.saveModelServices(file, recovered, value => Buffer.from(value).toString('base64'));
+  const contents = await fs.readFile(file, 'utf8');
+  assert.doesNotMatch(contents, /existing-memory|recovered-reply/);
+  assert.deepEqual(await r.loadModelServices(file, value => Buffer.from(value, 'base64').toString()), recovered);
+});
+
 test('managed startup uses a long first-run timeout with a validated override', () => {
   assert.equal(r.managedStartupTimeout({}), 30 * 60 * 1000);
   assert.equal(r.managedStartupTimeout({ VOICEMEM_DESKTOP_STARTUP_TIMEOUT_SECONDS: '600' }), 600000);

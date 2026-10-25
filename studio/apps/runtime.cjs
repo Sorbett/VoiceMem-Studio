@@ -240,6 +240,25 @@ function modelServicesFromLaunch(launch, env = process.env) {
   });
 }
 
+function modelServiceNeedsKey(service) {
+  return !['local', 'recommended', 'adapter'].includes(service.provider)
+    && !loopback(new URL(service.baseUrl).hostname);
+}
+
+// Repair only missing keys for the exact saved provider and endpoint.
+function recoverModelServiceCredentials(services, env = process.env) {
+  let next = services;
+  for (const role of ['memory', 'reply']) {
+    const service = services[role];
+    if (service.apiKey || !modelServiceNeedsKey(service)) continue;
+    const prefix = role === 'memory' ? 'VOICEMEM_MEMORY' : 'VOICEMEM_STUDIO';
+    if (env[`${prefix}_PROVIDER`] !== service.provider || !env[`${prefix}_BASE_URL`]
+        || modelEndpoint(env[`${prefix}_BASE_URL`]) !== service.baseUrl || !env[`${prefix}_API_KEY`]) continue;
+    next = { ...next, [role]: modelService(role, { ...service, apiKey: env[`${prefix}_API_KEY`] }) };
+  }
+  return next;
+}
+
 function updateModelService(current, role, value) {
   if (!['memory', 'reply', ...Object.keys(COMPONENT_CATALOG)].includes(role)) throw new Error('未知的模型服务角色。');
   const existing = modelServices(current);
@@ -249,9 +268,7 @@ function updateModelService(current, role, value) {
   const sameFactory = updated.factory === previous.factory;
   if (updated.provider !== 'recommended' && !updated.apiKey
       && updated.provider === previous.provider && sameEndpoint && sameFactory) updated.apiKey = previous.apiKey;
-  const requiresKey = !['local', 'recommended', 'adapter'].includes(updated.provider)
-    && !loopback(new URL(updated.baseUrl).hostname);
-  if (requiresKey && !updated.apiKey) {
+  if (modelServiceNeedsKey(updated) && !updated.apiKey) {
     const title = COMPONENT_CATALOG[role]?.title || (role === 'memory' ? '记忆模型' : '回复模型');
     throw new Error(`${title}：更换服务商或服务地址时请输入对应的 API Key。`);
   }
@@ -561,6 +578,7 @@ module.exports = { DEFAULTS, MANAGED_STARTUP_TIMEOUT_MS, MANAGED_STOP_TIMEOUT_MS
   serverUrl, settings, sameOrigin, audioPermission, loadSettings, saveSettings,
   validateProject, validateBackendProject, command, managedLaunch, MODEL_SERVICE_DEFAULTS, modelEndpoint,
   COMPONENT_CATALOG, componentService, modelService, modelServices, modelServicesFromLaunch, updateModelService, updateModelServices,
+  modelServiceNeedsKey, recoverModelServiceCredentials,
   publicModelServices, modelServiceEnvironment, loadModelServices, saveModelServices,
   appendWslEnvironment, managedBackendCommand, selectManagedPort,
   startManagedBackend, stopManagedBackend, prepareManagedMemory, publishedUrl, startDocker, probe, waitForStudio };

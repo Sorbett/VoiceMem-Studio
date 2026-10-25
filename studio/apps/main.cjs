@@ -376,8 +376,10 @@ else {
       const launch = runtime.managedLaunch(process.env);
       if (launch) {
         const stored = await runtime.loadModelServices(modelServicesFile, unprotectSecret);
-        managed = { ...launch, services: stored || runtime.modelServicesFromLaunch(launch, process.env) };
-        persistInitialManaged = !stored;
+        const services = stored ? runtime.recoverModelServiceCredentials(stored, process.env)
+          : runtime.modelServicesFromLaunch(launch, process.env);
+        managed = { ...launch, services };
+        persistInitialManaged = !stored || services !== stored;
         managedConfiguration = managed;
       }
       current = managed ? { ...runtime.DEFAULTS }

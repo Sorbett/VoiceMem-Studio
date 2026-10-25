@@ -450,15 +450,25 @@ preparation process checks and acquires the shared memory,
 perception, and transcription models. Keys are inherited only by preparation,
 Electron, and the backend process, never command arguments. After preparation,
 the user selects the Studio Agent's dialogue-model API; a different provider
-requires its own masked key, while the same provider reuses the memory key.
+or endpoint requires its own masked key, while the same service reuses the
+memory key unless a separate reply key is configured. Native source startup
+loads repository `.env` and `.env.qwen` values before the terminal prompts,
+preserving exported-variable precedence and carrying the resolved configuration
+through Electron to the backend. Blank input retains an available key; without
+one, the terminal asks again before preparing models.
 The last menu option clears managed state and opens only the connection page;
 the address is required before the style selector. This is not a second reply
 service: VoiceMem's selected API is used for memory work, while Studio owns
 the complete agent (memory integration, ASR, dialogue, TTS, and UI). The `start:remote` shortcut
 avoids even the memory preparation. VoiceMem initialization remains inside the
 eventual Studio backend, not a second service. Later managed launches reuse
-the App configuration without another terminal prompt. After the first
-backend reaches readiness, Electron persists them only through OS-backed
+complete App configuration without another terminal prompt. Missing saved
+memory or reply keys are collected through masked terminal input for their
+existing endpoints. Electron applies these keys only to missing credentials
+whose provider and endpoint match, preserving saved models and other components,
+and persists the repaired configuration only after backend readiness. The source
+launcher does not decrypt saved keys; Electron remains the secure-storage owner.
+After the first backend reaches readiness, Electron persists keys only through OS-backed
 `safeStorage`; the connection settings file remains secret-free.
 Electron starts `.venv/bin/python` with the MLX backend on macOS, or invokes
 `.venv-cuda/bin/python` through `wsl.exe` with the CUDA backend on Windows. Both

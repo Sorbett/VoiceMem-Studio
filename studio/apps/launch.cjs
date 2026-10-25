@@ -2,6 +2,7 @@
 const path = require('node:path');
 const fs = require('node:fs');
 const os = require('node:os');
+const { parseEnv } = require('node:util');
 const readline = require('node:readline/promises');
 const { spawn } = require('node:child_process');
 const runtime = require('./runtime.cjs');
@@ -25,6 +26,27 @@ function providerChoices(platform = process.platform, arch = process.arch) {
     || (platform === 'darwin' && arch === 'arm64'));
 }
 
+// Match the backend's dotenv precedence before selecting and handing off credentials.
+function projectEnvironment(projectDir, env = process.env) {
+  const next = { ...env };
+  for (const name of ['.env', '.env.qwen']) {
+    let values;
+    try { values = parseEnv(fs.readFileSync(path.join(projectDir, name), 'utf8')); }
+    catch (error) {
+      if (error.code === 'ENOENT') continue;
+      throw new Error(`无法读取项目 ${name} 配置，请检查文件格式和读取权限。`);
+    }
+    const resolved = { ...next };
+    for (const [key, value] of Object.entries(values)) {
+      const expanded = value.replace(/\$\{([^}:]*)(?::-([^}]*))?\}/g,
+        (_match, variable, fallback) => resolved[variable] ?? fallback ?? '');
+      if (!Object.hasOwn(next, key)) next[key] = expanded;
+      resolved[key] = next[key];
+    }
+  }
+  return next;
+}
+
 function savedModelProviders(platform = process.platform, env = process.env, home = os.homedir()) {
   const configured = String(env.VOICEMEM_DESKTOP_USER_DATA || '').trim();
   const base = configured ? path.resolve(configured) : platform === 'darwin'
@@ -38,7 +60,14 @@ function savedModelProviders(platform = process.platform, env = process.env, hom
     const replyProvider = String(value.reply?.provider || '').toLowerCase();
     if (value.schema !== 1 || !runtime.MEMORY_PROVIDERS?.has?.(memoryProvider)) return null;
     if (!runtime.MANAGED_PROVIDERS?.has?.(replyProvider)) return null;
-    return { memoryProvider, replyProvider };
+    const missingCredentials = {};
+    for (const role of ['memory', 'reply']) {
+      const { secret, ...config } = value[role];
+      const service = runtime.modelService(role, config);
+      if (!secret && runtime.modelServiceNeedsKey(service)) missingCredentials[role] = service;
+    }
+    return { memoryProvider, replyProvider,
+      ...(Object.keys(missingCredentials).length ? { missingCredentials } : {}) };
   } catch { return null; }
 }
 
@@ -70,7 +99,9 @@ async function chooseProvider({ platform, arch, input, output, askChoice, role =
 }
 
 async function readSecret(prompt, { input = process.stdin, output = process.stdout } = {}) {
-  if (!input.isTTY || typeof input.setRawMode !== 'function') return '';
+  if (!input.isTTY || typeof input.setRawMode !== 'function') {
+    throw new Error('输入 API Key 需要交互终端，请在终端中重新运行 npm start。');
+  }
   output.write(prompt);
   input.setRawMode(true);
   input.resume();
@@ -96,30 +127,47 @@ async function readSecret(prompt, { input = process.stdin, output = process.stdo
   });
 }
 
+async function requiredKey(prompt, { inherited = '', input, output, askSecret }) {
+  while (true) {
+    const key = String(await askSecret(prompt, { input, output }) || inherited).trim();
+    if (key && key.length <= 8192 && !/[\x00-\x1f\x7f]/.test(key)) return key;
+    output.write('API Key 为空或格式不正确，请重新输入；按 Ctrl+C 取消。\n');
+  }
+}
+
 async function launchEnvironment({ platform = process.platform, env = process.env, input = process.stdin,
   arch = process.arch, output = process.stdout, askSecret = readSecret, askChoice,
   prepareEnvironment = async () => {}, prepareMemory = async () => {},
-  savedProviders = savedModelProviders(platform, env) } = {}) {
-  const projectDir = path.resolve(__dirname, '../..');
-  const next = { ...env, VOICEMEM_DESKTOP_PROJECT_ROOT: projectDir };
+  projectDir = path.resolve(__dirname, '../..'), readEnvironment = projectEnvironment,
+  savedProviders } = {}) {
+  const configured = readEnvironment(projectDir, env);
+  const next = { ...configured, VOICEMEM_DESKTOP_PROJECT_ROOT: projectDir };
+  if (savedProviders === undefined) savedProviders = savedModelProviders(platform, next);
   if (savedProviders) {
     next.VOICEMEM_DESKTOP_MEMORY_PROVIDER = savedProviders.memoryProvider;
     next.VOICEMEM_DESKTOP_REPLY_PROVIDER = savedProviders.replyProvider;
     next.VOICEMEM_DESKTOP_MANAGED_PROVIDER = savedProviders.replyProvider;
     output.write('\n正在使用 App 中保存的模型服务配置。\n');
+    for (const [role, service] of Object.entries(savedProviders.missingCredentials || {})) {
+      const prefix = role === 'memory' ? 'VOICEMEM_MEMORY' : 'VOICEMEM_STUDIO';
+      output.write(`已保存的${role === 'memory' ? '记忆模型' : '回复模型'}缺少 API Key（${service.baseUrl}）。\n`);
+      next[`${prefix}_API_KEY`] = await requiredKey('请补填 API Key：', { input, output, askSecret });
+      next[`${prefix}_PROVIDER`] = service.provider;
+      next[`${prefix}_BASE_URL`] = service.baseUrl;
+    }
     await prepareEnvironment({ projectDir, env: next });
     return next;
   }
   const memoryProvider = await chooseProvider({ platform, arch, input, output, askChoice, role: 'memory' });
-  const inherited = String(next.VOICEMEM_MEMORY_API_KEY || next[memoryProvider.credential] || '').trim();
-  const secret = await askSecret(
+  const inherited = String(Object.hasOwn(next, 'VOICEMEM_MEMORY_API_KEY')
+    ? next.VOICEMEM_MEMORY_API_KEY : next[memoryProvider.credential] || '').trim();
+  const key = await requiredKey(
     `请输入 VoiceMem ${memoryProvider.credential}`
-      + `${inherited ? '（回车沿用当前环境变量）' : '（回车沿用项目 .env）'}：`,
-    { input, output },
+      + `${inherited ? '（回车沿用已配置的 Key）' : ''}：`,
+    { inherited, input, output, askSecret },
   );
-  const key = secret || inherited;
-  if (secret) next[memoryProvider.credential] = secret;
-  if (key) next.VOICEMEM_MEMORY_API_KEY = key;
+  if (key !== inherited) next[memoryProvider.credential] = key;
+  next.VOICEMEM_MEMORY_API_KEY = key;
   next.VOICEMEM_DESKTOP_MEMORY_PROVIDER = memoryProvider.id;
   output.write('\n第 2 步：正在检查 VoiceMem 环境并准备记忆、感知和转写模型…\n');
   await prepareEnvironment({ projectDir, env: next });
@@ -127,18 +175,21 @@ async function launchEnvironment({ platform = process.platform, env = process.en
   output.write('VoiceMem 所需模型已准备完成；它将在 Studio 后端进程中初始化。\n');
   const provider = await chooseProvider({ platform, arch, input, output, askChoice, role: 'reply' });
   if (provider.id === 'remote') return remoteEnvironment(next);
-  const replyInherited = String(next.VOICEMEM_STUDIO_API_KEY || next[provider.credential] || '').trim();
-  if (provider.id !== 'local' && provider.id !== memoryProvider.id) {
-    const replySecret = await askSecret(
+  const hasReplyKey = Object.hasOwn(configured, 'VOICEMEM_STUDIO_API_KEY');
+  const replyInherited = String(hasReplyKey
+    ? configured.VOICEMEM_STUDIO_API_KEY : configured[provider.credential] || '').trim();
+  const sameService = provider.id === memoryProvider.id
+    && runtime.modelService('memory', { provider: memoryProvider.id, baseUrl: next.VOICEMEM_MEMORY_BASE_URL }).baseUrl
+      === runtime.modelService('reply', { provider: provider.id, baseUrl: next.VOICEMEM_STUDIO_BASE_URL }).baseUrl;
+  if (provider.id !== 'local' && (!sameService || (hasReplyKey && !replyInherited))) {
+    const replyKey = await requiredKey(
       `请输入 Studio Agent ${provider.credential}`
-        + `${replyInherited ? '（回车沿用当前环境变量）' : '（回车沿用项目 .env）'}：`,
-      { input, output },
+        + `${replyInherited ? '（回车沿用已配置的 Key）' : ''}：`,
+      { inherited: replyInherited, input, output, askSecret },
     );
-    if (replySecret) {
-      next[provider.credential] = replySecret;
-      next.VOICEMEM_STUDIO_API_KEY = replySecret;
-    } else if (replyInherited) next.VOICEMEM_STUDIO_API_KEY = replyInherited;
-  } else if (provider.id === memoryProvider.id && key) next.VOICEMEM_STUDIO_API_KEY = key;
+    if (replyKey !== replyInherited) next[provider.credential] = replyKey;
+    next.VOICEMEM_STUDIO_API_KEY = replyKey;
+  } else if (sameService) next.VOICEMEM_STUDIO_API_KEY = hasReplyKey ? replyInherited : key;
   next.VOICEMEM_DESKTOP_REPLY_PROVIDER = provider.id;
   next.VOICEMEM_DESKTOP_MANAGED_PROVIDER = provider.id;
   return next;
@@ -153,7 +204,8 @@ function remoteEnvironment(env = process.env) {
   const next = { ...env };
   for (const name of MANAGED_ENVIRONMENT) delete next[name];
   for (const name of ['VOICEMEM_MEMORY_API_KEY', 'VOICEMEM_STUDIO_API_KEY',
-    'DEEPSEEK_API_KEY', 'DASHSCOPE_API_KEY', 'OPENAI_API_KEY']) delete next[name];
+    'DEEPSEEK_API_KEY', 'DASHSCOPE_API_KEY', 'OPENAI_API_KEY',
+    ...Object.keys(runtime.COMPONENT_CATALOG).map(role => `STUDIO_${role.toUpperCase()}_API_KEY`)]) delete next[name];
   delete next.VOICEMEM_DESKTOP_SERVER_URL;
   next.VOICEMEM_DESKTOP_CONFIGURE = '1';
   next.VOICEMEM_DESKTOP_REQUIRE_ADDRESS = '1';
@@ -221,6 +273,7 @@ async function main({ platform = process.platform, arch = process.arch, env: inh
   }
   if (!process.stdin.isTTY) throw new Error('本机启动需要交互终端来选择 API；只连接已有服务请运行 npm run start:remote。');
   const env = await launchEnvironment({
+    platform, arch, env: inheritedEnv,
     prepareEnvironment: ({ projectDir, env: childEnv }) => prepareLocalEnvironment(projectDir, childEnv),
     prepareMemory: ({ projectDir, provider, env: childEnv }) =>
       runtime.prepareManagedMemory(projectDir, provider, { platform: process.platform, env: childEnv }),
@@ -234,4 +287,4 @@ if (require.main === module) main().catch(error => {
 });
 
 module.exports = { PROVIDERS, REMOTE, MANAGED_ENVIRONMENT, providerChoices, selectProvider, chooseProvider,
-  savedModelProviders, readSecret, launchEnvironment, launchArguments, remoteEnvironment, main };
+  projectEnvironment, savedModelProviders, readSecret, launchEnvironment, launchArguments, remoteEnvironment, main };
