@@ -19,7 +19,7 @@ from studio.core.utils.interruption.component import Interruption
 from studio.core.utils.echo_guard.component import UtteranceGuard, is_echo
 from studio.core.utils.turn_taking.initialize import Backchannel, TurnTakingStateMachine
 from voicemem.stream import VoiceStream
-from web.harness import backchannel_policy
+from web.harness import PauseGate, backchannel_policy
 
 
 class ShortSpeechTests(unittest.IsolatedAsyncioTestCase):
@@ -316,6 +316,112 @@ class AnticipateTests(CaptureFixture, unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(turns), 1)
         self.assertFalse(turns[0].early_ok)
         self.assertEqual(turns[0].text, "我喜欢安静的地方但是图书馆很吵")
+
+
+class SpeculativeRefreshTests(CaptureFixture, unittest.IsolatedAsyncioTestCase):
+    def frame(self, text, *, silence=0, score=.99, final=False):
+        st = state(text, final=final)
+        st.eot_score = score
+        if silence:
+            st.state, st.silence = "<silence>", silence
+        return False, "", st
+
+    async def capture(self, frames, **kwargs):
+        events = []
+
+        async def early(text, _, refined):
+            events.append(("start", text, await refined))
+
+        async def cancel(_):
+            events.append(("cancel",))
+
+        sent, turns, _ = await self.run_frames(
+            frames, on_early=early, on_early_cancel=cancel, **kwargs)
+        return events, turns, sent
+
+    async def test_continuous_extension_refreshes_at_next_pause_before_confirmation(self):
+        first = "我喜欢安静的地方"
+        complete = first + "周末你能推荐几个地点吗"
+        events, turns, sent = await self.capture([
+            self.frame(first),
+            self.frame(complete),
+            self.frame(complete),
+            self.frame(complete, silence=.04),
+            self.frame(complete, final=True),
+        ])
+        self.assertEqual(events, [("start", first, first), ("cancel",),
+                                  ("start", complete, complete)])
+        self.assertEqual([turn.text for turn in turns], [complete])
+        self.assertTrue(turns[0].early_ok)
+        self.assertFalse(any(m['type'] == 'answer_start' for m in sent))
+
+    async def test_asr_only_extension_in_silence_keeps_frozen_bet(self):
+        first = "我喜欢安静的地方"
+        complete = first + "周末你能推荐几个地点吗"
+        events, _, _ = await self.capture([
+            self.frame(first), self.frame(complete, silence=.04),
+            self.frame(complete, final=True),
+        ])
+        self.assertEqual(events, [("start", first, first)])
+
+    async def test_minor_repairs_and_filler_suffix_do_not_restart(self):
+        first = "明天我有什么安排"
+        for changed in ("明天我有什么安徘", first + "呀啊嗯哦呐哈呀啊嗯哦"):
+            with self.subTest(changed=changed):
+                events, _, _ = await self.capture([
+                    self.frame(first), self.frame(changed),
+                    self.frame(changed, silence=.04),
+                    self.frame(changed, final=True),
+                ])
+                self.assertEqual(events, [("start", first, first)])
+
+    async def test_two_bets_bound_repeated_continuation_and_reset_next_turn(self):
+        first = "我喜欢安静的地方"
+        second = first + "周末你能推荐几个地点吗"
+        third = second + "最好能开车直接过去"
+        events, turns, _ = await self.capture([
+            self.frame(first), self.frame(second),
+            self.frame(second, silence=.04), self.frame(third),
+            self.frame(third, silence=.04), self.frame(third, final=True),
+            self.frame("今天气温怎么样"),
+            self.frame("今天气温怎么样", final=True),
+        ])
+        self.assertEqual(events, [
+            ("start", first, first), ("cancel",),
+            ("start", second, second), ("cancel",),
+            ("start", "今天气温怎么样", "今天气温怎么样"),
+        ])
+        self.assertFalse(turns[0].early_ok)
+        self.assertTrue(turns[1].early_ok)
+
+    async def test_resumed_bet_waits_for_pause_instead_of_restarting_during_speech(self):
+        first, complete = "我喜欢安静的地方", "我喜欢安静的地方但是要交通方便"
+        events, _, _ = await self.capture([
+            self.frame(first), self.frame(first, silence=.04),
+            self.frame(complete), self.frame(complete),
+            self.frame(complete, silence=.04), self.frame(complete, final=True),
+        ])
+        self.assertEqual(events, [("start", first, first), ("cancel",),
+                                  ("start", complete, complete)])
+
+    async def test_acknowledgement_hold_allows_only_private_paused_preparation(self):
+        pause = PauseGate(hold_until=.8, silence=.12)
+        text = "周末你能推荐几个地点吗"
+        events, turns, _ = await self.capture([
+            self.frame(text), self.frame(text, silence=.16),
+        ], pause_gate=pause)
+        self.assertEqual(events, [("start", text, text)])
+        self.assertEqual(turns, [])
+        self.assertEqual(pause.hold_until, .8)
+
+    async def test_hold_preserves_unfinished_and_low_eot_guards(self):
+        for text, score in (("我想问你", .99), ("明天有什么安排", .1)):
+            with self.subTest(text=text):
+                events, turns, _ = await self.capture([
+                    self.frame(text, silence=.16, score=score),
+                ], pause_gate=PauseGate(hold_until=.8))
+                self.assertEqual(events, [])
+                self.assertEqual(turns, [])
 
 
 class GuardTests(unittest.TestCase):

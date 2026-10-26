@@ -119,6 +119,9 @@ class Capture:
         eot_peak = 0.0
         early_at = 0.0
         early_paused = False                  # A real pause has followed the EOT bet.
+        early_voiced_end = None
+        early_attempts = 0
+        early_wait_pause = False
         if _bc_mod.emitting():
 
             self._backchannel_voice()
@@ -127,8 +130,10 @@ class Capture:
 
         def _reset_early():
             nonlocal early_at, early_paused, early_text, eot_peak, bc_speech_t0
+            nonlocal early_voiced_end, early_attempts, early_wait_pause
             nonlocal prewarm_idle, prewarm_mem
             early_at, early_paused, early_text = 0.0, False, ""
+            early_voiced_end, early_attempts, early_wait_pause = None, 0, False
             eot_peak = 0.0
             bc_speech_t0 = 0.0
             prewarm_idle = True
@@ -256,19 +261,25 @@ class Capture:
                 last_speak_t = time.monotonic()
 
             # Early generation is speculative until the user turn is confirmed.
-            # ASR may revise text during silence, but actual speech after a pause
-            # means the user continued the same sentence and invalidates the bet.
+            # ASR-only repairs keep the frozen bet. New voiced audio and a long
+            # content suffix can reject it even before VAD observes a pause.
             resumed_after_early = False
             if early_at:
+                before, current = gate.norm(early_text), gate.norm(cur)
+                suffix = current[len(before):] if current.startswith(before) else ""
+                extended = (early_voiced_end is not None and voiced_end is not None
+                            and voiced_end > early_voiced_end and before
+                            and sum(char not in "啊呀哦嗯呐哈" for char in suffix) >= 6)
                 if st.state == "<silence>" and st.silence > 0:
                     early_paused = True
-                elif early_paused and st.state == "<speak>":
+                if (early_paused and st.state == "<speak>") or extended:
                     resumed_after_early = True
                     early_at, early_paused, early_text = 0.0, False, ""
+                    early_voiced_end, early_wait_pause = None, True
                     eot_peak = 0.0
                     prewarm_idle = True
                     if on_early_cancel:
-                        await on_early_cancel("用户停顿后继续说")
+                        await on_early_cancel("用户持续续话" if extended else "用户停顿后继续说")
 
             #
 
@@ -290,12 +301,16 @@ class Capture:
             # EOT starts buffered work, but confirmation remains the commit point.
             # Resumed speech cancels this bet before any transcript or audio is sent.
             if (on_early and not busy and not input_echo and st.spoke and cur
-                    and not is_unfinished(cur) and not pause_gate.hold_until
+                    and not is_unfinished(cur) and early_attempts < 2
+                    and (not (early_wait_pause or pause_gate.hold_until)
+                         or (st.state == "<silence>" and st.silence > 0))
                     and not (utterance.started_busy and self._is_backchannel(cur))
                     and st.eot_score >= self.EARLY_EOT and not early_at
                     and not resumed_after_early):
                 early_text, early_at = cur, time.monotonic()
                 early_paused = st.state == "<silence>"
+                early_voiced_end = voiced_end
+                early_attempts += 1
                 refined_text = stream.refine_current_snapshot()
                 await on_early(cur, st, refined_text)
                 # Generation is buffered; normal turn confirmation still owns when
@@ -542,6 +557,7 @@ class Capture:
                 # actual resumed speech already cancelled it above.
                 _early_ok = bool(early_at)
                 early_at, early_paused, early_text = 0.0, False, ""
+                early_voiced_end, early_attempts, early_wait_pause = None, 0, False
 
                 bc_speech_t0 = 0.0
                 prewarm_idle = True

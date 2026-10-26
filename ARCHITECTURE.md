@@ -1116,6 +1116,15 @@ The UI finalizes user records by input ID and ignores later partials or duplicat
 finals for those records; a real new input remains free to update live text. Generated speech
 stays buffered until turn confirmation becomes the commit point for playback.
 
+Capture also cancels a stale EOT bet when newer voiced frames accompany a
+normalized prefix extension of at least six content characters. ASR-only repairs
+and filler-only suffixes do not trigger this refresh. A replacement waits for
+another acoustic pause and a complete, high-EOT hypothesis; each user turn admits
+at most two bets. During an acknowledgement's continuation hold, eligible paused
+input may prepare a private reply while the existing pause gate still controls
+confirmation. Final transcript, route, memory and ownership checks continue to
+govern release, so this overlap never shortens the user's continuation window.
+
 Clearly unfinished voice turns have a separate continuation path. The Studio session
 plays an eligible cached acknowledgement, keeps the turn interruptible, and
 merges resumed speech back into the unfinished text. If silence reaches the

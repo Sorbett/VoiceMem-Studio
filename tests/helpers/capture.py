@@ -53,8 +53,11 @@ def state(text="", *, final=False):
 
 
 class CaptureFixture:
-    async def run_frames(self, frames, on_early=None, on_early_cancel=None):
+    async def run_frames(self, frames, on_early=None, on_early_cancel=None,
+                         pause_gate=None):
         ns, sent, yielded, interrupted = anticipate_namespace(), [], [], []
+        if pause_gate is not None:
+            ns["PauseGate"] = lambda **_: pause_gate
         playback = {"busy": False, "text": ""}
         frames = iter(frames)
         current = None

@@ -9,6 +9,7 @@ import unittest
 from unittest.mock import AsyncMock, Mock, patch
 
 from tests.helpers.conversation import ConversationFixture
+from tests.helpers.capture import CaptureFixture, state
 from studio.core.utils.audio_timeline.component import AudioTimeline
 from studio.core.utils.conversation.component import Conversation
 from studio.core.utils.conversation.input_turn import InputContinuation
@@ -702,6 +703,48 @@ class ContextCommitTests(ConversationFixture, unittest.IsolatedAsyncioTestCase):
         self.assert_once(value)
         self.assertEqual(self.saved()[0].assistant_text, '')
         self.assertEqual(self.audio, [])
+
+
+class CaptureSpeculationCommitTests(ConversationFixture, CaptureFixture,
+                                    unittest.IsolatedAsyncioTestCase):
+    async def test_refreshed_reply_stays_private_and_commits_only_complete_input(self):
+        first = '周末我想去散步'
+        complete = first + '可以推荐几个安静的公园吗'
+
+        def frame(text, *, silence=0, final=False):
+            value = state(text, final=final)
+            value.eot_score = .99
+            if silence:
+                value.state, value.silence = '<silence>', silence
+            if final:
+                value.turn.result = empty_result()
+            return False, '', value
+
+        async def early(text, snapshot, refined):
+            snapshot = types.SimpleNamespace(memory=empty_result(), route='shallow',
+                                             eot_score=snapshot.eot_score)
+            await self.session.start_early(text, snapshot, refined)
+            await asyncio.wait_for(self.session.early['task'], 1)
+            self.assertEqual(self.audio, [])
+            self.assertEqual(self.messages, [])
+            self.agent.queue_remember_turn.assert_not_called()
+
+        _, turns, _ = await self.run_frames([
+            frame(first), frame(complete), frame(complete, silence=.04),
+            frame(complete, final=True),
+        ], on_early=early, on_early_cancel=self.session.drop_early)
+        self.assertEqual(self.model_calls, 2)
+        self.assertEqual(self.audio, [])
+        final = turns[0]
+        self.assertTrue(final.early_ok)
+        self.assertEqual(self.session.early['text'], complete)
+        routed = await self.session.route(final)
+        self.assertTrue(await self.session.commit_early(final, routed))
+        await asyncio.wait_for(self.session.turn['task'], 1)
+        self.assertTrue(self.audio)
+        self.agent.queue_remember_turn.assert_called_once()
+        self.assertEqual(self.context.turns(self.session.context_session, 'fixture')[0].user_text,
+                         complete)
 
 
 class RealtimePlaybackAuthorityTests(unittest.IsolatedAsyncioTestCase):
