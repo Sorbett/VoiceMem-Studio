@@ -140,6 +140,8 @@ class Conversation:
             if self.turn['speech_end']:
                 elapsed = (time.monotonic() - self.turn['speech_end']) * 1000
                 print(f'[lat] 闭嘴→浏览器开始播放（含回报传输） {elapsed:.0f}ms', flush=True)
+                from studio.core.utils.latency import log_playback_timing
+                log_playback_timing(self.turn.get('pending'), timeline, time.monotonic())
         if data.get('state') == 'stalled' and self.agent.BARGE_DEBUG:
             from voicemem.engine import gpu_loop as _gl, observer, resources, torch_snapshot
             print(f"[play] 缓冲见底：已播 {timeline.rendered_ms():.0f}ms，GPU 线程活跃任务 {getattr(_gl(), 'active_count', '?')}", flush=True)

@@ -2,9 +2,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import re
 
 
-FIRST_WAIT_S = 0.45
+FIRST_WAIT_S = 0.12
 NEXT_WAIT_S = 0.60
 BUFFERED_WAIT_S = 1.20
 FIRST_SOFT_CHARS = 28
@@ -15,6 +16,7 @@ NEXT_MAX_CHARS = 100
 _SENTENCE_END = "。！？!?…\n"
 _SOFT_END = "，,、；;：:"
 _CLOSERS = "\"'”’」』】）》)]}"
+_UNBROKEN_TOKEN = re.compile(r"[A-Za-z'-]+|[+-]?\d+(?:[.,]\d*)?")
 
 
 def _sentence_ends(text: str):
@@ -81,14 +83,16 @@ class SpeechBuffer:
         self.offset = 0
         self.first = True
         self.started: float | None = None
+        self._waiting_for_boundary = False
 
     def append(self, delta: str, now: float) -> None:
         self.text += delta
+        self._waiting_for_boundary = False
         if self.started is None and self.text.strip():
             self.started = now
 
     def remaining_wait(self, now: float, buffered_audio_s: float = 0.0) -> float | None:
-        if self.started is None:
+        if self.started is None or self._waiting_for_boundary:
             return None
         budget = FIRST_WAIT_S if self.first else max(
             NEXT_WAIT_S, min(BUFFERED_WAIT_S, buffered_audio_s - 0.4))
@@ -99,6 +103,11 @@ class SpeechBuffer:
         remaining = self.remaining_wait(now, buffered_audio_s)
         expired = remaining is not None and remaining <= 0
         output = []
+        if (expired and not final and self.first and self.text
+                and not self.text[-1].isspace()
+                and _UNBROKEN_TOKEN.fullmatch(self.text.strip())):
+            self._waiting_for_boundary = True
+            return output
         while self.text:
             end = _cut_index(self.text, self.first, force=final or expired)
             if not end:

@@ -2,17 +2,51 @@
 from concurrent.futures import ThreadPoolExecutor
 from contextvars import copy_context
 import threading
+import time
 from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
 
 import numpy as np
 
-from voicemem.engine import TORCH_LOCK, background_scope
+from voicemem.engine import TORCH_LOCK, Service, background_scope, inference_scope
 from voicemem.leftbrain.local_embedder import _LockedEncoder
 
 
 class EmbeddingReuseTests(unittest.TestCase):
+    def test_interactive_encoder_request_precedes_queued_background_request(self):
+        entered, release = threading.Event(), threading.Event()
+        order = []
+
+        def native(texts, **kwargs):
+            if texts == ['owner']:
+                entered.set()
+                release.wait(2)
+            order.append(texts[0])
+            return np.zeros((1, 3), dtype=np.float32)
+
+        encoder = _LockedEncoder(SimpleNamespace(encode=native, device='cpu'))
+
+        def encode(text, service):
+            with inference_scope(service):
+                return encoder.encode([text])
+
+        with ThreadPoolExecutor(max_workers=3) as workers:
+            owner = workers.submit(encode, 'owner', Service.INTERACTIVE)
+            self.assertTrue(entered.wait(1))
+            background = workers.submit(encode, 'background', Service.BACKGROUND)
+            interactive = workers.submit(encode, 'interactive', Service.INTERACTIVE)
+            try:
+                deadline = time.monotonic() + 1
+                while len(encoder._lock._waiting) < 2 and time.monotonic() < deadline:
+                    time.sleep(.001)
+                self.assertEqual(len(encoder._lock._waiting), 2)
+            finally:
+                release.set()
+            for future in (owner, background, interactive):
+                future.result(timeout=1)
+        self.assertEqual(order, ['owner', 'interactive', 'background'])
+
     def setUp(self):
         self.enterContext(patch("voicemem.engine.telemetry.metrics._metrics", {}))
 

@@ -313,6 +313,68 @@ class MLXShortTextTests(unittest.IsolatedAsyncioTestCase):
 
 
 class FillerHandoffTests(unittest.IsolatedAsyncioTestCase):
+    async def test_long_filler_synthesis_keeps_the_complete_clip(self):
+        closed = asyncio.Event()
+
+        async def tts(*_):
+            try:
+                yield bytes(48000)
+                yield bytes(48000)
+            finally:
+                closed.set()
+
+        memory = types.SimpleNamespace(utils=types.SimpleNamespace(
+            get=lambda _: types.SimpleNamespace(stream=tts)))
+        with patch('studio.core.utils.conversation.component.generate_local_filler',
+                   new=AsyncMock(return_value='一段过长的工作垫话。')):
+            result = await self.session.synthesize_work_filler(self.value, memory, 'fixture')
+        self.assertEqual(result, ('一段过长的工作垫话。', bytes(96000)))
+        self.assertTrue(closed.is_set())
+        self.assertFalse(self.events)
+
+    async def test_text_generation_deadline_does_not_limit_speech_preparation(self):
+        closed = asyncio.Event()
+
+        async def tts(*_):
+            try:
+                yield bytes(480)
+                await asyncio.sleep(.04)
+                yield bytes(48000)
+            finally:
+                closed.set()
+
+        memory = types.SimpleNamespace(utils=types.SimpleNamespace(
+            get=lambda _: types.SimpleNamespace(stream=tts)))
+        with patch('studio.core.utils.conversation.component.generate_local_filler',
+                   new=AsyncMock(return_value='让我想想。')), patch(
+                       'studio.harness.turn_taking.policy.WORK_FILLER_TIMEOUT_S', .01):
+            result = await asyncio.wait_for(
+                self.session.synthesize_work_filler(self.value, memory, 'fixture'), .5)
+        self.assertEqual(result, ('让我想想。', bytes(48480)))
+        self.assertTrue(closed.is_set())
+
+    async def test_long_filler_finishes_naturally_before_main_audio(self):
+        self.session.synthesize_work_filler = AsyncMock(
+            return_value=('自然的深思过渡语。', bytes(48000 * 4)))
+        task = asyncio.create_task(self.release())
+        for _ in range(100):
+            if self.events:
+                break
+            await asyncio.sleep(.001)
+        message = self.events[0]
+        self.assertEqual(message['type'], 'backchannel')
+        import base64
+        self.assertEqual(len(base64.b64decode(message['pcm'])), 48000 * 4)
+        await self.sink.send({'type': 'answer_start'})
+        await self.sink.send_audio(bytes(480))
+        await asyncio.sleep(.01)
+        self.assertFalse(task.done())
+        self.assertFalse(self.sink.live)
+        self.session.filler_done(message['filler_id'])
+        await asyncio.wait_for(task, .5)
+        self.assertTrue(self.sink.live)
+        self.sink._send_audio.assert_awaited_once_with(bytes(480))
+
     def setUp(self):
         self.events = []
         async def send(message):

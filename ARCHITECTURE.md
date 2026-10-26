@@ -645,11 +645,21 @@ Owned by:
 - `studio/prompt_config.py`: validated Studio prompt loading and caching;
 - `voicemem/utils/common/prompt_trace.py`: shared asynchronous request tracing;
 - `studio/core/utils/logging_utils/component.py`: runtime log routing;
+- `studio/core/utils/latency.py`: confirmed input/output stage correlation;
 - `tests/`: deterministic regressions and shared synthetic fixtures;
 - `evals/`: manually run latency and model-quality evaluations.
 
 Prompt traces may contain complete conversation and memory context. They are
 runtime data even though their schema is part of the observability design.
+
+Confirmed `Turn` and Studio `Pending` objects may carry numeric input-stage
+timing. Capture adds archival/handoff timing, routing records its own interval,
+and each output timeline captures its generation and first-audio timestamps.
+On the first accepted playback-start checkpoint, `[lat-breakdown]` joins that
+confirmed input with its adopted output, including speculative overlap.
+Gate and retrieval are subintervals of confirmation, not extra additive stages.
+The row contains only generated input/output identifiers and timing metadata;
+it does not expose dialogue or prompts to the client or persistent memory.
 
 ## 3. Dependency direction
 
@@ -850,6 +860,12 @@ The recognizer remains serial. Confirmed decodes precede queued speculative
 snapshots, and a stream cancels its unstarted snapshots at finalization.
 Already-running native calls finish normally; different audio snapshots are
 never treated as interchangeable.
+Each stream retains at most one successful completed speculative final-ASR
+result. Finalization may reuse it only in the same turn epoch, with the same
+provider and exactly equal PCM shape, dtype and samples. A streaming-text
+fallback is never cached as final recognition. Extra silence, resumed speech,
+provider replacement, reset and close prevent stale reuse. A cache hit advances
+the streaming decoder epoch just like a full-coverage final decode.
 `VoiceStream.prepare_audio` constructs connection-owned ASR and VAD adapters
 off the event loop. VAD recurrent state and segment queues are private to a
 connection; consumed segments are discarded because capture only needs speech
@@ -905,8 +921,12 @@ Existing persisted memories and Space metadata are not translated or migrated.
 The compatibility `/api/lang` endpoint changes UI language and reports
 `reply_lang: "auto"`.
 
-ASR finalization gives full-audio refinement an 80 ms preference window, then
-accepts the first non-empty result from refinement or streaming flush. Passing
+Standalone ASR finalization gives full-audio refinement an 80 ms preference
+window. Studio selects a 30 ms window, overridable with
+`STUDIO_ASR_FINAL_GRACE_S`, so a ready complete streaming flush can return
+earlier. The stream-level `final_asr_grace_s` option leaves the SDK default
+unchanged when omitted. Finalization then accepts the first non-empty result
+from refinement or streaming flush. Passing
 the preference window does not cancel refinement while streaming is unfinished.
 The two decoders share a one-second finalization deadline, including queue time;
 if neither produces usable text, the last available transcript is retained and
@@ -976,6 +996,24 @@ For deep turns, speculative classify/search starts while speech is still in
 progress. Query embedding work is shared within a search scope, and device
 access follows the existing Torch lock boundary. A shallow or backchannel route
 returns a normalized empty result rather than `None`.
+
+Gate and speculative retrieval use an engine-owned two-worker input executor,
+separate from the default asyncio executor used by background preparation.
+Cancellation reaches queued native admission through a captured predicate;
+resumed speech and turn reset also cancel obsolete silence-time Gate probes.
+Already-running native calls finish under their original ownership. Successful
+operations do not inject cancellation into their captured child work.
+
+Studio limits the confirmed Gate wait to 150 ms by default through
+`STUDIO_GATE_TIMEOUT_S`; zero disables that bound. The stream-level
+`gate_timeout_s` option is disabled when omitted by SDK callers. A timed-out
+classification conservatively retains the `deep` memory route; required search
+still completes before reply generation and is not covered by that Gate budget.
+Final deep confirmation reuses its authoritative route during retrieval instead
+of running Gate a second time. A shallow speculative result is upgraded with a
+real search when the final route requires memory. Parent cancellation never
+restarts retrieval. Gate queue time and worker wall time, including lock waits,
+are reported separately from the confirmation's Gate wait.
 
 ```mermaid
 flowchart LR
@@ -1149,6 +1187,15 @@ over-budget output, invalid text, failure or a queue-inclusive generation timeou
 skip the optional bridge. Token budget and cancellation limit background work;
 native inference already in progress cannot be forcibly interrupted. The
 legacy reply-stream filler helper remains available to direct callers.
+
+Work fillers preserve natural deep-reasoning transitions, including longer
+utterances. Speech preparation and playback have no additional duration cap;
+the local text generator retains its existing queue-inclusive timeout. Main
+reply preparation runs concurrently. A main output that becomes ready before
+the filler is emitted can cancel that unused filler. Once emitted, the complete
+filler waits for the client's completion report before main speech, without
+overlap or hard cuts. This intentional transition is distinct from silent
+latency and must not be removed just to reduce the main-output timing metric.
 
 ## 9. Reply, prompt, and speech flow
 
@@ -1340,6 +1387,10 @@ a deadline flush. Sentence endings release promptly; comma boundaries are a
 fallback for long phrases. Bounded first/rest waits and maximum lengths prevent
 indefinite buffering. Confirmed active playback headroom permits a longer bounded
 wait for subsequent phrases, without changing client playback or filler gates.
+The first phrase has a 120 ms text-buffer deadline; later phrases retain their
+existing headroom-aware budgets. At that deadline an isolated unfinished Latin
+word or numeric expression waits for more text or EOF. This boundary wait does
+not repeatedly poll an expired timer. Segments retain the original text offsets.
 After private control and tone parsing, Studio sends the original Markdown to
 the browser and keeps it as the reply history. A reply-local `MarkdownSpeech`
 parser emits separate speech text plus source code-point boundaries before
@@ -1510,6 +1561,12 @@ default executor waiting for output. Cancellation skips unstarted factories,
 checks between native steps and retains speech admission through owner-thread
 generator cleanup. Application shutdown drains that cleanup before closing the
 worker. Initial and subsequent acoustic batches retain their provider settings.
+Reference prompt encoding uses a provider-owned one-entry cache keyed by exact
+waveform bytes, shape, dtype and sample rate. Only the owner thread accesses it;
+returned codec values are copied so prompt construction cannot mutate the entry.
+It does not cache generated speech or mutable decoder state. Closing the provider
+drains its worker before releasing the entry. `STUDIO_TTS_REFERENCE_CACHE=0`
+selects the uncached reference-encoding path for paired checks.
 CUDA depth decoding uses the existing compiled CUDA-graph path by default, with
 profile warmup completed before serving. The master `fast_all` override remains
 unset so it cannot disable that stage. Completed requests report delivery RTF;
@@ -1558,6 +1615,12 @@ lock prioritizes streaming ASR over interactive queries and captured background
 work; aged waiters receive a turn to avoid starvation. Timed-out waiters leave
 no admission ticket behind. Native calls already running are not preempted.
 MLX and Torch retain separate execution lanes.
+
+Shared sentence encoders use the same priority-aware reentrant lock for model
+ownership, before acquiring device admission. Interactive queries can precede
+queued background encodes at both boundaries; active model calls remain serial
+and cannot be preempted. Cancellation can leave either wait without executing
+obsolete inference or retaining an admission ticket.
 
 A process-wide background capacity budget sits before speech admission
 and native model locks. Studio enables it during environment preparation,

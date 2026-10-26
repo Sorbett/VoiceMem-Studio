@@ -1,4 +1,4 @@
-"""Nonblocking admission for replaceable CPU inference snapshots."""
+"""Engine-owned input workers and nonblocking replaceable CPU probes."""
 from concurrent.futures import ThreadPoolExecutor
 from contextvars import copy_context
 from dataclasses import dataclass
@@ -6,6 +6,7 @@ import time
 
 
 eot_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="voicemem-eot")
+input_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="voicemem-input")
 
 
 @dataclass(frozen=True)

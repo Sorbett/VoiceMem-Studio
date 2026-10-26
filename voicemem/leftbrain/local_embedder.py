@@ -149,8 +149,9 @@ def resolve_path(model: LocalEmbedModel) -> str:
 class _LockedEncoder:
     """Preserve the encoder interface while admitting and timing locked inference."""
     def __init__(self, m):
+        from voicemem.engine.backends.torch import InferenceLock
         self._m = m
-        self._lock = threading.RLock()
+        self._lock = InferenceLock()
         self._reuse_owner = object()
 
     def _reuse_key(self, args, kwargs):

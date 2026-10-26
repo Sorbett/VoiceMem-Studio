@@ -13,6 +13,25 @@ from studio.core.utils.tts.segmentation import (
 
 
 class SpeechBufferTests(unittest.TestCase):
+    def test_first_deadline_does_not_emit_an_unfinished_english_word(self):
+        buffer = SpeechBuffer()
+        buffer.append('electro', 0.0)
+        self.assertEqual(buffer.ready(FIRST_WAIT_S), [])
+        self.assertIsNone(buffer.remaining_wait(FIRST_WAIT_S))
+        buffer.append('magnetic waves', FIRST_WAIT_S + .01)
+        segments = buffer.ready(FIRST_WAIT_S + .01)
+        self.assertEqual([segment.text for segment in segments], ['electromagnetic'])
+        segments += buffer.ready(FIRST_WAIT_S + .02, final=True)
+        self.assertEqual(' '.join(segment.text for segment in segments), 'electromagnetic waves')
+
+    def test_first_deadline_waits_for_a_number_to_finish(self):
+        buffer = SpeechBuffer()
+        buffer.append('3.', 0.0)
+        self.assertEqual(buffer.ready(FIRST_WAIT_S), [])
+        self.assertIsNone(buffer.remaining_wait(FIRST_WAIT_S))
+        buffer.append('14。', FIRST_WAIT_S + .01)
+        self.assertEqual([s.text for s in buffer.ready(FIRST_WAIT_S + .01)], ['3.14。'])
+
     def test_short_comma_phrases_form_one_complete_first_sentence(self):
         buffer = SpeechBuffer()
         parts = ['你好呀，', '我会用自然的语气回答你的问题，', '接下来我们检查语音是否能够连续播放。']

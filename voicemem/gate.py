@@ -11,6 +11,7 @@ from __future__ import annotations
 import os
 import re
 from functools import lru_cache
+from voicemem.engine.scheduling.cancellation import InferenceCancelled
 
 BACKCHANNEL = "backchannel"
 SHALLOW = "shallow"
@@ -180,6 +181,8 @@ def route(text: str, *, semantic: bool = True, language: str = "") -> str:
             language = "en"
     try:
         return DEEP if semantic_margin(t, language) > MARGIN else SHALLOW
+    except InferenceCancelled:
+        raise
     except Exception as e:
         # If semantic routing is unavailable, preserve eligibility for memory retrieval.
         print(f"[gate] 句向量兜底不可用（{type(e).__name__}: {e}）→ 按 deep 走", flush=True)

@@ -65,6 +65,9 @@ class Routing:
     async def route_pending_thinking(self, pending: Pending, memory_vm=None,
                                      history=None) -> Pending:
         """Combine VoiceMem memory eligibility with local reasoning depth off-loop."""
+        started = time.monotonic()
+        if getattr(pending, 'timing', None) is not None:
+            pending.timing = {**pending.timing, 'route_started_at': started}
         from studio.core.utils.self_harness.component import reasoning_preference
         if pending.stranger:
             history = []
@@ -87,8 +90,11 @@ class Routing:
                     pending.replay = ""
                     print(f"[route] memory retrieval failed: {type(exc).__name__}: {exc}",
                           flush=True)
+            if getattr(pending, 'timing', None) is not None:
+                routed_at = time.monotonic()
+                pending.timing.update(route_finished_at=routed_at,
+                                      route_ms=(routed_at-started)*1000)
             return pending
-        started = time.monotonic()
         memory_vm = memory_vm or self.vm
         memory_required = gate.needs_memory(pending.route) or bool(query)
         memory_ms = 0.0
@@ -149,6 +155,10 @@ class Routing:
                 if not memory_task.done():
                     memory_task.cancel()
                 await asyncio.gather(memory_task, return_exceptions=True)
+        routed_at = time.monotonic()
+        if getattr(pending, 'timing', None) is not None:
+            pending.timing.update(route_finished_at=routed_at,
+                                  route_ms=(routed_at-started)*1000)
         print(f"[route] {decision.display_name} → {decision.reply_mode}"
               f" / reasoning={decision.reasoning_effort} "
               f"(model={(classified - started) * 1000:.0f}ms"

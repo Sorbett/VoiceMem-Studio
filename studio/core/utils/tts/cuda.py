@@ -63,6 +63,7 @@ class BreezeCUDATTS:
         self._engine = CudaWorker(device, sample_rate=self.sample_rate)
         self.device = self._engine.device
         self._runtime = None
+        self._reference_cache = None
         self._closed = False
 
     def _load(self):
@@ -97,6 +98,8 @@ class BreezeCUDATTS:
         import torch
         torch.cuda.synchronize(self.device)
         self._model, self._codec, self._runtime = model, codec, runtime
+        from .reference_cache import ReferenceAudioCache
+        self._reference_cache = ReferenceAudioCache(codec)
         print(f'[tts] Breeze CUDA ready: {self.device}, {self.depth_mode} depth, local streaming', flush=True)
 
     def _segments(self, text, instruction, cancelled):
@@ -112,10 +115,16 @@ class BreezeCUDATTS:
             request.update(ref_audio_path=self.ref_audio, ref_text=self.ref_text)
         with torch.inference_mode(), torch.cuda.device(self.device):
             set_all_seeds(self.seed)
-            inputs = prepare_inputs(self._tokenizer, self._codec, self._model, [request],
+            cache = self._reference_cache if os.environ.get('STUDIO_TTS_REFERENCE_CACHE', '1') != '0' else None
+            hits = cache.hits if cache is not None else 0
+            prepared_at = time.monotonic()
+            inputs = prepare_inputs(self._tokenizer, cache if cache is not None else self._codec, self._model, [request],
                                     get_template(select_template_name(request)),
                                     guidance_scale=self.cfg_scale,
                                     guidance_scale_ref=None, guidance_scale_ins=None)
+            cache_state = ('hit' if cache.hits > hits else 'miss') if cache is not None and self.ref_audio else 'off'
+            print(f'[tts-input] prepare_ms={(time.monotonic()-prepared_at)*1000:.0f}'
+                  f' reference_cache={cache_state}', flush=True)
             if cancelled.is_set():
                 return
             set_all_seeds(self.seed)
@@ -186,4 +195,8 @@ class BreezeCUDATTS:
 
     async def aclose(self):
         self._closed = True
-        await self._engine.aclose()
+        try:
+            await self._engine.aclose()
+        finally:
+            if self._reference_cache is not None:
+                self._reference_cache.clear()

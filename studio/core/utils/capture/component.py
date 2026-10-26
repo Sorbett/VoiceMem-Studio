@@ -25,11 +25,15 @@ class Capture:
                          on_speech_start=None, textless_confirm_s=None,
                          turn_taking=None, language_state=None):
         """Own one stream and release its workers when capture ends or is closed."""
+        import os
+        gate_budget = float(os.environ.get('STUDIO_GATE_TIMEOUT_S', '0.15'))
         pause_gate = PauseGate(min_silence_s=self.CONFIRM_S)
         stream = open_stream(
             self.vm, spec_min_chars=self.SPEC_MIN_CHARS, gamble_s=self.GAMBLE_S,
             confirm_s=self.CONFIRM_S, eot=self._eot(),
             textless_confirm_s=textless_confirm_s,
+            final_asr_grace_s=float(os.environ.get('STUDIO_ASR_FINAL_GRACE_S', '0.03')),
+            gate_timeout_s=gate_budget if gate_budget != 0 else None,
             turn_end_guard=pause_gate.allow_end)
         background_tasks = set()
         input_hot = None
@@ -550,7 +554,7 @@ class Capture:
                     print(f"[speaker] owner={owner['id'] or '-'} last={owner['last'] or '-'}"
                           f" miss={owner.get('miss', 0)} stranger={stranger}", flush=True)
                 turn_taking.commit_user_turn()
-                yield Pending(st.turn.text,
+                pending = Pending(st.turn.text,
                               "" if stranger else st.turn.memory_context,
                               st.turn.result, spoken=True,
                               audio_path=await asyncio.to_thread(
@@ -567,7 +571,13 @@ class Capture:
                                                  voiced_end / self.MIC_RATE)
                                                 if voiced_start is not None else None),
                               input_audio_epoch=audio_epoch,
-                              input_turn_id=input_turn_id)
+                              input_turn_id=input_turn_id,
+                              timing=dict(getattr(st.turn, 'timing', None) or {}))
+                if pending.timing and 'confirmed_at' in pending.timing:
+                    captured_at = time.monotonic()
+                    pending.timing['capture_ms'] = (captured_at-pending.timing['confirmed_at'])*1000
+                    pending.timing['captured_at'] = captured_at
+                yield pending
 
     async def _session_anticipate(self, session_id: str, sock, on_close=None, **kwargs):
         languages = kwargs.setdefault("language_state", {})

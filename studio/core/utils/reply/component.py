@@ -251,7 +251,14 @@ class Reply:
 
         async def _mark_first_audio():
             if not _lat["audio"]:
-                _lat["audio"] = (time.monotonic() - _t0) * 1000
+                first_audio_at = time.monotonic()
+                _lat["audio"] = (first_audio_at - _t0) * 1000
+                timeline.latency = {
+                    'started_at': _t0, 'first_audio_at': first_audio_at,
+                    'llm_ms': _lat['llm'],
+                    'segment_ms': _lat['seg']-_lat['llm'],
+                    'tts_ms': _lat['audio']-_lat['seg'],
+                }
 
                 _vad = ((time.monotonic() - pending.speech_end) * 1000
                         if pending.speech_end else 0.0)

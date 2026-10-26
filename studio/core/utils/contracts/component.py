@@ -35,6 +35,8 @@ class Pending:
     # Voiced bounds in seconds on the connection's received-PCM clock.
     input_audio_span: tuple[float, float] | None = None
     input_audio_epoch: int = 0  # Microphone restarts break continuation ownership.
+    # Runtime-only stage durations in ms and monotonic timestamps ending in _at.
+    timing: dict[str, float] | None = None
 
 
 def input_transcript_event(pending) -> dict:

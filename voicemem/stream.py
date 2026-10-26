@@ -20,17 +20,21 @@ from voicemem import gate as _gate_mod
 from dataclasses import dataclass
 from voicemem.memory_api import build_memory_context
 from voicemem.utils.audio.stream_io import resample
+from voicemem.engine.scheduling.cancellation import (
+    InferenceCancelled, check_cancelled, run_cancellable,
+)
 
 
 @dataclass
 class Turn:
-    """Confirmed input text, its memory result, the original streaming text and final route."""
+    """Confirmed text, memory and route, with optional runtime stage timing."""
     text: str
     result: object
     # Streaming text before final-ASR refinement.
     raw_text: str = ""
     # Final memory route. Non-deep routes carry a gated empty result.
     route: str = _gate_mod.DEEP
+    timing: dict[str, float] | None = None
 
     @property
     def memory_context(self) -> str:
@@ -221,7 +225,9 @@ from voicemem.engine import TORCH_LOCK as _EMBED_LOCK  # Process-wide Torch seri
 from voicemem.utils.audio.final_asr_executor import FinalASRExecutor
 _FINAL_ASR_EXECUTOR = FinalASRExecutor()
 # Keep the historical executor alias for consumers of this module.
-from voicemem.engine.scheduling.probes import LatestProbe, eot_executor as _EOT_EXECUTOR
+from voicemem.engine.scheduling.probes import (
+    LatestProbe, eot_executor as _EOT_EXECUTOR, input_executor as _INPUT_EXECUTOR,
+)
 
 
 class _AsrWorker:
@@ -395,6 +401,14 @@ class _EotContext:
     silence: float
 
 
+@dataclass(frozen=True)
+class _RefinedSnapshot:
+    epoch: int
+    pcm: np.ndarray
+    text: str
+    provider: object
+
+
 class VoiceStream:
     """Input session for typed text, external-ASR partials or PCM16 audio.
 
@@ -406,7 +420,7 @@ class VoiceStream:
     def __init__(self, vm, *, on_partial=None, spec_min_chars=6,
                  gamble_s=0.2, confirm_s=0.3, src_rate=24000, vad_threshold=None,
                  emotion=None, gate=_gate_mod.route, eot=None, textless_confirm_s=None,
-                 turn_end_guard=None,
+                 turn_end_guard=None, final_asr_grace_s=None, gate_timeout_s=None,
                  eot_min_s=float(os.environ.get("VOICEMEM_EOT_MIN_SILENCE", "0")),
                  eot_ends_turn=os.environ.get("VOICEMEM_EOT_ENDS_TURN", "1") != "0"):
         self.vm = vm
@@ -426,6 +440,12 @@ class VoiceStream:
         self.spec_min_chars = spec_min_chars
         self.gamble_s = gamble_s
         self.confirm_s = confirm_s
+        if final_asr_grace_s is not None and not 0 <= final_asr_grace_s <= 1.0:
+            raise ValueError('final_asr_grace_s must be between 0 and 1 second')
+        self.final_asr_grace_s = final_asr_grace_s
+        if gate_timeout_s is not None and not 0 < gate_timeout_s <= 10.0:
+            raise ValueError('gate_timeout_s must be positive and at most 10 seconds')
+        self.gate_timeout_s = gate_timeout_s
         # Dialogue can probe short voiced input before streaming ASR emits a word.
         # Opt-in: library/music-only callers retain the original sound-only path.
         self.textless_confirm_s = textless_confirm_s
@@ -442,6 +462,7 @@ class VoiceStream:
         self._closed = False
         self._snapshot_tasks = set()
         self._snapshot_jobs = set()
+        self._refined_snapshot = None
         # Mutable state belongs to this input session and is reset at turn boundaries.
         self._text = ""
         # Text covering audio before the current streaming-decoder epoch.
@@ -453,6 +474,7 @@ class VoiceStream:
         self._spec_text = ""
         self._spec_started = 0.0  # Speculation throttle timestamp.
         self._gate_pre = None  # Gate task started at silence onset.
+        self._gate_pre_timing = {}
         self._gate_pre_text = ""
         self._eot_wait = 0.0  # Elapsed time since the last EOT probe.
         self._eot_score = 0.0  # Latest EOT score.
@@ -525,6 +547,7 @@ class VoiceStream:
         self._asr = self._vad = self._asr_w = None
         self._pcm, self._preroll = [], []
         self._asr_prefix = ""
+        self._refined_snapshot = None
 
     @property
     def asr_worker(self) -> "_AsrWorker":
@@ -555,13 +578,31 @@ class VoiceStream:
             return _gate_mod.DEEP
         try:
             return self.gate(text)
+        except InferenceCancelled:
+            raise
         except Exception as e:
             # On gate failure, retain memory eligibility rather than suppressing retrieval.
             print(f"[gate] 判定失败（{type(e).__name__}: {e}）→ 按 deep 走", flush=True)
             return _gate_mod.DEEP
 
     # Speculative retrieval runs outside the event loop.
-    async def _speculate(self, text) -> Turn:
+    async def _input_work(self, operation, *, timing=None, label='input'):
+        """Retain queue and worker wall time while cancelling obsolete admission."""
+        submitted = time.monotonic()
+
+        def work():
+            started = time.monotonic()
+            if timing is not None:
+                timing[f'{label}_queue_ms'] = (started-submitted)*1000
+            try:
+                return operation()
+            finally:
+                if timing is not None:
+                    timing[f'{label}_worker_ms'] = (time.monotonic()-started)*1000
+
+        return await run_cancellable(work, executor=_INPUT_EXECUTOR)
+
+    async def _speculate(self, text, *, confirmed_route=None) -> Turn:
         t0 = time.perf_counter()
 
         def work():
@@ -569,18 +610,20 @@ class VoiceStream:
             started = time.perf_counter()
             # Hold TORCH_LOCK only for model inference, not while waiting for Search().
             # Search waits on other workers whose encoders need the same cross-thread lock.
-            route = self._gate_locked(text)
+            route = confirmed_route or self._gate_locked(text)
+            check_cancelled()
             if route != _gate_mod.DEEP:
                 return route, None, started, started, time.perf_counter()
             with query_embedding_scope():
                 c = self.vm.classify(text)
+                check_cancelled()
                 classified = time.perf_counter()
                 result = self.vm.search(text, slots=c.slots, entities=c.entities,
                                         emotion=self.emotion or None)
             searched = time.perf_counter()
             return route, result, started, classified, searched
 
-        route, result, started, classified, searched = await asyncio.to_thread(work)
+        route, result, started, classified, searched = await self._input_work(work)
         self._route = route
         if result is None:
             return Turn(text, empty_result(), raw_text=text, route=route)
@@ -680,16 +723,23 @@ class VoiceStream:
         text = await self._final_text_async(pcm)
         self._apply_refined(text)
 
-    async def _final_text_async(self, pcm, *, speculative=False):
+    async def _final_text_async(self, pcm, *, speculative=False, timing=None):
         """Only return text: competing tasks never mutate turn state."""
         if pcm is None or not len(pcm):
             return
         submitted = time.monotonic()
 
         def work():
+            running = time.monotonic()
+            if timing is not None:
+                timing['final_queue_ms'] = (running-submitted)*1000
             if ASR_DEBUG:
                 print(f"[asr-final] 排队 {(time.monotonic()-submitted)*1000:.0f}ms", flush=True)
-            return self._transcribe_final(pcm)
+            try:
+                return self._transcribe_final(pcm)
+            finally:
+                if timing is not None:
+                    timing['final_compute_ms'] = (time.monotonic()-running)*1000
 
         job = _FINAL_ASR_EXECUTOR.submit(work, speculative=speculative)
         if speculative:
@@ -716,9 +766,15 @@ class VoiceStream:
         """
         fallback = self._text.strip()
         pcm = np.concatenate(self._pcm).copy() if self._pcm else None
+        epoch = self._eot_epoch
+        cached_pcm = pcm.copy() if pcm is not None else None
 
         async def resolve() -> str:
             refined = await self._final_text_async(pcm, speculative=True)
+            if (refined and refined.strip() and cached_pcm is not None
+                    and epoch == self._eot_epoch and not self._closed):
+                self._refined_snapshot = _RefinedSnapshot(
+                    epoch, cached_pcm, refined.strip(), self._final_asr)
             return (refined or fallback).strip()
 
         task = asyncio.create_task(resolve())
@@ -726,7 +782,7 @@ class VoiceStream:
         task.add_done_callback(self._snapshot_tasks.discard)
         return task
 
-    async def _finish_asr(self, pcm):
+    async def _finish_asr(self, pcm, *, timing=None):
         """Race both decoders after a final-ASR grace period, with one deadline."""
         started = time.monotonic()
         deadline = started + ASR_FINISH_TIMEOUT_S
@@ -734,14 +790,28 @@ class VoiceStream:
         # Running native calls finish normally and cannot mutate turn state.
         for job in tuple(self._snapshot_jobs):
             job.cancel()
-        final = asyncio.create_task(self._final_text_async(pcm))
+        detail = timing if timing is not None else {}
+        snapshot = self._refined_snapshot
+        if (snapshot is not None and snapshot.epoch == self._eot_epoch
+                and snapshot.provider is self._final_asr and pcm is not None
+                and snapshot.pcm.dtype == pcm.dtype
+                and np.array_equal(snapshot.pcm, pcm)):
+            self._text = self._raw_text = snapshot.text
+            self._restart_asr()
+            detail['snapshot_reused'] = 1.0
+            if ASR_DEBUG:
+                print('[asr-final] 复用完全一致的音频复核结果', flush=True)
+            return
+        detail['snapshot_reused'] = 0.0
+        final = asyncio.create_task(self._final_text_async(pcm, timing=detail))
         flush = asyncio.ensure_future(self.asr_worker.flush())
         pending = {final, flush}
         text = stream_text = None
         timed_out = False
         try:
             # Unlike wait_for, wait does not cancel a useful late final result.
-            await asyncio.wait({final}, timeout=min(ASR_FINAL_GRACE_S, ASR_FINISH_TIMEOUT_S))
+            grace = ASR_FINAL_GRACE_S if self.final_asr_grace_s is None else self.final_asr_grace_s
+            await asyncio.wait({final}, timeout=min(grace, ASR_FINISH_TIMEOUT_S))
             while True:
                 for task in tuple(pending):
                     if not task.done():
@@ -798,17 +868,49 @@ class VoiceStream:
                     task.cancel()
             await asyncio.gather(final, flush, return_exceptions=True)
 
-    async def _confirm(self) -> Turn:
+    async def _confirm(self, *, timing=None) -> Turn:
         """Apply the gate to final text and return a confirmed turn with its memory result."""
+        started = time.monotonic()
         route, pre = None, self._gate_pre
+        pre_timing = self._gate_pre_timing
         self._gate_pre = None
+        self._gate_pre_timing = {}
+
+        async def wait_for_gate(task):
+            if self.gate_timeout_s is None:
+                return await task
+            remaining = max(0.0, self.gate_timeout_s-(time.monotonic()-started))
+            return await asyncio.wait_for(task, timeout=remaining)
+
         if pre is not None and len(self._text) - len(self._gate_pre_text) < SPEC_MIN_GROWTH:
             try:
-                route = await pre  # Reuse completed speculation when available.
+                route = await wait_for_gate(pre)
+            except asyncio.TimeoutError:
+                route = _gate_mod.DEEP
+                if timing is not None:
+                    timing['gate_timeout'] = 1.0
+                print('[gate] 确认等待达到预算，保留记忆检索资格', flush=True)
             except Exception:
                 route = None
+            finally:
+                if timing is not None:
+                    timing.update(pre_timing)
+        elif pre is not None:
+            pre.cancel()
         if route is None:
-            route = await asyncio.to_thread(self._gate_locked, self._text)
+            task = asyncio.create_task(self._input_work(
+                lambda text=self._text: self._gate_locked(text), timing=timing, label='gate'))
+            try:
+                route = await wait_for_gate(task)
+            except asyncio.TimeoutError:
+                route = _gate_mod.DEEP
+                if timing is not None:
+                    timing['gate_timeout'] = 1.0
+                print('[gate] 确认等待达到预算，保留记忆检索资格', flush=True)
+        gated = time.monotonic()
+        if timing is not None:
+            timing['gate_ms'] = (gated-started)*1000
+            timing['retrieval_ms'] = 0.0
         self._route = route
         if self._route != _gate_mod.DEEP:
             if self._spec:
@@ -817,13 +919,26 @@ class VoiceStream:
             print(f"[gate] {self._route}：{self._text[:16]!r} → 不检索", flush=True)
             return Turn(self._text, empty_result(), raw_text=self._raw_text or self._text,
                         route=self._route)
-        try:
-            # A final deep route needs retrieval even if earlier partial text was shallow.
-            turn = await (self._spec or self._speculate(self._text))
-        except asyncio.CancelledError:
-            turn = await self._speculate(self._text)
+        # Waiting on completion keeps child cancellation separate from cancellation
+        # of confirmation itself, which must never start another retrieval.
+        speculative = self._spec
+        if speculative is not None:
+            try:
+                await asyncio.wait({speculative})
+            except asyncio.CancelledError:
+                speculative.cancel()
+                await asyncio.gather(speculative, return_exceptions=True)
+                raise
+        if speculative is None or speculative.cancelled():
+            turn = await self._speculate(self._text, confirmed_route=self._route)
+        else:
+            turn = speculative.result()
+        if turn.route != self._route:
+            turn = await self._speculate(self._text, confirmed_route=self._route)
+        if timing is not None:
+            timing['retrieval_ms'] = (time.monotonic()-gated)*1000
         # Final ASR supplies reply text; completed speculative memory can be reused without another search.
-        if turn.text != self._text:
+        if turn.text != self._text or turn.route != self._route:
             turn = Turn(self._text, turn.result, raw_text=self._raw_text or self._text,
                         route=self._route)
         return turn
@@ -832,6 +947,10 @@ class VoiceStream:
         self._eot_epoch += 1
         self._eot_probe.invalidate()
         self._eot_result = None
+        self._refined_snapshot = None
+        if self._gate_pre is not None:
+            self._gate_pre.cancel()
+        self._gate_pre_timing = {}
         if getattr(self, "_asr_w", None) is not None:
             self._asr_w.reset()
         elif self._asr is not None:
@@ -973,13 +1092,20 @@ class VoiceStream:
                 self._spec.cancel(); self._spec, self._spec_text = None, ""
             if speaking:
                 self._spoke = True
+                if self._gate_pre is not None:
+                    self._gate_pre.cancel()
                 self._gate_pre = None  # New speech invalidates the silence-time gate probe.
+                self._gate_pre_timing = {}
             self._silence = 0.0
         else:
             if self._silence == 0.0 and self._spoke and self._text.strip():
                 # Start gate inference when silence begins, concurrently with turn confirmation.
                 self._gate_pre_text = self._text
-                self._gate_pre = asyncio.ensure_future(asyncio.to_thread(self._gate_locked, self._text))
+                gate_text = self._text
+                self._gate_pre_timing = {}
+                self._gate_pre = asyncio.create_task(self._input_work(
+                    lambda: self._gate_locked(gate_text), timing=self._gate_pre_timing,
+                    label='gate'))
             self._silence += len(frame) / 16000.0
         if self._text.strip() and self.on_partial:
             self.on_partial(self._text)
@@ -1000,6 +1126,7 @@ class VoiceStream:
         # as music and wait for 5s of audio + 3s silence. Use VAD silence (not
         # residual speaker energy) for one offline probe per voiced burst.
         fast_final = False
+        timing = {}
         if (self.textless_confirm_s is not None and self._spoke
                 and not self._text.strip() and not self._textless_probed
                 and self._voiced_s >= 0.12
@@ -1007,7 +1134,7 @@ class VoiceStream:
             self._textless_probed = True
             _asr_started = time.monotonic()
             pcm = np.concatenate(self._pcm) if self._pcm else None
-            refined = await self._final_text_async(pcm)
+            refined = await self._final_text_async(pcm, timing=timing)
             if refined and refined.strip():
                 self._text = self._raw_text = refined.strip()
                 self._restart_asr()
@@ -1033,7 +1160,7 @@ class VoiceStream:
             pcm = np.concatenate(self._pcm) if self._pcm else None
             # Final ASR refines the confirmed snapshot; its text is used for the reply and later memory ingestion.
             if not fast_final and not self._held_final_text:
-                await self._finish_asr(pcm)
+                await self._finish_asr(pcm, timing=timing)
                 # Final ASR may reveal a dangling clause absent from the partial.
                 # Retain that decode while the app leaves room for continuation.
                 if self.turn_end_guard is not None and not self.turn_end_guard(
@@ -1045,7 +1172,15 @@ class VoiceStream:
                                        spoke=self._spoke, eot_score=0.0,
                                        speech_end=self._speech_end)
             _refined = time.monotonic()
-            turn = await self._confirm()  # Yield the confirmed turn and reset its input state.
+            turn = await self._confirm(timing=timing)
+            confirmed_at = time.monotonic()
+            timing.update(
+                endpoint_ms=(_asr_started-self._speech_end)*1000,
+                asr_tail_ms=(_refined-_asr_started)*1000,
+                confirm_ms=(confirmed_at-_refined)*1000,
+                confirmed_at=confirmed_at,
+            )
+            turn.timing = timing
             if ASR_DEBUG:
                 print(f"[asr-final] 判停/VAD后等待 {(_asr_started-self._speech_end)*1000:.0f}ms"
                       f" · ASR并行收尾 {(_refined-_asr_started)*1000:.0f}ms"
