@@ -56,6 +56,19 @@ class InputIdentityTests(unittest.IsolatedAsyncioTestCase):
             self.assertAlmostEqual(actual, expected)
         self.assertFalse(can_continue_input(turns[0], turns[1]))
 
+    async def test_audio_features_are_captured_before_peak_reset_and_do_not_leak_to_text(self):
+        voice = capture_fixtures.state('合成的问题')
+        voice.eot_score = .8
+        _, turns, _ = await capture_fixtures.CaptureFixture().run_frames([
+            (False, '', voice), (False, '', capture_fixtures.state('合成的问题', final=True)),
+            (False, '', capture_fixtures.state('下一个问题')),
+            (False, '', capture_fixtures.state('下一个问题', final=True)),
+        ])
+        self.assertEqual(turns[0].audio_state['eot_probability'], .8)
+        self.assertEqual(turns[1].audio_state['eot_probability'], 0)
+        self.assertAlmostEqual(turns[0].audio_state['span_s'], .04)
+        self.assertIsNone(pending(spoken=False).audio_state)
+
     async def test_short_audio_gap_is_independent_of_asr_and_model_wall_time(self):
         snapshots = [capture_fixtures.state('首句'), capture_fixtures.state('首句', final=True),
                      capture_fixtures.state('补充'), capture_fixtures.state('补充', final=True)]

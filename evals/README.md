@@ -12,12 +12,24 @@
 | 回合结束与打断 | `eot_turn_end.py`、`echo_barge.py` |
 | 向量编码与检索 | `embed_latency.py`、`query_embedding_latency.py`、`embed_ab.py`、`embed_locomo.py` |
 | 检索排序和相关性 | `topk_relevance.py`、`recency_ab.py`、`recency_rerank.py` |
-| 路由质量 | `router_quality.py`、`turn_gate.py` |
+| 路由质量 | `router_quality.py`、`voice_router_compare.py`、`turn_gate.py` |
 | 标签维护对比 | `retag_llm.py` |
 
 每个脚本文件顶部说明其参数和所需数据。它们可能需要模型、API、音频样本或专用 Memory Space，并非全部可以在干净环境中直接运行。不要使用个人正在使用的记忆库做实验；运行会写入数据的模式前，先阅读对应参数说明。
 
 这里的评测用于观察效果与性能。自动测试通过不能替代真实设备上的语音和延迟测试。
+
+`python -m evals.voice_router_compare --order ABBA --out results/voice-router-comparison.json`
+在原生 Apple Silicon 上对比 MLX Qwen 和本地训练路由的 CPU ONNX 版本。
+两组使用同一批合成中英输入与有限历史，每条清空结果缓存，冷启动另计。
+报告普通问题误触发深思、复杂问题漏判，以及耗时中位数和 p95。
+训练样本与现有合成检查的独立性未确认；该测试不含真实音频、ASR、API、
+浏览器播放、持续发热或实际端到端延迟。模型准备与设置见
+[路由适配器说明](../studio/core/utils/reply_modes/README.md)。
+
+`python -m evals.work_filler_cache --out results/work-filler-cache.json`
+使用当前推荐的本地 TTS 预合成中英文等待语，检查完整音频、磁盘复用和内存命中。
+该脚本会写入忽略的等待语音缓存，但不会播放、录音或调用 API。
 
 `python evals/engine_contention.py --studio-voice --order ABBAABBA --utterances 4 --background-jobs 4`
 在同一进程交替关闭（A）和开启（B）动态后台准入，保持模型和合成参数一致。

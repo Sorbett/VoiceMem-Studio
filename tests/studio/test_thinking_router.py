@@ -289,6 +289,17 @@ class MemoryRoutingIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(pending.replay, 'existing-replay')
         self.agent.vm.search.assert_not_called()
 
+    async def test_observed_audio_is_copied_only_for_capable_router(self):
+        pending = self.pending(prepared=True)
+        pending.audio_state = {'eot_probability': .8, 'silence_s': .2, 'span_s': 2.0}
+        await self.agent.route_pending_thinking(pending)
+        self.assertNotIn('audio_state', self.router.classify_async.call_args.kwargs)
+        self.router.accepts_audio_state = True
+        await self.agent.route_pending_thinking(pending)
+        actual = self.router.classify_async.call_args.kwargs['audio_state']
+        self.assertEqual(actual, pending.audio_state)
+        self.assertIsNot(actual, pending.audio_state)
+
     async def test_ordinary_followups_keep_gate_approved_memory(self):
         for text in ('我后天约了谁？', '所以最后的结果是多少？', '帮我想想午饭吃什么。'):
             with self.subTest(text=text):

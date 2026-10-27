@@ -6,7 +6,7 @@ import unittest
 from unittest.mock import AsyncMock, Mock, patch
 
 from tests.helpers.conversation import ConversationFixture
-from studio.core.utils.conversation.input_turn import can_continue_input, refresh_continuation
+from studio.core.utils.conversation.input_turn import can_continue_input, join_input, refresh_continuation
 from studio.core.utils.routing.component import Routing
 from studio.core.utils.contracts.component import Pending
 from studio.core.utils.realtime_session.component import RealtimeSession
@@ -16,6 +16,15 @@ from voicemem.stream import empty_result
 
 
 class InputContinuationTests(ConversationFixture, unittest.IsolatedAsyncioTestCase):
+    def test_joined_audio_features_use_complete_span_without_mutating_prior_inputs(self):
+        base = self.pending('Synthetic first', input_audio_span=(0, 1), audio_state={'span_s': 1})
+        tail = self.pending('Synthetic tail', input_audio_span=(1.2, 2.2),
+                            audio_state={'span_s': 1, 'silence_s': .2})
+        combined = join_input(base, tail)
+        self.assertEqual(combined.audio_state, {'span_s': 2.2, 'silence_s': .2})
+        self.assertEqual(tail.audio_state, {'span_s': 1, 'silence_s': .2})
+        self.assertEqual(base.audio_state, {'span_s': 1})
+
     def setUp(self):
         super().setUp()
         self.block_model = True

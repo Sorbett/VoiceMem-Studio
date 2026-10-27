@@ -30,9 +30,13 @@ def join_input(base, pending):
     joiner = ("" if base.text and pending.text and all(
         "\u3400" <= ch <= "\u9fff" for ch in (base.text[-1], pending.text[0])) else " ")
     text = f"{base.text}{joiner}{pending.text}".strip()
+    span = (base.input_audio_span[0], pending.input_audio_span[1])
+    observed = getattr(pending, 'audio_state', None)
+    if observed is not None:
+        observed = {**observed, 'span_s': span[1] - span[0]}
     return replace(pending, text=text, continuation_prompt=False, early_ok=False,
                    replace_input_turn_id=base.input_turn_id, transcript_managed=False,
-                   input_audio_span=(base.input_audio_span[0], pending.input_audio_span[1]),
+                   input_audio_span=span, audio_state=observed,
                    language=detect_language(text, base.language or "zh"))
 
 
