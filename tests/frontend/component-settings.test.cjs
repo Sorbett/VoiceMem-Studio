@@ -14,6 +14,7 @@ function current() {
 test('existing saved configurations retain the recommended audio and routing factories', () => {
   const config = current();
   for (const role of Object.keys(r.COMPONENT_CATALOG)) assert.deepEqual(config[role],{provider:'recommended'});
+  assert.equal(r.COMPONENT_CATALOG.router.providers.recommended.label, 'VoiceMem-Jev · 推荐');
   assert.deepEqual(r.modelService('reply',{provider:'local',model:'/fixture/local-model'}),{
     provider:'local',model:'/fixture/local-model',baseUrl:'',apiKey:'',
   });

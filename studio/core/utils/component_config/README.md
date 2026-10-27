@@ -16,12 +16,14 @@ Restart the desktop App after updating its preload code.
 | `asr_final` | SenseVoice | Installed adapter |
 | `vad` | Silero | Installed adapter |
 | `eot` | Smart Turn | Installed adapter |
-| `router` | Qwen3 0.6B | Installed adapter |
+| `router` | VoiceMem-Jev | Installed adapter |
 | `speech` | Breeze MLX/CUDA | OpenAI-compatible streaming speech |
 
-The trained depth encoder is an optional router adapter. See
-[reply router configuration](../reply_modes/README.md) for its local checkpoint,
-CPU ONNX selection and comparison command. The recommended router is unchanged.
+The recommended router automatically downloads a pinned VoiceMem-Jev checkpoint:
+CUDA uses PyTorch weights on the selected CUDA device; Mac and other CPU router
+devices use CPU ONNX. Only the selected format is required. See
+[reply router configuration](../reply_modes/README.md) for cache validation and
+explicit local adapter configuration. Custom adapters retain their own bindings.
 
 Memory and reply keep separate DeepSeek, Qwen/DashScope, and OpenAI-compatible
 Chat service settings. MLX-local replies also accept an explicit model path or

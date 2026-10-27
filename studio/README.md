@@ -66,7 +66,8 @@ Windows 用户先安装 Node.js 22.12 或更新版本、Docker Desktop（WSL2 �
 - **从哪里更换模型服务？** App 管理的本机后端可在“设置 → 组件”填写模型名称、服务地址和 Key，支持多项一起应用并重启，启动失败时回到原配置。当前链路保留为推荐默认；常用接入包括记忆/回复的 Chat API、Deepgram 流式识别和 OpenAI-compatible 语音合成。轮次控制等组件保留高级适配器入口，具体协议见[组件接入说明](core/utils/component_config/README.md)。连接已有或 Docker 服务时这里是只读的，需要在服务器端设置后重启。
 - **启动前想检查环境？** 已装好对应 Python 环境后，可在仓库根目录运行 `python -m studio --check`。它只做检查，不下载模型，也不打开记忆空间。
 - **默认配置文件在哪里？** 样例在 `studio/.env.example`，实际配置是仓库根目录的 `.env` 或进程环境变量。不要提交含真实 Key 的 `.env`。命令行参数优先于环境变量；已导出的变量优先于 `.env`。
-- **如何指定流式 ASR 设备？** 使用 `--asr-device auto/cpu/mps/cuda:N` 或 `.env` 中的 `STUDIO_ASR_DEVICE`。Mac 默认保持自动选择，实际设备会显示在启动日志中；它与 Torch 路由、Breeze 的设备分开配置。
+- **思考路由用什么模型？** 默认使用 [VoiceMem-Jev](https://huggingface.co/Sorbett/VoiceMem-Jev)，首次启动自动下载并校验。CUDA 使用 PyTorch 权重；Mac 使用 CPU ONNX，每台设备只需下载对应格式。缓存完整时可离线复用，不再下载或加载 Qwen3-0.6B。自定义适配器仍按设置使用。
+- **如何指定流式 ASR 设备？** 使用 `--asr-device auto/cpu/mps/cuda:N` 或 `.env` 中的 `STUDIO_ASR_DEVICE`。Mac 默认保持自动选择，实际设备会显示在启动日志中；它与思考路由、Breeze 的设备分开配置。
 - **浏览器能用吗？** 浏览器是补充访问方式。独立启动的后端默认可通过 `http://localhost:8787` 访问同一套对话界面；App 管理的后端使用其实际监听端口。浏览器在远程地址使用麦克风时需要 HTTPS，或通过 SSH 转发后访问本机地址。
 
 更多平台细节见[桌面 App 说明](apps/README.md)和[后端部署说明](deploy/README.md)。

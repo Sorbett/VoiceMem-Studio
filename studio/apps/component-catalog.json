@@ -36,7 +36,7 @@
     "title": "思考路由",
     "contract": "思考深度 · 垫话生成 · 可取消",
     "providers": {
-      "recommended": {"label": "Qwen3 0.6B · 推荐"},
+      "recommended": {"label": "VoiceMem-Jev · 推荐"},
       "adapter": {"label": "自定义适配器"}
     }
   },

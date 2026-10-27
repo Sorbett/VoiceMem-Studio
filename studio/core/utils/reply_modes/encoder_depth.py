@@ -1,4 +1,4 @@
-"""Opt-in local depth classification with separate current/context encoding."""
+"""Local depth classification with separate current/context encoding."""
 from __future__ import annotations
 
 from collections import OrderedDict

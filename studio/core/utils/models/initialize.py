@@ -47,8 +47,8 @@ def models(args, stage="all"):
         return shared
     if args.mode == 'llm_tts':
         if recommended('router'):
-            shared.append(Model('三级回复路由', 'reply-router/Qwen3-0.6B', 'Qwen/Qwen3-0.6B',
-                                HF + ('tokenizer.json',), ('*.json', '*.safetensors', '*.txt', '*.jinja')))
+            from studio.core.utils.reply_modes.checkpoint import model_spec
+            shared.append(model_spec(args.backend, args.device))
         if recommended('speech') and args.backend == 'cuda':
             from studio.core.utils.tts.cuda import model_directory
             from studio.paths import ROOT

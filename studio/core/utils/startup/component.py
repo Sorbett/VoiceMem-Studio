@@ -101,7 +101,7 @@ class Startup:
                     break
 
         if self.MODE == 'llm_tts':
-            step('三级回复路由', lambda: thinking_router().warmup())
+            step('思考路由', lambda: thinking_router().warmup())
         with warmup_audio() as (pcm, audio_path):
             for name, action in memory_warmups(self.vm, audio_path=audio_path):
                 step(name, action)

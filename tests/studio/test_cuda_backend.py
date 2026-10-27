@@ -125,7 +125,7 @@ class BackendConfigTests(unittest.TestCase):
         breeze = next(item for item in cuda if item.name == 'Breeze CUDA')
         self.assertIn('audio_tokenizer/*.safetensors', breeze.required)
         self.assertTrue(any('Breeze-TTS-2-mlx' in item.directory for item in mlx))
-        self.assertFalse(any(item.name.startswith(('Breeze', '三级回复', '本地回复')) for item in memory))
+        self.assertFalse(any(item.name.startswith(('Breeze', 'VoiceMem-Jev', '本地回复')) for item in memory))
 
     def test_visible_reply_keeps_its_key_and_endpoint_separate_from_memory(self):
         from studio.core.utils.llm.initialize import create

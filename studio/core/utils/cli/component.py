@@ -34,7 +34,7 @@ def parse_args(argv=None):
     parser.add_argument("--tts-device", default=os.environ.get("STUDIO_TTS_DEVICE") or "",
                         help="Breeze CUDA 设备，如 cuda:0；默认与 --device 相同")
     parser.add_argument("--device", default=os.environ.get("STUDIO_DEVICE") or "",
-                        help="Torch 路由设备；CUDA 下也是 ASR 的默认设备，如 cuda:0")
+                        help="CUDA 路由设备，也是 CUDA 下 ASR 的默认设备；Mac 路由使用 CPU ONNX")
     parser.add_argument("--asr-device", default=os.environ.get("STUDIO_ASR_DEVICE") or
                         os.environ.get("VOICEMEM_ASR_DEVICE") or "",
                         help="流式 ASR 设备；auto 自动选择，或 cpu/mps/cuda:N")

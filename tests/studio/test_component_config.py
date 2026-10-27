@@ -75,7 +75,7 @@ class ConfigurationTests(unittest.TestCase):
         with patch.dict(os.environ, {'STUDIO_COMPONENTS':json.dumps(values)}, clear=True):
             selected = {model.name for model in models(parse_args(['--backend','mlx','--llm','openai']))}
         self.assertTrue({'E5 记忆向量','SenseVoice 感知','AST 环境感知','声纹','emotion2vec'} <= selected)
-        self.assertFalse({'Breeze MLX','三级回复路由','Silero VAD','SenseVoice 最终转写','中英双语流式 ASR','Smart Turn EOT'} & selected)
+        self.assertFalse({'Breeze MLX','VoiceMem-Jev','Silero VAD','SenseVoice 最终转写','中英双语流式 ASR','Smart Turn EOT'} & selected)
 
     def test_credentials_follow_active_components_and_empty_role_does_not_reuse_another_key(self):
         from studio.core.utils.cli.component import parse_args

@@ -1,5 +1,6 @@
 """Inspect all startup requirements before importing models or opening memory."""
 from importlib import metadata
+from dataclasses import replace
 import os
 import platform
 import sys
@@ -52,7 +53,12 @@ def inspect(args, stage="all"):
     local_speech = selection('speech')['provider'] == 'recommended'
     local_router = selection('router')['provider'] == 'recommended'
     mlx = args.backend == 'mlx'
-    router = 'mlx-gpu' if mlx and os.environ.get('STUDIO_ROUTER_BACKEND', 'mlx') == 'mlx' else args.device
+    if local_router:
+        from studio.core.utils.reply_modes.checkpoint import runtime
+        selected_router = runtime(args.backend, args.device)
+        router = f'VoiceMem-Jev/{selected_router.backend}:{selected_router.device}'
+    else:
+        router = 'adapter'
     speech = 'mlx-gpu' if mlx else args.tts_device
     print(f'[startup] backend={args.backend} · ASR={args.asr_device}'
           f' · Router={router} · TTS={speech}', flush=True)
@@ -97,11 +103,11 @@ def inspect(args, stage="all"):
         except (ImportError, RuntimeError, OSError) as exc:
             errors.append(f'CUDA 检查失败：{type(exc).__name__}')
     elif args.mode == 'llm_tts' and stage != 'memory':
-        if local_router or args.llm == 'local':
+        if args.llm == 'local':
             packages.update({'mlx-lm': None, 'mlx': '0.32.2'})
         if local_speech:
             packages.update({'mlx': '0.32.2', 'mlx-audio': '0.5.1'})
-        if (local_speech or local_router or args.llm == 'local') and (platform.system() != 'Darwin' or platform.machine() != 'arm64'):
+        if (local_speech or args.llm == 'local') and (platform.system() != 'Darwin' or platform.machine() != 'arm64'):
             errors.append('Breeze MLX 需要原生 Apple Silicon macOS 环境')
     for name, expected in packages.items():
         try:
@@ -155,7 +161,7 @@ def inspect(args, stage="all"):
         errors.append(f'Prompt/控制配置无效：{type(exc).__name__}: {exc}')
     for model in models(args, stage):
         ready = model.ready(MODELS)
-        reusable = any(type(model)(model.name, old, model.repository, model.required).ready(ROOT / 'models')
+        reusable = any(replace(model, directory=old).ready(ROOT / 'models')
                        for old in model.legacy or (model.directory,))
         status = '就绪' if ready else '复用原有权重' if reusable else '缺失，启动时自动下载'
         print(f'[startup] {model.name}: {status}', flush=True)

@@ -116,16 +116,23 @@ replace the session's explicit prompt overrides atomically; defaults on disk
 remain immutable. A matching request ID acknowledges acceptance or validation
 failure through `self_harness_state`.
 
-The local Qwen3-0.6B classifier selects ordinary or deep reasoning after ASR.
+The local VoiceMem-Jev classifier selects ordinary or deep reasoning after ASR.
 Studio combines that depth with VoiceMem memory eligibility into the existing
-`fast`, `medium`, or `slow` reply modes. Missing default weights are downloaded into the
-`studio/models/reply-router/Qwen3-0.6B` directory with visible progress.
-Explicit model paths remain caller-owned.
-An explicitly selected `encoder_depth:create` adapter can use a trained binary
-encoder instead. Its CPU ONNX path uses bounded non-spinning threads and a
+`fast`, `medium`, or `slow` reply modes. Startup acquisition downloads only the
+selected format from `Sorbett/VoiceMem-Jev`, pinned to revision
+`f2ede1f81a39c785fe191a7f00327a122d799f26`, under
+`studio/models/reply-router/VoiceMem-Jev`. CUDA devices use the `eager` PyTorch
+weights; other router devices use CPU `onnx`. Required runtime files, tokenizer
+assets and provenance are checked against source-controlled SHA-256 values.
+Complete caches are reusable offline; incomplete downloads resume and corrupt
+files require a fresh validated download. `--check` remains read-only. Acquisition
+finishes before warmup; the runtime factory never performs network acquisition.
+Explicit adapter paths remain caller-owned and retain their prototype opt-in.
+The CPU ONNX path uses bounded non-spinning threads and a
 model-private lock; it does not acquire the legacy Torch/MPS device lock.
-The recommended Qwen selection remains unchanged. Default waiting speech is
-prepared independently, so the encoder does not load Qwen for filler wording.
+Recommended startup neither downloads nor loads Qwen3-0.6B and ignores the old
+`STUDIO_ROUTER_BACKEND` selector. Qwen classes remain for explicit compatibility
+and evaluation callers. Default waiting speech is prepared independently.
 
 `studio/core/core.py` exposes service setup and the chronological controls:
 listen, merge continuation, stop warming, wait on unfinished speech, route,
@@ -1231,8 +1238,8 @@ voice preferences use the prepared text with current captured TTS instructions
 rather than stale audio. The existing readiness race still cancels unplayed work.
 
 Explicit custom filler prompts retain non-thinking generation from complete
-current input and at most two bounded history messages. Qwen uses its local
-short-text implementation. The trained adapter retains the same method contract
+current input and at most two bounded history messages. Legacy Qwen callers use
+their local short-text implementation. VoiceMem-Jev retains the same method contract
 through an independent configured chat provider; this optional path never loads
 Qwen or changes main reply parameters. Default cached fillers make no chat API
 request. Model/protocol failures and queue-inclusive text-generation timeouts
@@ -1263,24 +1270,26 @@ Studio system prompt
 ```
 
 Reply mode remains one public per-turn signal, composed from two separate inputs:
-VoiceMem's existing Gate for memory eligibility, and Qwen3-0.6B for reasoning depth.
-The model receives current text plus up to four context messages sharing the
-existing 320-character history budget. It answers only whether deep reasoning
+VoiceMem's existing Gate for memory eligibility, and VoiceMem-Jev for reasoning
+depth. The legacy generative Qwen router receives current text plus up to four
+context messages sharing the existing 320-character history budget. It answers
+only whether deep reasoning
 is needed and does not receive memory-prefetch hints. Studio-specific topic,
 date and greeting regex shortcuts are not used. Automatic depth selection uses
 one off-loop classification request, not a second model judge or a keyword
 override. An explicit quick/deep Self Harness preference selects that depth
 directly without running a classifier whose result would be overwritten. Gate
 memory eligibility remains independent of this preference.
-The editable depth policy treats recall, ordinary explanation, simple formula
-application and requests for an already-derived result as ordinary reasoning.
+For that legacy generative router, the editable depth policy treats recall,
+ordinary explanation, simple formula application and requests for an already-derived
+result as ordinary reasoning.
 Explicit current deep-thinking requests and genuinely complex derivation,
 diagnosis or multi-constraint planning remain deep. History resolves references;
 an earlier difficult topic or a verbose assistant answer does not carry a sticky
 depth into the next turn. Few-shot examples use the same bounded-history/current-
 input framing as runtime requests. An ordinary depth decision still retains
 Gate-approved memory.
-The optional trained encoder has a fixed checkpoint policy, separately bounded
+The recommended trained encoder has a fixed checkpoint policy, separately bounded
 current text and history, and calibrated ordinary/deep logits. It does not read
 the generative router prompt. Capture adds runtime-only EOT/silence/voiced-span
 state to `Pending`; routing forwards a copied dictionary only to adapters with
@@ -1290,11 +1299,12 @@ mutating earlier snapshots. These features cannot end a turn, change memory
 eligibility, or authorize release of speculative output. Exact request caches
 include the observed feature state. Shared async requests use the input executor
 with cancellable native admission and independent waiter cancellation.
-Inference executes on the shared `GpuLoop` for the MLX backend, using the same local Qwen weights
-quantized to 8 bits at load time. Its immutable KV prefix includes only the
+Legacy generative Qwen inference executes on the shared `GpuLoop` for the MLX
+backend, using the same local Qwen weights quantized to 8 bits at load time.
+Its immutable KV prefix includes only the
 system prompt and examples; every request receives a separate cache copy after
-verifying the token prefix. CUDA and explicit `STUDIO_ROUTER_BACKEND=torch`
-retain the Torch path under the process Torch lock. Depth decisions are cached
+verifying the token prefix. Its explicit Torch implementation runs under the
+process Torch lock. Depth decisions are cached
 by text and bounded
 context, independent of the Gate; changing memory eligibility recomposes the
 final route without rerunning depth.
@@ -1642,7 +1652,7 @@ recording speech text or instructions. Delivery RTF and gaps include downstream
 consumer delays; they are distinct from GPU compute time and browser playback.
 Creating an independent MLX thread or stream bypasses this safety
 and scheduling model.
-Auxiliary Qwen work fillers run as non-exclusive token-stepped jobs on this
+Legacy auxiliary Qwen work fillers run as non-exclusive token-stepped jobs on this
 same scheduler. Each has a private KV cache and leaves the classifier's static
 prefix cache untouched.
 
