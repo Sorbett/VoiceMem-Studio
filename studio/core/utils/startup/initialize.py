@@ -60,7 +60,8 @@ def inspect(args, stage="all"):
     else:
         router = 'adapter'
     speech = 'mlx-gpu' if mlx else args.tts_device
-    print(f'[startup] backend={args.backend} · ASR={args.asr_device}'
+    asr = 'X-ASR/cpu' if selection('asr')['provider'] == 'recommended' else selection('asr')['provider']
+    print(f'[startup] backend={args.backend} · ASR={asr}'
           f' · Router={router} · TTS={speech}', flush=True)
     for name, provider, purpose, present in required_keys:
         print(f'[startup] {name}: {"已找到" if present else "缺失"}（{purpose}：{provider}）', flush=True)
@@ -72,8 +73,7 @@ def inspect(args, stage="all"):
         'funasr', 'modelscope', 'sherpa-onnx', 'soundfile', 'scipy',
         'huggingface-hub', 'onnxruntime', 'accelerate')}
     packages['python-dotenv'] = None
-    from studio.core.utils.asr.profile import local_backend
-    if selection('asr')['provider'] == 'recommended' and local_backend() == 'xasr':
+    if selection('asr')['provider'] == 'recommended':
         packages.update({'onnx': '1.23.2', 'filelock': None})
     packages['transformers'] = '4.57.3' if args.backend == 'cuda' else '5.16.1'
     if args.backend == 'cuda':
@@ -93,8 +93,6 @@ def inspect(args, stage="all"):
                 errors.append('PyTorch 无法使用 CUDA；请检查 NVIDIA 驱动和 CUDA 版 PyTorch')
             else:
                 devices = {args.device, args.tts_device}
-                if args.asr_device.startswith('cuda'):
-                    devices.add(args.asr_device)
                 for device in devices:
                     index = torch.device(device).index or 0
                     if index >= torch.cuda.device_count():
