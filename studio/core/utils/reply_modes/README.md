@@ -5,82 +5,44 @@ the existing `ThinkingDecision` boundary. It decides ordinary
 versus deep reasoning; VoiceMem continues to own memory eligibility. The
 router cannot end a voice turn or release private speculative output.
 
-## VoiceMem-Jev (v6)
+## VoiceMem-Jev
 
-The public model release is named **VoiceMem-Jev**. Its current checkpoint is v6,
-published at [Sorbett/VoiceMem-Jev](https://huggingface.co/Sorbett/VoiceMem-Jev).
-It is a 102,274,064-parameter MacBERT encoder with a calibrated binary head.
-The model repository contains two formats of the same checkpoint:
+The recommended router uses [Sorbett/VoiceMem-Jev](https://huggingface.co/Sorbett/VoiceMem-Jev)
+as its single model and runtime source. Run Studio normally; first startup
+automatically downloads the required format and the repository's Python runtime.
+No router configuration or separate package installation is needed.
 
-| Directory | Weight file | Recommended runtime selection |
+| Router device | Downloaded format | Runtime |
 | --- | --- | --- |
-| `eager/` | `model.safetensors` | CUDA: PyTorch on `--device` / `STUDIO_DEVICE` |
-| `onnx/` | `model.onnx` | Apple Silicon and other CPU router devices: CPU ONNX |
+| CUDA | `eager/` | Published PyTorch router on the selected device |
+| Mac or CPU | `onnx/` | Published CPU ONNX router |
 
-These are serialization/runtime formats, not hardware-specific model versions.
-The current ONNX adapter explicitly selects CPUExecutionProvider; ONNX CUDA is
-not enabled by choosing a CUDA-capable machine. PyTorch device availability
-depends on the installed runtime and hardware.
+Both formats belong to the same model repository. The cache is
+`studio/models/reply-router/VoiceMem-Jev`, or its equivalent under
+`STUDIO_MODELS_DIR`. Complete caches work offline. Missing weights, tokenizer or
+runtime files are acquired before warmup. Downloads use the Hub's default
+revision; Studio carries no release SHA or per-file hash catalog.
 
-Startup acquisition selects one format, pins Hub revision
-`f2ede1f81a39c785fe191a7f00327a122d799f26`, and validates its runtime files
-against source-controlled SHA-256 values. Its cache root is
-`studio/models/reply-router/VoiceMem-Jev` (or the corresponding path under
-`STUDIO_MODELS_DIR`). Complete caches need no network. Missing files resume
-downloading; checksum mismatches trigger a fresh download and remain fatal if
-validation still fails. `--check` only inspects files. Acquisition completes
-before router warmup and live input; routing itself never downloads weights.
-Recommended startup does not download or load Qwen3-0.6B. Legacy Qwen classes
-remain available to explicit evaluation callers. `STUDIO_ROUTER_BACKEND` no
-longer selects the recommended implementation.
+The bundled `voicemem_jev` runtime owns model structure, tokenization,
+preprocessing, observation layout and calibrated predictions. Studio retains
+its engine scheduling, cancellation, exact-request cache and independent filler
+interface. CPU ONNX does not acquire a Torch/MPS device lock. Live routing does
+not download files or install dependencies.
 
-Keep `depth_encoder.json`, `encoder/`, and `tokenizer/` beside each weight file.
-The original checkpoint includes the custom decision head. Loading only a base
-MacBERT encoder or a generic sequence-classification pipeline is insufficient.
-Keep `LICENSE`, `NOTICE.txt`, `SOURCE.json`, and the scoped `EVALUATION.json` at
-the model repository root. A release-specific `SHA256SUMS` must describe the
-files actually distributed.
-The ONNX weight SHA-256 is
-`35ef159d8a14aa4b81eb959663af01508e76cc80609860e94956abcd3a939290`.
-Weights are runtime data and do not belong in this working tree's source diff.
+Explicit local adapters retain the existing factory:
+`studio.core.utils.reply_modes.encoder_depth:create`. Choose the local `onnx/`
+or `eager/` model directory, with options such as
+`{"backend":"onnx","device":"cpu","allow_prototype":true}` or
+`{"backend":"eager","device":"cuda:0","allow_prototype":true}`.
+Keep `python/voicemem_jev` beside the format directories, or install the model's
+Python runtime into the environment. API Key and Base URL stay empty. Published
+Studio adapter subclasses retain their existing load hook.
 
-No adapter configuration is needed for the recommended selection. To use an
-explicit local checkpoint instead, choose **Settings → Components → Router →
-Adapter**, using the complete directory for the chosen format:
-
-- Factory: `studio.core.utils.reply_modes.encoder_depth:create`
-- Model: `studio/models/reply-router/VoiceMem-Jev/onnx` from the repository root,
-  or an absolute path to the complete bundle.
-- Options: `{"backend":"onnx","device":"cpu","allow_prototype":true}`
-- API Key and Base URL: empty.
-
-For the original checkpoint, change Model to the complete `eager` directory and
-Options to `{"backend":"eager","device":"cuda:0","allow_prototype":true}`
-for CUDA, or use `"device":"cpu"` for CPU. Changing the file format alone does
-not select a device. The custom adapter accepts local directories only; custom
-Hub repositories must be downloaded before selecting their format directory.
-
-The same startup selection is:
-
-```dotenv
-STUDIO_COMPONENTS='{"router":{"provider":"adapter","factory":"studio.core.utils.reply_modes.encoder_depth:create","model":"studio/models/reply-router/VoiceMem-Jev/onnx","options":{"backend":"onnx","device":"cpu","allow_prototype":true}}}'
-```
-
-Selection uses the existing apply/restart flow. Restore the recommended router
-to re-enable automatic device binding and acquisition. The release metadata
-retains its prototype marker; recommended startup explicitly accepts this pinned
-release, while custom adapter callers must still opt in with `allow_prototype`.
-This does not establish natural-dialogue accuracy. The fixed classifier is trained
-through its checkpoint, so editing a generative router prompt does not change
-its learned decision policy. Main reply, TTS and custom filler prompts remain
-request-scoped as usual.
-
-CPU ONNX uses two non-spinning threads and a model-private lock, without acquiring
-the Torch/MPS device lock. Async work uses the engine input executor and
-cancellation scope; cancelled work cannot publish a late turn result. EOT,
-silence and voiced-span observations are passed only to adapters declaring
-support. Missing measurements remain absent. A continued input uses the joined
-voiced span and current silence state.
+The model's prototype opt-in remains explicit for custom adapters. The
+recommended default accepts the published model. Learned decisions do not use
+the editable generative-router prompt; reply, TTS and custom filler prompts keep
+their existing request scope. Memory eligibility, EOT and speculative output
+commitment remain owned by their existing pipeline stages.
 
 ## Waiting speech
 

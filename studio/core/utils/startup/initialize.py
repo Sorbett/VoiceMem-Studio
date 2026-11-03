@@ -54,9 +54,9 @@ def inspect(args, stage="all"):
     local_router = selection('router')['provider'] == 'recommended'
     mlx = args.backend == 'mlx'
     if local_router:
-        from studio.core.utils.reply_modes.checkpoint import runtime
-        selected_router = runtime(args.backend, args.device)
-        router = f'VoiceMem-Jev/{selected_router.backend}:{selected_router.device}'
+        from studio.core.utils.reply_modes.initialize import router_runtime
+        router_backend, router_device = router_runtime(args.backend, args.device)
+        router = f'VoiceMem-Jev/{router_backend}:{router_device}'
     else:
         router = 'adapter'
     speech = 'mlx-gpu' if mlx else args.tts_device

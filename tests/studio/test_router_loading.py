@@ -1,4 +1,4 @@
-"""Device-bound router acquisition without real weights, services or user data."""
+"""Direct repository acquisition and routing startup without real weights or services."""
 from contextlib import redirect_stdout
 from dataclasses import replace
 import hashlib
@@ -15,7 +15,7 @@ from unittest.mock import patch
 from studio.core.utils.cli.component import parse_args
 from studio.core.utils.models.component import Model, _digest
 from studio.core.utils.models.initialize import models
-from studio.core.utils.reply_modes import checkpoint, initialize
+from studio.core.utils.reply_modes import initialize
 
 
 class DeviceBindingTests(unittest.TestCase):
@@ -28,28 +28,51 @@ class DeviceBindingTests(unittest.TestCase):
         with patch.dict(os.environ, {}, clear=True):
             for backend, device, expected, target in cases:
                 with self.subTest(backend=backend, device=device):
-                    selected = checkpoint.runtime(backend, device)
-                    self.assertEqual((selected.backend, selected.device), (expected, target))
+                    self.assertEqual(initialize.router_runtime(backend, device), (expected, target))
         with patch.dict(os.environ, {'STUDIO_BACKEND': 'cuda', 'STUDIO_DEVICE': 'cuda:3'}, clear=True):
-            self.assertEqual(checkpoint.runtime(), checkpoint.RouterRuntime('eager', 'cuda:3'))
-            self.assertEqual(checkpoint.runtime('mlx', 'cpu'), checkpoint.RouterRuntime('onnx', 'cpu'))
+            self.assertEqual(initialize.router_runtime(), ('eager', 'cuda:3'))
+            self.assertEqual(initialize.router_runtime('mlx', 'cpu'), ('onnx', 'cpu'))
 
-    def test_manifest_pins_only_one_complete_format(self):
+    def test_manifest_downloads_one_format_and_the_published_runtime(self):
         for backend, device, selected, other in [('mlx', 'cpu', 'onnx', 'eager'),
-                                                  ('cuda', 'cuda:1', 'eager', 'onnx')]:
+                                                ('cuda', 'cuda:1', 'eager', 'onnx')]:
             with self.subTest(backend=backend), patch.dict(os.environ, {}, clear=True):
                 args = parse_args(['--backend', backend, '--device', device])
                 manifest = models(args)
                 model = next(item for item in manifest if item.name == 'VoiceMem-Jev')
-                self.assertEqual(model, checkpoint.model_spec(backend, device))
                 self.assertEqual(model.repository, 'Sorbett/VoiceMem-Jev')
-                self.assertEqual(model.revision, checkpoint.REVISION)
-                self.assertEqual(set(model.patterns), set(model.required))
-                self.assertEqual(set(dict(model.checksums)), set(model.required))
-                self.assertIn(f'{selected}/tokenizer/vocab.txt', model.required)
-                self.assertIn(f'{selected}/encoder/config.json', model.required)
+                self.assertIsNone(model.revision)
+                self.assertEqual(model.checksums, ())
+                self.assertIn(f'{selected}/*', model.patterns)
+                self.assertIn('python/*', model.patterns)
+                self.assertIn(f'{selected}/tokenizer/tokenizer.json', model.required)
+                self.assertIn('python/voicemem_jev/router.py', model.required)
                 self.assertFalse(any(path.startswith(f'{other}/') for path in model.required))
+                self.assertFalse(any(name in model.required for name in ('TRAINING.json', 'EVALUATION.json')))
                 self.assertFalse(any('Qwen3-0.6B' in item.repository for item in manifest))
+
+    def test_download_acquires_runtime_and_reuses_a_complete_cache_offline(self):
+        with tempfile.TemporaryDirectory() as root, patch.dict(os.environ, {}, clear=True):
+            model = next(item for item in models(parse_args(['--backend', 'mlx'])) if item.name == 'VoiceMem-Jev')
+
+            def download(**kwargs):
+                for name in model.required:
+                    path = Path(kwargs['local_dir']) / name
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.write_bytes(b'{}' if name.endswith('.json') else b'synthetic artifact' * 100)
+            with patch('huggingface_hub.snapshot_download', side_effect=download) as fetch:
+                model.acquire(Path(root)/'models', Path(root)/'legacy')
+                self.assertEqual(fetch.call_args.kwargs['repo_id'], 'Sorbett/VoiceMem-Jev')
+                self.assertNotIn('revision', fetch.call_args.kwargs)
+                fetch.reset_mock()
+                model.acquire(Path(root)/'models', Path(root)/'legacy')
+                fetch.assert_not_called()
+                runtime = Path(root)/'models'/model.directory/'python/voicemem_jev/router.py'
+                runtime.unlink()
+                self.assertFalse(model.ready(Path(root)/'models'))
+                model.acquire(Path(root)/'models', Path(root)/'legacy')
+                fetch.assert_called_once()
+                self.assertTrue(runtime.is_file())
 
     def test_memory_realtime_and_custom_router_do_not_acquire_default(self):
         with patch.dict(os.environ, {}, clear=True):
@@ -72,7 +95,7 @@ class DeviceBindingTests(unittest.TestCase):
                 self.assertIs(initialize.thinking_router(), factory.return_value)
                 self.assertIs(initialize.thinking_router(), factory.return_value)
                 from studio.paths import MODELS
-                factory.assert_called_once_with(MODELS / checkpoint.DIRECTORY / expected,
+                factory.assert_called_once_with(MODELS / initialize.DIRECTORY / expected,
                                                 backend=expected, device=device, allow_prototype=True)
                 qwen.assert_not_called()
                 download.assert_not_called()

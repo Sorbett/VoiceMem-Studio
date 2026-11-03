@@ -119,14 +119,20 @@ failure through `self_harness_state`.
 The local VoiceMem-Jev classifier selects ordinary or deep reasoning after ASR.
 Studio combines that depth with VoiceMem memory eligibility into the existing
 `fast`, `medium`, or `slow` reply modes. Startup acquisition downloads only the
-selected format from `Sorbett/VoiceMem-Jev`, pinned to revision
-`f2ede1f81a39c785fe191a7f00327a122d799f26`, under
+selected format and its Python runtime directly from `Sorbett/VoiceMem-Jev`, using
+Hugging Face's default revision and local cache under
 `studio/models/reply-router/VoiceMem-Jev`. CUDA devices use the `eager` PyTorch
-weights; other router devices use CPU `onnx`. Required runtime files, tokenizer
-assets and provenance are checked against source-controlled SHA-256 values.
-Complete caches are reusable offline; incomplete downloads resume and corrupt
-files require a fresh validated download. `--check` remains read-only. Acquisition
-finishes before warmup; the runtime factory never performs network acquisition.
+weights; other router devices use CPU `onnx`. The existing model acquisition
+layer checks that the selected weights, tokenizer and runtime files are present,
+resumes incomplete downloads, and reuses complete caches offline. There is no
+Studio-maintained release SHA, per-file checksum catalog or duplicate encoder
+network. The acquired `voicemem_jev` package owns model construction,
+preprocessing, metadata compatibility, calibration and inference. The Studio
+adapter retains only request caching, cancellation, device admission, telemetry
+and the existing filler interface. It imports the runtime from the same local
+bundle before inference; explicit installed SDKs remain usable for custom model
+paths. `--check` remains read-only and does not execute acquired runtime code.
+Acquisition finishes before warmup; live classification never downloads weights.
 Explicit adapter paths remain caller-owned and retain their prototype opt-in.
 The CPU ONNX path uses bounded non-spinning threads and a
 model-private lock; it does not acquire the legacy Torch/MPS device lock.
@@ -994,8 +1000,12 @@ language estimate cannot be adopted. Partial recognition may select an eligible
 backchannel bank but does not commit the session's language fallback.
 
 Reply text follows the shared persona and user context naturally. TTS selects
-instructions from the actual generated segment, so an explicit user request to
+instructions from the actual generated prose, so an explicit user request to
 answer in another language works without a forced output-language control field.
+Studio's speech projection excludes marked formulas and code from language
+evidence, including unfinished structures in a streamed reply. Projected variables
+and viewing cues retain those structured spans through segmentation; their Latin
+letters cannot independently switch the TTS instruction language.
 Tone labels stay canonical; English tone and speech-rate instructions are
 localized at the speech boundary. Backchannel caches are keyed by language and
 voice. Missing matching clips stay silent rather than playing the other language
@@ -1345,9 +1355,13 @@ an earlier difficult topic or a verbose assistant answer does not carry a sticky
 depth into the next turn. Few-shot examples use the same bounded-history/current-
 input framing as runtime requests. An ordinary depth decision still retains
 Gate-approved memory.
-The recommended trained encoder has a fixed checkpoint policy, separately bounded
-current text and history, and calibrated ordinary/deep logits. It does not read
-the generative router prompt. Capture adds runtime-only EOT/silence/voiced-span
+The recommended classifier uses the published VoiceMem-Jev runtime for text and
+history preparation, speech-state features and ordinary/deep probabilities.
+These model semantics are maintained with the weights rather than reimplemented
+in Studio. The thin adapter retains the existing `EncoderDepthRouter` factory
+and load hook for configured and published Studio adapter subclasses. CPU ONNX
+uses the SDK's bounded non-spinning session; CUDA retains engine device admission.
+The classifier does not read the generative router prompt. Capture adds runtime-only EOT/silence/voiced-span
 state to `Pending`; routing forwards a copied dictionary only to adapters with
 `accepts_audio_state is True`. Text input has no acoustic state; early snapshots
 lack the final voiced span. Continued input updates the joined span without
@@ -1582,7 +1596,9 @@ labelled `math`, `latex` or `tex` use formula cues. Delimited math (`$...$`,
 lookahead: short numeric expressions become spoken operators, short coordinate
 tuples become comma-separated values without delimiters, and complex
 expressions become viewing cues. Recognizable complex syntax can release a cue
-before the closing delimiter arrives. Inline code retains short identifiers and
+before the closing delimiter arrives. Pure numeric bodies longer than this
+lookahead use the bounded numeric reader, retaining every digit even inside math
+delimiters. Inline code retains short identifiers and
 simple expressions; long, multiline or symbol-dense snippets use an inline
 reference. Numeric expressions are parsed, never evaluated. Ordinary unmarked
 arithmetic remains unchanged, and currency text is preserved when distinguishable
@@ -1592,6 +1608,17 @@ in the generated prose language, falling back to the captured input language,
 without shared cross-session cue counters. Language detection reads the same
 accumulated reply lazily when a structured cue, arithmetic expression or TTS
 segment needs it; ordinary deltas do not repeatedly scan the growing reply.
+`studio/core/utils/tts/numbers.py` normalizes large standalone numbers in that
+speech projection, before sentence segmentation. Short ordinary numbers retain
+their provider reading. Larger integers use Chinese or English cardinal words
+through 16 digits; longer integers, explicit identifier contexts and leading-zero
+strings use grouped digit readings. Long decimal tails retain every digit,
+including zeros. No floating-point conversion, rounding or extra model request is
+used. The reader holds at most 256 numeric source characters and streams long
+digit tails incrementally. Cancellation discards pending digits. Numeric expansion
+keeps monotonic source boundaries, so display, history and heard-prefix ownership
+remain in the original Markdown. Local MLX, CUDA and injected speech providers
+receive the same projected text; their inference settings are unchanged.
 Repeated
 block cues require 64 new prose characters and are capped at three per type per
 reply; adjacent blocks do not each add another announcement. Short inline

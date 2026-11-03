@@ -19,11 +19,11 @@ Restart the desktop App after updating its preload code.
 | `router` | VoiceMem-Jev | Installed adapter |
 | `speech` | Breeze MLX/CUDA | OpenAI-compatible streaming speech |
 
-The recommended router automatically downloads a pinned VoiceMem-Jev checkpoint:
-CUDA uses PyTorch weights on the selected CUDA device; Mac and other CPU router
-devices use CPU ONNX. Only the selected format is required. See
-[reply router configuration](../reply_modes/README.md) for cache validation and
-explicit local adapter configuration. Custom adapters retain their own bindings.
+The recommended router automatically downloads the selected weights and Python
+runtime from `Sorbett/VoiceMem-Jev`. CUDA uses PyTorch on the selected device;
+Mac and other CPU router devices use CPU ONNX. No separate router setup is needed.
+See [reply router configuration](../reply_modes/README.md) for local cache and
+explicit adapter configuration. Custom adapters retain their own bindings.
 
 The recommended ASR downloads a pinned official ONNX revision on first launch,
 then converts it locally and caches INT8 weights before warmup. This startup

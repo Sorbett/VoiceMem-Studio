@@ -66,7 +66,7 @@ Windows 用户先安装 Node.js 22.12 或更新版本、Docker Desktop（WSL2 �
 - **从哪里更换模型服务？** App 管理的本机后端可在“设置 → 组件”填写模型名称、服务地址和 Key，支持多项一起应用并重启，启动失败时回到原配置。当前链路保留为推荐默认；常用接入包括记忆/回复的 Chat API、Deepgram 流式识别和 OpenAI-compatible 语音合成。轮次控制等组件保留高级适配器入口，具体协议见[组件接入说明](core/utils/component_config/README.md)。连接已有或 Docker 服务时这里是只读的，需要在服务器端设置后重启。
 - **启动前想检查环境？** 已装好对应 Python 环境后，可在仓库根目录运行 `python -m studio --check`。它只做检查，不下载模型，也不打开记忆空间。
 - **默认配置文件在哪里？** 样例在 `studio/.env.example`，实际配置是仓库根目录的 `.env` 或进程环境变量。不要提交含真实 Key 的 `.env`。命令行参数优先于环境变量；已导出的变量优先于 `.env`。
-- **思考路由用什么模型？** 默认使用 [VoiceMem-Jev](https://huggingface.co/Sorbett/VoiceMem-Jev)，首次启动自动下载并校验。CUDA 使用 PyTorch 权重；Mac 使用 CPU ONNX，每台设备只需下载对应格式。缓存完整时可离线复用，不再下载或加载 Qwen3-0.6B。自定义适配器仍按设置使用。
+- **思考路由用什么模型？** 默认使用 [VoiceMem-Jev](https://huggingface.co/Sorbett/VoiceMem-Jev)，首次启动直接从同一仓库下载所需权重和运行代码，无需单独配置。CUDA 使用 PyTorch；Mac 使用 CPU ONNX，每台设备只下载对应格式。完整缓存可离线复用。自定义适配器仍按设置使用。
 - **流式 ASR 用哪个模型？** Studio 仅内置 [X-ASR-zh-en](https://huggingface.co/GilgameshWind/X-ASR-zh-en) 480ms，INT8、CPU 单线程。中文、英文和中英混说共用一套权重，不随界面语言切换。首次启动下载约 614 MB 官方 ONNX 权重，在本机准备约 168 MB INT8 缓存，后续启动直接复用；最终转写仍使用 SenseVoice。
 - **英文界面还能说中文吗？** 可以。界面分类和画像展示跟随界面语言，原始发言、事实记忆和自定义 Space 名称保留原文。新记忆的生成描述跟随当轮输入语言，不会因切换界面而改写旧记忆。
 - **浏览器能用吗？** 浏览器是补充访问方式。独立启动的后端默认可通过 `http://localhost:8787` 访问同一套对话界面；App 管理的后端使用其实际监听端口。浏览器在远程地址使用麦克风时需要 HTTPS，或通过 SSH 转发后访问本机地址。

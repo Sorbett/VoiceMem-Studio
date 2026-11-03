@@ -121,7 +121,7 @@ async def main(args):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--checkpoint', type=Path, default=Path('studio/models/reply-router/voice-router-v6/onnx'))
+    parser.add_argument('--checkpoint', type=Path, default=Path('studio/models/reply-router/VoiceMem-Jev/onnx'))
     parser.add_argument('--order', default='ABBA')
     parser.add_argument('--prompt-language', choices=('zh', 'en'), default='zh')
     parser.add_argument('--out', type=Path, required=True)

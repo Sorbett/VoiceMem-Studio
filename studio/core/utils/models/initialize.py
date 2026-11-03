@@ -47,8 +47,16 @@ def models(args, stage="all"):
         return shared
     if args.mode == 'llm_tts':
         if recommended('router'):
-            from studio.core.utils.reply_modes.checkpoint import model_spec
-            shared.append(model_spec(args.backend, args.device))
+            from studio.core.utils.reply_modes.initialize import DIRECTORY, REPOSITORY, router_runtime
+            backend, _ = router_runtime(args.backend, args.device)
+            weight = 'model.onnx' if backend == 'onnx' else 'model.safetensors'
+            required = tuple(f'{backend}/{name}' for name in (
+                weight, 'depth_encoder.json', 'encoder/config.json',
+                'tokenizer/tokenizer.json', 'tokenizer/tokenizer_config.json'))
+            required += tuple(f'python/voicemem_jev/{name}' for name in (
+                '__init__.py', 'router.py', 'onnx_runtime.py'))
+            shared.append(Model('VoiceMem-Jev', DIRECTORY, REPOSITORY, required,
+                                (f'{backend}/*', 'python/*', 'LICENSE', 'NOTICE.txt', 'licenses/*')))
         if recommended('speech') and args.backend == 'cuda':
             from studio.core.utils.tts.cuda import model_directory
             from studio.paths import ROOT

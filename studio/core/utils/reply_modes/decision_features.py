@@ -45,18 +45,6 @@ def audio_vector(state=None) -> np.ndarray:
     return np.asarray(values + present, dtype=np.float32)
 
 
-def decision_state(text, history=None, audio_state=None):
-    """Serialize bounded semantic context and only genuinely observed audio state."""
-    current, recent = texts(text, history)
-    audio_vector(audio_state)
-    state = {'current_user': current, 'recent_dialogue': recent}
-    observed = {name: audio_state[name] for name, _ in AUDIO_FIELDS
-                if audio_state and audio_state.get(name) is not None}
-    if observed:
-        state['observed_audio'] = observed
-    return state
-
-
 def combine(current, context, audio_state=None) -> np.ndarray:
     """Join semantics, context interaction and optional acoustic observations."""
     current, context = np.asarray(current, np.float32), np.asarray(context, np.float32)
