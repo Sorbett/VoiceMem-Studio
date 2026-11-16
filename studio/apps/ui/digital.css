@@ -212,7 +212,7 @@ body.memory-on .memory{pointer-events:auto}
 .ink-canvas{position:absolute;inset:0;width:100%;height:100%}
 .memory-in{position:absolute;inset:0;opacity:0;transition:opacity .7s var(--ease);pointer-events:none}
 .memory-in.show{opacity:1;pointer-events:auto}
-.brain-wrap{position:absolute;inset:0}
+.brain-wrap{position:absolute;inset:0;z-index:0}
 .brain{position:absolute;top:50%;right:var(--brain-c);width:min(43vw,82svh);
   --pop:translate(50%,-50%);aspect-ratio:1100/914;
   opacity:0;transform:translate(50%,-50%);transition:opacity .9s var(--ease) .15s,transform 1.1s var(--ease) .15s}
@@ -221,7 +221,7 @@ body.memory-on .memory{pointer-events:auto}
 .memory-head{position:absolute;left:auto;right:var(--brain-c);transform:translateX(50%);top:78px;
   width:min(38vw,74svh);color:#e6e2f4}
 .memory-head h2{font:400 clamp(20px,1.7vw,30px)/1.5 var(--serif)}
-.memory-head,.memory-legend{pointer-events:none}
+.memory-head,.memory-legend{z-index:1;pointer-events:none}
 .memory-head p{margin-top:6px;font-size:calc(13px * var(--font-scale,1));color:#8e89a6}
 .memory-legend{position:absolute;left:auto;right:var(--brain-c);transform:translateX(50%);bottom:34px;
   width:min(38vw,74svh);display:flex;gap:16px;flex-wrap:wrap;color:#8e89a6;font-size:calc(12px * var(--font-scale,1))}
